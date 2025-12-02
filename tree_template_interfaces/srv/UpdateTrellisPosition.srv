@@ -1,3 +1,4 @@
 geometry_msgs/Pose pose
+string side   # "near", "far", or "unknown"
 ---
 bool success

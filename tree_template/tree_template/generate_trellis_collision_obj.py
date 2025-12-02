@@ -206,7 +206,7 @@ class TreeSceneNode(Node):
         """
         Each call adds a new tree instance at (x, y, z).
         """
-        self.add_tree_instance_at(request.pose)
+        self.add_tree_instance_at(request.pose, request.side)
 
         response.success = True
         self.get_logger().info(
@@ -254,10 +254,38 @@ class TreeSceneNode(Node):
         response.message = f"Requested removal of {removed} trellis tree objects."
         self.get_logger().info(response.message)
         return response
+    
+    def get_trellis_orientation(self, trellis_pose: Pose, side: str) -> np.ndarray:
+        """
+        Compute the trellis orientation based on side and yaw.
+        Returns a quaternion [x, y, z, w].
+        """
+        if side == "near":
+            trellis_yaw = np.pi / 2.0
+        elif side == "far":
+            trellis_yaw = -np.pi / 2.0
+        else:
+            trellis_yaw = np.pi / 2.0
+
+        apriori_canopy_ori = R.from_euler('xyz', [0.0, self.trellis_angle, trellis_yaw]).as_quat()
+
+        # Combine trellis orientation with apriori canopy orientation
+        canopy_orientation = R.from_quat([
+            apriori_canopy_ori[0],
+            apriori_canopy_ori[1],
+            apriori_canopy_ori[2],
+            apriori_canopy_ori[3]
+        ]) * R.from_quat([
+            trellis_pose.orientation.x,
+            trellis_pose.orientation.y,
+            trellis_pose.orientation.z,
+            trellis_pose.orientation.w
+        ])
+        return canopy_orientation.as_quat()
 
     # ------------ Core helper ------------
 
-    def add_tree_instance_at(self, trellis_pose: Pose):
+    def add_tree_instance_at(self, trellis_pose: Pose, side: str):
         """
         Publish a new CollisionObject at the provided (x, y, z) in a target frame (e.g.'odom').
         Each call gets a unique ID and that ID is persisted in YAML with coordinates.
@@ -309,8 +337,7 @@ class TreeSceneNode(Node):
         # Pose of the whole tree object
         tree_object.pose.position = trellis_pose.position
 
-        # TODO: update such that it takes the Pose message orientation into account
-        canopy_orientation = R.from_euler('xyz', [0.0, self.trellis_angle, np.pi / 2.0]).as_quat()
+        canopy_orientation = self.get_trellis_orientation(trellis_pose, side)
         tree_object.pose.orientation.x = canopy_orientation[0]
         tree_object.pose.orientation.y = canopy_orientation[1]
         tree_object.pose.orientation.z = canopy_orientation[2]
