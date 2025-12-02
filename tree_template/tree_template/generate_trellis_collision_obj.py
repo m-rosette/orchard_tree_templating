@@ -5,6 +5,7 @@ from typing import List, Dict
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from moveit_msgs.msg import CollisionObject
 from geometry_msgs.msg import Pose
@@ -16,9 +17,7 @@ from scipy.spatial.transform import Rotation as R
 import numpy as np
 
 from tree_template_interfaces.srv import UpdateTrellisPosition
-
-from ament_index_python.packages import get_package_share_directory
-import yaml
+from tree_template_interfaces.msg import TrunkRegistry
 
 
 class TreeSceneNode(Node):
@@ -46,18 +45,10 @@ class TreeSceneNode(Node):
         self.trellis_frame = self.get_parameter("trellis_frame").get_parameter_value().string_value
         self.trellis_prefix = self.get_parameter("trellis_prefix").get_parameter_value().string_value
 
-        # Locate this package's resource folder and YAML file path
-        pkg_share = get_package_share_directory('tree_template')
-        resource_dir = os.path.join(pkg_share, 'resource')
-        os.makedirs(resource_dir, exist_ok=True)
-        self.id_store_path = os.path.join(resource_dir, 'trellis_ids.yaml')
-
-        # In-memory storage
+        # In-memory storage (replaces YAML)
         self.created_coords: Dict[str, Dict[str, float]] = {}
-
-        # Load any existing IDs from YAML
-        self.created_ids: List[str] = self._load_ids_from_yaml()
-        self.instance_counter = self._compute_initial_counter()
+        self.created_ids: List[str] = []
+        self.instance_counter = 0
 
         # Services
         self.update_position_service = self.create_service(
@@ -77,128 +68,35 @@ class TreeSceneNode(Node):
             CollisionObject, 'collision_object', 10
         )
 
-        self.get_logger().info(
-            f"Trellis template node running.\n"
-            f"  YAML store: {self.id_store_path}\n"
-            f"  Loaded {len(self.created_ids)} existing IDs.\n"
-            f"  Next instance index: {self.instance_counter}"
+        # Subscriber to trunk registry published by TrunkClusterToTemplateNode
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.trunk_registry_sub = self.create_subscription(
+            TrunkRegistry,
+            'trunk_registry',
+            self.trunk_registry_callback,
+            qos
         )
 
-    # ------------ YAML helpers ------------
+        self.get_logger().info(
+            f"Trellis template node running.\n"
+            f"  trellis_frame={self.trellis_frame}\n"
+            f"  trellis_prefix={self.trellis_prefix}\n"
+            f"  Starting with empty in-memory tree registry (no YAML persistence)."
+        )
 
-    def _load_ids_from_yaml(self) -> List[str]:
+    # ------------ Trunk registry subscriber ------------
+
+    def trunk_registry_callback(self, msg: TrunkRegistry):
         """
-        Load IDs (and optionally coordinates) from YAML.
-
-        Supports:
-          - legacy format: [ "v_trellis_tree_0", "v_trellis_tree_1", ... ]
-          - new format:
-              - id: v_trellis_tree_0
-                x: ...
-                y: ...
-                z: ...
+        Receive the current set of committed trunks from trunk_to_template_position.
+        Right now this is primarily informational, but you can hook additional
+        behavior here if needed.
         """
-        if not os.path.exists(self.id_store_path):
-            return []
-
-        try:
-            with open(self.id_store_path, "r") as f:
-                data = yaml.safe_load(f)
-
-            self.created_coords = {}
-            ids: List[str] = []
-
-            # New preferred format: list of dicts
-            if isinstance(data, list):
-                for entry in data:
-                    if isinstance(entry, dict) and "id" in entry:
-                        obj_id = str(entry["id"])
-                        ids.append(obj_id)
-                        coords = {}
-                        for k in ["x", "y", "z"]:
-                            if k in entry:
-                                coords[k] = float(entry[k])
-                        if coords:
-                            self.created_coords[obj_id] = coords
-                    elif isinstance(entry, str):
-                        # Legacy: simple list of IDs
-                        ids.append(entry)
-                return ids
-
-            # Fallback: dict mapping id -> coords
-            if isinstance(data, dict):
-                for obj_id, coords in data.items():
-                    obj_id = str(obj_id)
-                    ids.append(obj_id)
-                    if isinstance(coords, dict):
-                        c = {}
-                        for k in ["x", "y", "z"]:
-                            if k in coords:
-                                c[k] = float(coords[k])
-                        if c:
-                            self.created_coords[obj_id] = c
-                return ids
-
-            return []
-        except Exception as e:
-            self.get_logger().warn(f"Failed to load ID store from {self.id_store_path}: {e}")
-            self.created_coords = {}
-            return []
-
-    def _save_ids_to_yaml(self):
-        """
-        Save IDs and their coordinates to YAML in the format:
-
-        - id: v_trellis_tree_0
-          x: ...
-          y: ...
-          z: ...
-        """
-        try:
-            entries = []
-            for obj_id in self.created_ids:
-                entry = {"id": obj_id}
-                coords = self.created_coords.get(obj_id, None)
-                if coords:
-                    for k in ["x", "y", "z"]:
-                        if k in coords:
-                            entry[k] = float(coords[k])
-                entries.append(entry)
-
-            with open(self.id_store_path, "w") as f:
-                yaml.safe_dump(entries, f)
-        except Exception as e:
-            self.get_logger().warn(f"Failed to save ID store to {self.id_store_path}: {e}")
-
-    def _register_id(self, obj_id: str, pose: Pose):
-        """
-        Store ID and its (x, y, z) position in memory and YAML.
-        """
-        if obj_id not in self.created_ids:
-            self.created_ids.append(obj_id)
-
-        self.created_coords[obj_id] = {
-            "x": pose.position.x,
-            "y": pose.position.y,
-            "z": pose.position.z,
-        }
-
-        self._save_ids_to_yaml()
-
-    def _compute_initial_counter(self) -> int:
-        """
-        Parse indices from IDs like 'v_trellis_tree_<n>' and start
-        from max(n) + 1, so we don't reuse IDs across restarts.
-        """
-        max_idx = -1
-        for obj_id in self.created_ids:
-            if obj_id.startswith(self.trellis_prefix):
-                try:
-                    idx = int(obj_id.split(self.trellis_prefix)[1])
-                    max_idx = max(max_idx, idx)
-                except ValueError:
-                    continue
-        return max_idx + 1
+        self.get_logger().debug(f"Received trunk registry with {len(msg.trunks)} trunks")
 
     # ------------ Service callbacks ------------
 
@@ -219,11 +117,11 @@ class TreeSceneNode(Node):
 
     def clear_trellis_trees_callback(self, request, response):
         """
-        Remove all trellis trees whose IDs are stored in the YAML file.
+        Remove all trellis trees whose IDs are stored in memory.
         Only IDs with prefix 'v_trellis_tree_' are touched.
         """
         if not self.created_ids:
-            msg = "No trellis tree IDs stored. Nothing to remove."
+            msg = "No trellis tree IDs stored in memory. Nothing to remove."
             self.get_logger().info(msg)
             response.success = True
             response.message = msg
@@ -244,17 +142,16 @@ class TreeSceneNode(Node):
             removed += 1
             self.get_logger().info(f"Requested removal of {obj_id}")
 
-        # Clear local list, coords, and YAML
+        # Clear local list and coords, reset counter
         self.created_ids = []
         self.created_coords = {}
-        self._save_ids_to_yaml()
         self.instance_counter = 0
 
         response.success = True
         response.message = f"Requested removal of {removed} trellis tree objects."
         self.get_logger().info(response.message)
         return response
-    
+
     def get_trellis_orientation(self, trellis_pose: Pose, side: str) -> np.ndarray:
         """
         Compute the trellis orientation based on side and yaw.
@@ -269,7 +166,6 @@ class TreeSceneNode(Node):
 
         apriori_canopy_ori = R.from_euler('xyz', [0.0, self.trellis_angle, trellis_yaw]).as_quat()
 
-        # Combine trellis orientation with apriori canopy orientation
         canopy_orientation = R.from_quat([
             apriori_canopy_ori[0],
             apriori_canopy_ori[1],
@@ -287,8 +183,8 @@ class TreeSceneNode(Node):
 
     def add_tree_instance_at(self, trellis_pose: Pose, side: str):
         """
-        Publish a new CollisionObject at the provided (x, y, z) in a target frame (e.g.'odom').
-        Each call gets a unique ID and that ID is persisted in YAML with coordinates.
+        Publish a new CollisionObject at the provided (x, y, z) in a target frame (e.g. 'odom').
+        Each call gets a unique ID and that ID is stored in memory.
         """
         tree_object = CollisionObject()
         tree_object.header = Header()
@@ -296,7 +192,16 @@ class TreeSceneNode(Node):
 
         # Unique ID per instance
         tree_object.id = self.trellis_prefix + str(self.instance_counter)
-        self._register_id(tree_object.id, trellis_pose)
+        obj_id = tree_object.id
+
+        # Track ID and coordinates in memory
+        if obj_id not in self.created_ids:
+            self.created_ids.append(obj_id)
+        self.created_coords[obj_id] = {
+            "x": trellis_pose.position.x,
+            "y": trellis_pose.position.y,
+            "z": trellis_pose.position.z,
+        }
         self.instance_counter += 1
 
         # Leader branch (vertical cylinder)
@@ -324,7 +229,6 @@ class TreeSceneNode(Node):
             branch_pose.position.y = 0.0
             branch_pose.position.z = i * self.branch_spacing
 
-            # 90° about X
             branch_orientation = R.from_euler('xyz', [np.pi / 2, 0.0, 0.0]).as_quat()
             branch_pose.orientation.x = branch_orientation[0]
             branch_pose.orientation.y = branch_orientation[1]

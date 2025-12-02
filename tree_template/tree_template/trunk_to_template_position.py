@@ -9,6 +9,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from std_msgs.msg import Header
 from geometry_msgs.msg import PointStamped, PoseArray, Pose, Point
@@ -16,13 +17,12 @@ from visualization_msgs.msg import Marker
 
 from pf_orchard_interfaces.msg import TreeImageData
 from tree_template_interfaces.srv import UpdateTrellisPosition
+from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
 from std_srvs.srv import Trigger
 
 import tf2_ros
 from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point
 
-from ament_index_python.packages import get_package_share_directory
-import yaml
 from scipy.spatial.transform import Rotation as R
 
 
@@ -36,7 +36,8 @@ class TrunkClusterToTemplateNode(Node):
           - Classifies side (NEAR/FAR) based on which side of the fitted row datum
             line the tree lies on
           - Sends a single /update_trellis_position request with pose + side
-      - Publishes the fitted row datum line as a green Marker on 'trunk_row_datum'.
+      - Publishes the fitted row datum line as a green Marker on 'trunk_row_datum'
+      - Publishes the current set of committed trunks on 'trunk_registry'.
     """
 
     def __init__(self):
@@ -78,7 +79,7 @@ class TrunkClusterToTemplateNode(Node):
 
         self.uniqueness_radius = float(self.get_parameter("uniqueness_radius").value)
 
-        # Row axis (for along/lateral decomposition) – used for uniqueness gating
+        # Row axis (for along/lateral decomposition) used for uniqueness gating
         self.row_axis = np.array(
             [
                 float(self.get_parameter("row_axis_x").value),
@@ -128,8 +129,12 @@ class TrunkClusterToTemplateNode(Node):
         self.tracks: Dict[int, Dict] = {}
         self.next_track_id = 0
 
-        # Pending positions to avoid duplicates vs YAML
+        # Positions for which we have sent a service request but have not yet
+        # received a response. Used to avoid duplicates.
         self.pending_positions: list[np.ndarray] = []
+
+        # Registry of committed trunks (in memory only, replaces YAML)
+        self.committed_trunks: list[TrunkInfo] = []
 
         # -------- Service clients --------
         self.trellis_template_client = self.create_client(
@@ -146,7 +151,7 @@ class TrunkClusterToTemplateNode(Node):
         while not self.clear_trees_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("Waiting for clear_trellis_trees service...")
 
-        # Clear existing trees on startup
+        # Clear existing trees on startup (collision objects) via TreeSceneNode
         clear_request = Trigger.Request()
         clear_future = self.clear_trees_client.call_async(clear_request)
         clear_future.add_done_callback(
@@ -167,6 +172,18 @@ class TrunkClusterToTemplateNode(Node):
 
         # -------- Publisher for row datum --------
         self.row_datum_pub = self.create_publisher(Marker, "trunk_row_datum", 10)
+
+        # -------- Publisher for trunk registry (snapshot of committed trunks) --------
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.trunk_registry_pub = self.create_publisher(
+            TrunkRegistry,
+            "trunk_registry",
+            qos,
+        )
 
         # -------- Timer for track evaluation / committing / updating datum --------
         self.timer = self.create_timer(
@@ -205,10 +222,6 @@ class TrunkClusterToTemplateNode(Node):
 
         if points_2d.size == 0:
             return
-        
-        for id in msg.classifications:
-            if id == 1:
-                self.get_logger().error(f"Detection Classification: {id}")
 
         n = points_2d.shape[0]
         for i in range(n):
@@ -350,7 +363,8 @@ class TrunkClusterToTemplateNode(Node):
                 else:
                     pose.orientation.w = 1.0  # fallback: no rotation
 
-                self.send_trellis_request(pose, side)
+                width_mean = track["width_mean"]
+                self.send_trellis_request(pose, side, width_mean)
                 new_requests += 1
             else:
                 self.get_logger().debug(
@@ -370,17 +384,15 @@ class TrunkClusterToTemplateNode(Node):
         y = m x + b in the XY plane.
 
         Conventions:
-          - If we cannot fit a line (fewer than 2 trunks in YAML): 'unknown'
+          - If we cannot fit a line (fewer than 2 committed trunks): 'unknown'
           - signed_dist = (y - (m x + b)) / sqrt(m^2 + 1)
               signed_dist < 0  -> 'near'
               signed_dist >= 0 -> 'far'
-
-        If this is flipped in your coordinate frame, just swap the labels.
         """
         fit = self._fit_row_datum_line()
         if fit is None:
             self.get_logger().warn(
-                "Cannot classify side: not enough trunks in YAML to fit datum. "
+                "Cannot classify side: not enough committed trunks to fit datum. "
                 "Defaulting to 'unknown'."
             )
             return "unknown"
@@ -398,9 +410,7 @@ class TrunkClusterToTemplateNode(Node):
             )
             return "unknown"
 
-        # Signed perpendicular distance from point (x, y) to line y = m x + b
         signed_dist = (y - y_line) / denom
-
         side = "near" if signed_dist < 0.0 else "far"
 
         self.get_logger().debug(
@@ -409,13 +419,11 @@ class TrunkClusterToTemplateNode(Node):
         )
 
         return side
-    
+
     def _get_all_positions_on_side(self, side: str) -> list[np.ndarray]:
         """
-        Return all existing trunk positions (YAML + pending) that lie on the
+        Return all existing trunk positions (committed + pending) that lie on the
         specified side ("near" or "far") of the fitted row datum line.
-
-        If the line cannot be fit, returns an empty list.
         """
         if side not in ("near", "far"):
             return []
@@ -429,8 +437,7 @@ class TrunkClusterToTemplateNode(Node):
         if denom < 1e-6:
             return []
 
-        # Existing (from YAML) + pending (already requested but not yet confirmed)
-        positions = self.load_existing_positions() + self.pending_positions
+        positions = self.get_existing_positions() + self.pending_positions
 
         same_side_positions: list[np.ndarray] = []
         for pos in positions:
@@ -452,10 +459,10 @@ class TrunkClusterToTemplateNode(Node):
 
     def _fit_row_datum_line(self) -> Optional[tuple[float, float]]:
         """
-        Fit a single line y = m x + b to existing trunk positions from YAML.
+        Fit a single line y = m x + b to committed trunk positions.
         Returns (m, b) or None if not enough points.
         """
-        trunks = self._load_trunks_for_row_datum()
+        trunks = self._trunks_for_row_datum()
         if len(trunks) < 2:
             return None
 
@@ -466,7 +473,7 @@ class TrunkClusterToTemplateNode(Node):
         A = np.vstack([x, np.ones_like(x)]).T
         m, b = np.linalg.lstsq(A, y, rcond=None)[0]
         return float(m), float(b)
-    
+
     def compute_datum_yaw_quaternion(self) -> Optional[np.ndarray]:
         """
         Computes the yaw quaternion for the fitted row datum line.
@@ -476,7 +483,7 @@ class TrunkClusterToTemplateNode(Node):
         if fit is None:
             return None
 
-        m, b = fit
+        m, _ = fit
 
         # Direction vector of the line in XY plane = (1, m)
         theta = np.arctan2(m, 1.0)  # yaw angle
@@ -488,7 +495,7 @@ class TrunkClusterToTemplateNode(Node):
 
     def row_datum_timer_callback(self):
         """
-        Update the row datum marker based on current YAML trunk positions.
+        Update the row datum marker based on current committed trunk positions.
         """
         fit = self._fit_row_datum_line()
         if fit is None:
@@ -496,17 +503,16 @@ class TrunkClusterToTemplateNode(Node):
             return
 
         m, b = fit
-        trunks = self._load_trunks_for_row_datum()
+        trunks = self._trunks_for_row_datum()
         pts = np.array(trunks, dtype=float)
         x = pts[:, 0]
         self._publish_row_datum_line(m, b, x)
 
-    def _load_trunks_for_row_datum(self) -> list[tuple[float, float]]:
+    def _trunks_for_row_datum(self) -> list[tuple[float, float]]:
         """
-        Use the same YAML as trellis IDs via load_existing_positions(),
-        and extract (x, y) pairs for line fitting.
+        Extract (x, y) pairs for line fitting from committed trunk poses.
         """
-        positions = self.load_existing_positions()  # list of np.array([x, y, z])
+        positions = self.get_existing_positions()
         trunks: list[tuple[float, float]] = []
         for p in positions:
             if p.shape[0] >= 2:
@@ -547,7 +553,6 @@ class TrunkClusterToTemplateNode(Node):
 
         marker.scale.x = self.row_datum_line_width  # line thickness
 
-        # Green line
         marker.color.r = 0.0
         marker.color.g = 1.0
         marker.color.b = 0.0
@@ -605,7 +610,7 @@ class TrunkClusterToTemplateNode(Node):
 
     # ---------------- Service call helpers ----------------
 
-    def send_trellis_request(self, pose: Pose, side: str):
+    def send_trellis_request(self, pose: Pose, side: str, width: Optional[float]):
         """
         Asynchronously call /update_trellis_position for a given position
         in TARGET FRAME coordinates, including side id ("near" / "far" / "unknown").
@@ -621,19 +626,25 @@ class TrunkClusterToTemplateNode(Node):
 
         future = self.trellis_template_client.call_async(request)
 
-        # Attach the position to the future so we know which one it corresponds to
+        # Attach data to the future so we know which one it corresponds to
         position_array = np.array(
             [pose.position.x, pose.position.y, pose.position.z],
             dtype=float,
         )
-        future._trellis_pose = position_array
+        future._trellis_pos = position_array
+        future._trellis_pose = pose
+        future._trellis_side = side
+        future._trellis_width = width
         future.add_done_callback(self.trellis_response_callback)
 
     def trellis_response_callback(self, future):
         """
         Handle the result of the trellis placement service.
         """
-        pos = getattr(future, "_trellis_pose", None)
+        pos = getattr(future, "_trellis_pos", None)
+        pose = getattr(future, "_trellis_pose", None)
+        side = getattr(future, "_trellis_side", "")
+        width = getattr(future, "_trellis_width", None)
 
         if future.result() is None:
             self.get_logger().error(
@@ -647,11 +658,30 @@ class TrunkClusterToTemplateNode(Node):
             self.get_logger().info(f"Trellis placement succeeded at {pos}.")
             self._remove_from_pending(pos)
 
-            # YAML should now include this new tree, so recompute and republish datum
+            # Add to in-memory registry and publish updated registry
+            if pose is not None:
+                trunk = TrunkInfo()
+                trunk.pose = pose
+                trunk.side = side or ""
+                trunk.width = float(width) if width is not None else float("nan")
+                self.committed_trunks.append(trunk)
+                self.publish_trunk_registry()
+
+            # Recompute and republish datum based on committed trunks
             self.row_datum_timer_callback()
         else:
             self.get_logger().error(f"Trellis placement FAILED for position {pos}.")
             self._remove_from_pending(pos)
+
+    def publish_trunk_registry(self):
+        """
+        Publish a snapshot of all committed trunks on trunk_registry.
+        """
+        msg = TrunkRegistry()
+        # Directly reuse the stored TrunkInfo objects
+        msg.trunks = list(self.committed_trunks)
+        self.trunk_registry_pub.publish(msg)
+        self.get_logger().debug(f"Published trunk registry with {len(msg.trunks)} trunks")
 
     def _remove_from_pending(self, pos: Optional[np.ndarray]):
         """
@@ -675,8 +705,6 @@ class TrunkClusterToTemplateNode(Node):
         Convert TreeImageData into:
           - pts: (N, 2) array of [x, y] points in CAMERA FRAME
           - widths: (N,) array if available, else None
-
-        Handles mismatched lengths by truncating to the minimum length.
         """
         xs = np.array(msg.xs, dtype=np.float32)
         ys = np.array(msg.ys, dtype=np.float32)
@@ -713,21 +741,24 @@ class TrunkClusterToTemplateNode(Node):
 
         pts = np.stack([xs, ys], axis=1).astype(np.float32)
         return pts, widths
-    
+
+    def get_existing_positions(self) -> list[np.ndarray]:
+        """
+        Return list of positions for all committed trunks as np.array([x, y, z]).
+        """
+        positions: list[np.ndarray] = []
+        for ti in self.committed_trunks:
+            p = ti.pose.position
+            positions.append(np.array([p.x, p.y, p.z], dtype=float))
+        return positions
+
     def is_position_new(self, pos: np.ndarray, side: Optional[str] = None) -> bool:
         """
         Decide if 'pos' (in TARGET FRAME) corresponds to a new tree.
 
-        If uniqueness_radius > 0 and side is 'near' or 'far', compare to ALL
-        existing + pending trunks that are classified on the same side.
-
-        Otherwise:
-          - If uniqueness_radius > 0, fall back to a simple Euclidean threshold
-            against all existing + pending positions.
-          - If uniqueness_radius <= 0, use anisotropic row-based gating with
-            along_row_tolerance and lateral_tolerance.
+        Uses committed trunk positions (in memory) plus pending positions.
         """
-        existing_positions = self.load_existing_positions()
+        existing_positions = self.get_existing_positions()
         all_existing = existing_positions + self.pending_positions
 
         if not all_existing:
@@ -744,7 +775,6 @@ class TrunkClusterToTemplateNode(Node):
 
                 for existing in same_side_positions:
                     if np.linalg.norm(pos - existing) < self.uniqueness_radius:
-                        # Too close to an existing/pending trunk on this side
                         return False
                 return True
 
@@ -764,84 +794,6 @@ class TrunkClusterToTemplateNode(Node):
                 return False
 
         return True
-
-    def load_existing_positions(self) -> list[np.ndarray]:
-        """
-        Load existing trellis tree positions from the YAML file.
-        Supports:
-          - New format (preferred):
-              - id: v_trellis_tree_0
-                x: ...
-                y: ...
-                z: ...
-          - Legacy format:
-              { "v_trellis_tree_0": {"x": ..., "y": ..., "z": ...}, ... }
-
-        Returns a list of np.ndarray positions.
-        """
-        positions: list[np.ndarray] = []
-
-        try:
-            pkg_share = get_package_share_directory("tree_template")
-            resource_dir = os.path.join(pkg_share, "resource")
-            yaml_path = os.path.join(resource_dir, "trellis_ids.yaml")
-        except Exception as e:
-            self.get_logger().warn(f"Could not resolve trellis_ids.yaml path: {e}")
-            return positions
-
-        if not os.path.exists(yaml_path):
-            self.get_logger().debug(
-                "trellis_ids.yaml does not exist; no existing positions."
-            )
-            return positions
-
-        try:
-            with open(yaml_path, "r") as f:
-                data = yaml.safe_load(f)
-        except Exception as e:
-            self.get_logger().warn(f"Failed to read trellis_ids.yaml: {e}")
-            return positions
-
-        if data is None:
-            self.get_logger().debug("trellis_ids.yaml is empty.")
-            return positions
-
-        # New format: list of dicts
-        if isinstance(data, list):
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                try:
-                    x = float(entry.get("x", 0.0))
-                    y = float(entry.get("y", 0.0))
-                    z = float(entry.get("z", 0.0))
-                    positions.append(np.array([x, y, z], dtype=float))
-                except Exception as e:
-                    self.get_logger().warn(
-                        f"Failed to parse list entry in trellis_ids.yaml: {e}"
-                    )
-            return positions
-
-        # Legacy format: dict mapping id -> {x, y, z}
-        if isinstance(data, dict):
-            for obj_id, pos_dict in data.items():
-                if not isinstance(pos_dict, dict):
-                    continue
-                try:
-                    x = float(pos_dict.get("x", 0.0))
-                    y = float(pos_dict.get("y", 0.0))
-                    z = float(pos_dict.get("z", 0.0))
-                    positions.append(np.array([x, y, z], dtype=float))
-                except Exception as e:
-                    self.get_logger().warn(
-                        f"Failed to parse position for {obj_id} in trellis_ids.yaml: {e}"
-                    )
-            return positions
-
-        self.get_logger().warn(
-            f"trellis_ids.yaml has unexpected top-level type: {type(data)}"
-        )
-        return positions
 
 
 def main(args=None):
