@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import ExecuteProcess, SetEnvironmentVariable
+from launch.actions import ExecuteProcess, SetEnvironmentVariable, DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+
 
 def generate_launch_description():
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+
     return LaunchDescription([
+
+        # Declare launch argument
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='false',
+            description='Use simulated clock'
+        ),
+
         SetEnvironmentVariable(
             name='WIDTH_ESTIMATION_PACKAGE_PATH',
             value='/home/marcus/trunk_width_ws/trunk_width_estimation'
@@ -12,6 +25,12 @@ def generate_launch_description():
         SetEnvironmentVariable(
             name='WIDTH_ESTIMATION_PACKAGE_DATA_PATH',
             value='/home/marcus/trunk_width_ws/width_estimation_analysis_data'
+        ),
+
+        # Pass use_sim_time to the Python script through env var
+        SetEnvironmentVariable(
+            name='USE_SIM_TIME',
+            value=use_sim_time
         ),
 
         # Run the Python script directly
@@ -27,7 +46,10 @@ def generate_launch_description():
         Node(
             package='tree_template',
             executable='tree_template',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time
+            }]
         ),
 
         # trunk_to_template_position node
@@ -36,7 +58,7 @@ def generate_launch_description():
             executable='trunk_to_template_position',
             output='screen',
             parameters=[{
-                'use_sim_time': False,
+                'use_sim_time': use_sim_time
             }]
         ),
     ])

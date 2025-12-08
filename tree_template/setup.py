@@ -26,6 +26,7 @@ setup(
             'tree_template = tree_template.generate_trellis_collision_obj:main',
             'trunk_to_template_position = tree_template.trunk_to_template_position:main',
             'trunk_row_datum = tree_template.row_datum:main',
+            'row_prior_mapper = tree_template.row_prior_mapper:main',
         ],
     },
 )

@@ -31,10 +31,14 @@ class TreeSceneNode(Node):
         self.declare_parameter("side_branch_radii", 0.04)
         self.declare_parameter("side_branch_len", 2.0)
         self.declare_parameter("trellis_angle", -18.435)  # Martin's angle
-        self.declare_parameter("branch_spacing", 0.5)  # m
-        self.declare_parameter('trellis_frame', 'odom')
-        self.declare_parameter('trellis_prefix', 'v_trellis_tree_')
+        self.declare_parameter("branch_spacing", 0.5)      # m
+        self.declare_parameter("trellis_frame", "odom")
+        self.declare_parameter("trellis_prefix", "v_trellis_tree_")
 
+        # Topic providing the row-level map of trunks (from RowPriorMapper)
+        self.declare_parameter("registry_topic", "row_prior_registry")
+
+        # Resolve parameters
         self.leader_branch_radii = self.get_parameter("leader_branch_radii").get_parameter_value().double_value
         self.leader_branch_len = self.get_parameter("leader_branch_len").get_parameter_value().double_value
         self.num_side_branches = self.get_parameter("num_side_branches").get_parameter_value().double_value
@@ -44,13 +48,14 @@ class TreeSceneNode(Node):
         self.branch_spacing = self.get_parameter("branch_spacing").get_parameter_value().double_value
         self.trellis_frame = self.get_parameter("trellis_frame").get_parameter_value().string_value
         self.trellis_prefix = self.get_parameter("trellis_prefix").get_parameter_value().string_value
+        self.registry_topic = self.get_parameter("registry_topic").get_parameter_value().string_value
 
-        # In-memory storage (replaces YAML)
+        # In-memory storage
         self.created_coords: Dict[str, Dict[str, float]] = {}
         self.created_ids: List[str] = []
         self.instance_counter = 0
 
-        # Services
+        # Services (manual add + clear)
         self.update_position_service = self.create_service(
             UpdateTrellisPosition,
             'update_trellis_position',
@@ -68,7 +73,7 @@ class TreeSceneNode(Node):
             CollisionObject, 'collision_object', 10
         )
 
-        # Subscriber to trunk registry published by TrunkClusterToTemplateNode
+        # Subscriber to trunk registry (from RowPriorMapper)
         qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -76,39 +81,163 @@ class TreeSceneNode(Node):
         )
         self.trunk_registry_sub = self.create_subscription(
             TrunkRegistry,
-            'trunk_registry',
+            self.registry_topic,
             self.trunk_registry_callback,
-            qos
+            qos,
         )
 
         self.get_logger().info(
-            f"Trellis template node running.\n"
+            "Trellis template node running.\n"
             f"  trellis_frame={self.trellis_frame}\n"
             f"  trellis_prefix={self.trellis_prefix}\n"
-            f"  Starting with empty in-memory tree registry (no YAML persistence)."
+            f"  registry_topic={self.registry_topic}\n"
+            "  Starting with empty in-memory tree registry (no YAML persistence)."
         )
 
     # ------------ Trunk registry subscriber ------------
 
     def trunk_registry_callback(self, msg: TrunkRegistry):
         """
-        Receive the current set of committed trunks from trunk_to_template_position.
-        Right now this is primarily informational, but you can hook additional
-        behavior here if needed.
+        Update or create trellis templates based on the row-level trunk registry.
+
+        For slot index i:
+          - Collision object ID is f"{trellis_prefix}{i}"
+          - If that ID has never been seen, we ADD a new CollisionObject with full
+            geometry (leader + side branches).
+          - If that ID already exists, we MOVE the existing CollisionObject to
+            the new pose (no need to resend geometry).
         """
-        self.get_logger().debug(f"Received trunk registry with {len(msg.trunks)} trunks")
+        num_trunks = len(msg.trunks)
+        self.get_logger().debug(f"Received trunk registry with {num_trunks} trunks")
+
+        for i, trunk in enumerate(msg.trunks):
+            obj_id = f"{self.trellis_prefix}{i}"
+
+            trellis_pose: Pose = trunk.pose
+            side: str = trunk.side if trunk.side else "near"
+
+            # Compute canopy orientation from row-parallel yaw and side-specific tilt
+            canopy_orientation = self.get_trellis_orientation(trellis_pose, side)
+
+            if obj_id not in self.created_ids:
+                # First time for this slot: create full geometry and ADD
+                tree_object = CollisionObject()
+                tree_object.header = Header()
+                tree_object.header.frame_id = self.trellis_frame
+                tree_object.id = obj_id
+
+                # Leader branch primitive (main trunk)
+                leader_branch = SolidPrimitive()
+                leader_branch.type = SolidPrimitive.CYLINDER
+                leader_branch.dimensions = [
+                    self.leader_branch_len,
+                    self.leader_branch_radii,
+                ]
+
+                leader_pose = Pose()
+                leader_pose.position.x = 0.0
+                leader_pose.position.y = 0.0
+                leader_pose.position.z = self.leader_branch_len / 2.0
+                leader_pose.orientation.w = 1.0
+
+                tree_object.primitives.append(leader_branch)
+                tree_object.primitive_poses.append(leader_pose)
+
+                # Side branches (V-trellis arms)
+                for j in range(1, int(self.num_side_branches) + 1):
+                    side_branch = SolidPrimitive()
+                    side_branch.type = SolidPrimitive.CYLINDER
+                    side_branch.dimensions = [
+                        self.side_branch_len,
+                        self.side_branch_radii,
+                    ]
+
+                    branch_pose = Pose()
+                    branch_pose.position.x = 0.0
+                    branch_pose.position.y = 0.0
+                    branch_pose.position.z = j * self.branch_spacing
+
+                    branch_orientation = R.from_euler(
+                        "xyz", [np.pi / 2, 0.0, 0.0]
+                    ).as_quat()
+                    branch_pose.orientation.x = branch_orientation[0]
+                    branch_pose.orientation.y = branch_orientation[1]
+                    branch_pose.orientation.z = branch_orientation[2]
+                    branch_pose.orientation.w = branch_orientation[3]
+
+                    tree_object.primitives.append(side_branch)
+                    tree_object.primitive_poses.append(branch_pose)
+
+                # Pose of the whole tree object in the target frame
+                tree_object.pose.position = trellis_pose.position
+                tree_object.pose.orientation.x = canopy_orientation[0]
+                tree_object.pose.orientation.y = canopy_orientation[1]
+                tree_object.pose.orientation.z = canopy_orientation[2]
+                tree_object.pose.orientation.w = canopy_orientation[3]
+
+                tree_object.operation = CollisionObject.ADD
+                self.collision_object_publisher.publish(tree_object)
+
+                self.created_ids.append(obj_id)
+                self.created_coords[obj_id] = {
+                    "x": trellis_pose.position.x,
+                    "y": trellis_pose.position.y,
+                    "z": trellis_pose.position.z,
+                }
+
+                self.get_logger().debug(
+                    f"ADD trellis '{obj_id}' at "
+                    f"({trellis_pose.position.x:.2f}, "
+                    f"{trellis_pose.position.y:.2f}, "
+                    f"{trellis_pose.position.z:.2f}), "
+                    f"side={side}"
+                )
+            else:
+                # Existing slot: MOVE the object to the new pose
+                move_obj = CollisionObject()
+                move_obj.header = Header()
+                move_obj.header.frame_id = self.trellis_frame
+                move_obj.id = obj_id
+
+                move_obj.pose.position = trellis_pose.position
+                move_obj.pose.orientation.x = canopy_orientation[0]
+                move_obj.pose.orientation.y = canopy_orientation[1]
+                move_obj.pose.orientation.z = canopy_orientation[2]
+                move_obj.pose.orientation.w = canopy_orientation[3]
+
+                move_obj.operation = CollisionObject.MOVE
+                self.collision_object_publisher.publish(move_obj)
+
+                self.created_coords[obj_id] = {
+                    "x": trellis_pose.position.x,
+                    "y": trellis_pose.position.y,
+                    "z": trellis_pose.position.z,
+                }
+
+                self.get_logger().debug(
+                    f"MOVE trellis '{obj_id}' to "
+                    f"({trellis_pose.position.x:.2f}, "
+                    f"{trellis_pose.position.y:.2f}, "
+                    f"{trellis_pose.position.z:.2f}), "
+                    f"side={side}"
+                )
+
+        # Keep instance_counter in sync with number of created IDs, in case the
+        # manual service path is still used elsewhere.
+        self.instance_counter = len(self.created_ids)
 
     # ------------ Service callbacks ------------
 
     def update_trellis_position_callback(self, request, response):
         """
-        Each call adds a new tree instance at (x, y, z).
+        Each call adds a new tree instance at (x, y, z) using the manual service.
+        This is separate from the row_prior_registry-driven map.
         """
         self.add_tree_instance_at(request.pose, request.side)
 
         response.success = True
         self.get_logger().info(
-            f"Added tree instance at: "
+            "Added tree instance at: "
             f"x={request.pose.position.x:.3f}, "
             f"y={request.pose.position.y:.3f}, "
             f"z={request.pose.position.z:.3f}"
@@ -118,10 +247,9 @@ class TreeSceneNode(Node):
     def clear_trellis_trees_callback(self, request, response):
         """
         Remove all trellis trees whose IDs are stored in memory.
-        Only IDs with prefix 'v_trellis_tree_' are touched.
         """
         if not self.created_ids:
-            msg = "No trellis tree IDs stored in memory. Nothing to remove."
+            msg = "No trellis trees stored in memory. Nothing to remove."
             self.get_logger().info(msg)
             response.success = True
             response.message = msg
@@ -152,11 +280,14 @@ class TreeSceneNode(Node):
         self.get_logger().info(response.message)
         return response
 
+    # ------------ Orientation helper ------------
+
     def get_trellis_orientation(self, trellis_pose: Pose, side: str) -> np.ndarray:
         """
-        Compute the trellis orientation based on side and yaw.
+        Compute the trellis orientation based on side and row-parallel yaw.
         Returns a quaternion [x, y, z, w].
         """
+        # Base trellis yaw depends on which canopy side this tree is on.
         if side == "near":
             trellis_yaw = np.pi / 2.0
         elif side == "far":
@@ -164,27 +295,36 @@ class TreeSceneNode(Node):
         else:
             trellis_yaw = np.pi / 2.0
 
-        apriori_canopy_ori = R.from_euler('xyz', [0.0, self.trellis_angle, trellis_yaw]).as_quat()
+        # First, build an apriori canopy orientation using the known trellis angle
+        apriori_canopy_ori = R.from_euler(
+            "xyz", [0.0, self.trellis_angle, trellis_yaw]
+        ).as_quat()
 
-        canopy_orientation = R.from_quat([
-            apriori_canopy_ori[0],
-            apriori_canopy_ori[1],
-            apriori_canopy_ori[2],
-            apriori_canopy_ori[3]
-        ]) * R.from_quat([
-            trellis_pose.orientation.x,
-            trellis_pose.orientation.y,
-            trellis_pose.orientation.z,
-            trellis_pose.orientation.w
-        ])
+        # Then compose with the row-parallel yaw stored in trellis_pose.orientation
+        canopy_orientation = R.from_quat(
+            [
+                apriori_canopy_ori[0],
+                apriori_canopy_ori[1],
+                apriori_canopy_ori[2],
+                apriori_canopy_ori[3],
+            ]
+        ) * R.from_quat(
+            [
+                trellis_pose.orientation.x,
+                trellis_pose.orientation.y,
+                trellis_pose.orientation.z,
+                trellis_pose.orientation.w,
+            ]
+        )
         return canopy_orientation.as_quat()
 
-    # ------------ Core helper ------------
+    # ------------ Core helper for manual tree creation ------------
 
     def add_tree_instance_at(self, trellis_pose: Pose, side: str):
         """
-        Publish a new CollisionObject at the provided (x, y, z) in a target frame (e.g. 'odom').
+        Publish a new CollisionObject at the provided (x, y, z) in a target frame.
         Each call gets a unique ID and that ID is stored in memory.
+        This is primarily used by the manual /update_trellis_position service.
         """
         tree_object = CollisionObject()
         tree_object.header = Header()
@@ -194,17 +334,16 @@ class TreeSceneNode(Node):
         tree_object.id = self.trellis_prefix + str(self.instance_counter)
         obj_id = tree_object.id
 
-        # Track ID and coordinates in memory
-        if obj_id not in self.created_ids:
-            self.created_ids.append(obj_id)
+        # Store in memory
         self.created_coords[obj_id] = {
             "x": trellis_pose.position.x,
             "y": trellis_pose.position.y,
             "z": trellis_pose.position.z,
         }
+        self.created_ids.append(obj_id)
         self.instance_counter += 1
 
-        # Leader branch (vertical cylinder)
+        # Leader branch primitive
         leader_branch = SolidPrimitive()
         leader_branch.type = SolidPrimitive.CYLINDER
         leader_branch.dimensions = [self.leader_branch_len, self.leader_branch_radii]
@@ -218,8 +357,8 @@ class TreeSceneNode(Node):
         tree_object.primitives.append(leader_branch)
         tree_object.primitive_poses.append(leader_pose)
 
-        # Side branches (horizontal cylinders)
-        for i in range(1, int(self.num_side_branches) + 1):
+        # Side branches
+        for j in range(1, int(self.num_side_branches) + 1):
             side_branch = SolidPrimitive()
             side_branch.type = SolidPrimitive.CYLINDER
             side_branch.dimensions = [self.side_branch_len, self.side_branch_radii]
@@ -227,9 +366,11 @@ class TreeSceneNode(Node):
             branch_pose = Pose()
             branch_pose.position.x = 0.0
             branch_pose.position.y = 0.0
-            branch_pose.position.z = i * self.branch_spacing
+            branch_pose.position.z = j * self.branch_spacing
 
-            branch_orientation = R.from_euler('xyz', [np.pi / 2, 0.0, 0.0]).as_quat()
+            branch_orientation = R.from_euler(
+                "xyz", [np.pi / 2, 0.0, 0.0]
+            ).as_quat()
             branch_pose.orientation.x = branch_orientation[0]
             branch_pose.orientation.y = branch_orientation[1]
             branch_pose.orientation.z = branch_orientation[2]
@@ -257,10 +398,10 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Shutting down TreeSceneNode...')
+        node.get_logger().info("Shutting down TreeSceneNode...")
     finally:
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
