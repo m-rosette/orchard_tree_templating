@@ -27,6 +27,7 @@ setup(
             'trunk_to_template_position = tree_template.trunk_to_template_position:main',
             'trunk_row_datum = tree_template.row_datum:main',
             'row_prior_mapper = tree_template.row_prior_mapper:main',
+            'depth_image_to_pointcloud2 = tree_template.depth_image_to_pointcloud2:main',
         ],
     },
 )

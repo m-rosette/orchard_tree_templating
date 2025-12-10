@@ -26,6 +26,7 @@ class RowPriorMapper(Node):
     """
 
     def __init__(self):
+        # TODO: Update the line fitting to not depend directly on a row origin. Make it such that the row origin can be updated online as well.
         super().__init__("row_prior_mapper")
 
         # ---------- Parameters ----------
@@ -44,21 +45,21 @@ class RowPriorMapper(Node):
 
         # Unified EMA scheduling: high alpha early, low alpha once "confident"
         # Position
-        self.declare_parameter("alpha_pos_high", 0.5)
-        self.declare_parameter("alpha_pos_low", 0.3)
-        self.declare_parameter("n_pos_confident", 5)
+        self.declare_parameter("alpha_pos_high", 0.8)
+        self.declare_parameter("alpha_pos_low", 0.5)
+        self.declare_parameter("n_pos_confident", 10)
 
         # Width
         self.declare_parameter("alpha_width_high", 0.5)
-        self.declare_parameter("alpha_width_low", 0.3)
-        self.declare_parameter("n_width_confident", 5)
+        self.declare_parameter("alpha_width_low", 0.5)
+        self.declare_parameter("n_width_confident", 10)
 
         # Yaw (global row orientation)
         self.declare_parameter("alpha_yaw_high", 0.5)
-        self.declare_parameter("alpha_yaw_low", 0.3)
-        self.declare_parameter("n_yaw_confident", 20)
+        self.declare_parameter("alpha_yaw_low", 0.5)
+        self.declare_parameter("n_yaw_confident", 10)
 
-        self.declare_parameter("slot_s_gate", 0.6)
+        self.declare_parameter("slot_s_gate", 0.5)
         self.declare_parameter("observation_topic", "trunk_observations")
         self.declare_parameter("registry_topic", "row_prior_registry")
 
@@ -366,13 +367,22 @@ class RowPriorMapper(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RowPriorMapper()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down RowPriorMapper...")
     finally:
+        # Clean up the node
         node.destroy_node()
-        rclpy.shutdown()
+
+        # Only try to shut down if context is still active
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except rclpy.exceptions.RCLError:
+                # Context was already shut down somewhere else; ignore
+                pass
 
 
 if __name__ == "__main__":

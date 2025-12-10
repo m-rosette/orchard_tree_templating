@@ -287,7 +287,15 @@ class TreeSceneNode(Node):
         Compute the trellis orientation based on side and row-parallel yaw.
         Returns a quaternion [x, y, z, w].
         """
-        # Base trellis yaw depends on which canopy side this tree is on.
+        # 1. Row yaw from RowPriorMapper (includes global row_yaw update)
+        row_R = R.from_quat([
+            trellis_pose.orientation.x,
+            trellis_pose.orientation.y,
+            trellis_pose.orientation.z,
+            trellis_pose.orientation.w,
+        ])
+
+        # 2. Side-dependent trellis yaw (around the tree’s local frame)
         if side == "near":
             trellis_yaw = np.pi / 2.0
         elif side == "far":
@@ -295,28 +303,17 @@ class TreeSceneNode(Node):
         else:
             trellis_yaw = np.pi / 2.0
 
-        # First, build an apriori canopy orientation using the known trellis angle
-        apriori_canopy_ori = R.from_euler(
+        # 3. Trellis local rotation: first tilt by trellis_angle, then yaw for side
+        #    This is defined in the local (row-aligned) frame.
+        trellis_local_R = R.from_euler(
             "xyz", [0.0, self.trellis_angle, trellis_yaw]
-        ).as_quat()
-
-        # Then compose with the row-parallel yaw stored in trellis_pose.orientation
-        canopy_orientation = R.from_quat(
-            [
-                apriori_canopy_ori[0],
-                apriori_canopy_ori[1],
-                apriori_canopy_ori[2],
-                apriori_canopy_ori[3],
-            ]
-        ) * R.from_quat(
-            [
-                trellis_pose.orientation.x,
-                trellis_pose.orientation.y,
-                trellis_pose.orientation.z,
-                trellis_pose.orientation.w,
-            ]
         )
-        return canopy_orientation.as_quat()
+
+        # 4. Compose: apply row_R first, then trellis_local_R
+        #    (Active rotations: R_total = row_R * trellis_local_R)
+        canopy_R = row_R * trellis_local_R
+        
+        return canopy_R.as_quat()
 
     # ------------ Core helper for manual tree creation ------------
 

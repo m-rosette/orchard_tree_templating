@@ -160,6 +160,13 @@ class TrunkClusterToTemplateNode(Node):
             qos,
         )
 
+        # -------- Publisher for committed trunk markers --------
+        self.trunk_marker_pub = self.create_publisher(
+            Marker,
+            "committed_trunk_markers",
+            10,
+        )
+
         # -------- Timer for track evaluation / committing / updating datum --------
         self.timer = self.create_timer(
             self.cluster_timer_period, self.track_evaluation_timer_callback
@@ -203,10 +210,10 @@ class TrunkClusterToTemplateNode(Node):
             xy = points_2d[i]
             width = float(widths[i]) if widths is not None else None
 
-            # Map 2D (x,y) to a 3D point in camera frame (same as before)
-            pos_cam = np.array([xy[0], 0.55, -xy[1]], dtype=float)
+            # Map 2D (x,y) to a 3D point in camera frame
+            pos_cam = np.array([-xy[0], 0.0, -xy[1]], dtype=float)
 
-            pos_target = self.transform_to_target_frame(pos_cam)
+            pos_target = self.transform_to_target_frame(pos_cam, msg.header.stamp)
             if pos_target is None:
                 continue
 
@@ -346,6 +353,9 @@ class TrunkClusterToTemplateNode(Node):
                 tinfo.width = float(width_mean) if width_mean is not None else float("nan")
 
                 self.trunk_obs_pub.publish(tinfo)
+
+                # Also publish a committed trunk marker
+                self.publish_committed_trunk_marker(pose, track_id)
 
                 # Also store for datum fitting & optional debug registry
                 self.committed_trunks.append(tinfo)
@@ -539,12 +549,12 @@ class TrunkClusterToTemplateNode(Node):
 
     # ---------------- TF helper ----------------
 
-    def transform_to_target_frame(self, pos_cam: np.ndarray) -> Optional[np.ndarray]:
+    def transform_to_target_frame(self, pos_cam: np.ndarray, stamp) -> Optional[np.ndarray]:
         """
         Transform a 3D point from camera_frame to target_frame using TF2.
         """
         ps = PointStamped()
-        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.header.stamp = stamp
         ps.header.frame_id = self.camera_frame
         ps.point.x = float(pos_cam[0])
         ps.point.y = float(pos_cam[1])
@@ -554,7 +564,7 @@ class TrunkClusterToTemplateNode(Node):
             transform = self.tf_buffer.lookup_transform(
                 self.target_frame,
                 self.camera_frame,
-                Time.from_msg(ps.header.stamp),
+                Time.from_msg(stamp),
                 timeout=Duration(seconds=0.1),
             )
         except (
@@ -679,20 +689,69 @@ class TrunkClusterToTemplateNode(Node):
         self.trunk_registry_pub.publish(msg)
         self.get_logger().debug(f"Published trunk registry with {len(msg.trunks)} trunks")
 
+    def publish_committed_trunk_marker(self, pose: Pose, marker_id: int):
+        """
+        Publish a red cube marker at the committed trunk pose.
+        Each trunk gets a unique marker id so previous cubes stay in RViz.
+        """
+        marker = Marker()
+        marker.header = Header()
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.frame_id = self.target_frame
+
+        marker.ns = "committed_trunks"
+        marker.id = marker_id
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+
+        # Use the trunk pose directly
+        marker.pose = pose
+
+        # Cube size in meters - adjust if you want bigger/smaller
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+
+        # Red, slightly transparent
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 0.9
+
+        self.trunk_marker_pub.publish(marker)
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = TrunkClusterToTemplateNode()
     executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
+
     try:
         executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down TrunkClusterToTemplateNode...")
     finally:
-        executor.shutdown()
+        # Stop the executor
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+
+        # Remove and destroy the node
+        try:
+            executor.remove_node(node)
+        except Exception:
+            pass
         node.destroy_node()
-        rclpy.shutdown()
+
+        # Only try to shutdown the context if it is still active
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except rclpy.exceptions.RCLError:
+                # Context already shut down somewhere else
+                pass
 
 
 if __name__ == "__main__":
