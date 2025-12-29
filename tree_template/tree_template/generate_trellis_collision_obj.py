@@ -30,25 +30,47 @@ class TreeSceneNode(Node):
         self.declare_parameter("num_side_branches", 4.0)
         self.declare_parameter("side_branch_radii", 0.04)
         self.declare_parameter("side_branch_len", 2.0)
-        self.declare_parameter("trellis_angle", -18.435)  # Martin's angle
+        self.declare_parameter("trellis_angle", -18.435)  # Martin's angle (deg)
         self.declare_parameter("branch_spacing", 0.5)      # m
         self.declare_parameter("trellis_frame", "odom")
         self.declare_parameter("trellis_prefix", "v_trellis_tree_")
 
-        # Topic providing the row-level map of trunks (from RowPriorMapper)
-        self.declare_parameter("registry_topic", "row_prior_registry")
+        # Topic providing the row-level map of trunks.
+        # For FastSLAM, use 'fastslam_registry'.
+        # For the old RowPriorMapper pipeline, use 'row_prior_registry'.
+        self.declare_parameter("registry_topic", "fastslam_registry")
 
         # Resolve parameters
-        self.leader_branch_radii = self.get_parameter("leader_branch_radii").get_parameter_value().double_value
-        self.leader_branch_len = self.get_parameter("leader_branch_len").get_parameter_value().double_value
-        self.num_side_branches = self.get_parameter("num_side_branches").get_parameter_value().double_value
-        self.side_branch_radii = self.get_parameter("side_branch_radii").get_parameter_value().double_value
-        self.side_branch_len = self.get_parameter("side_branch_len").get_parameter_value().double_value
-        self.trellis_angle = np.deg2rad(self.get_parameter("trellis_angle").get_parameter_value().double_value)
-        self.branch_spacing = self.get_parameter("branch_spacing").get_parameter_value().double_value
-        self.trellis_frame = self.get_parameter("trellis_frame").get_parameter_value().string_value
-        self.trellis_prefix = self.get_parameter("trellis_prefix").get_parameter_value().string_value
-        self.registry_topic = self.get_parameter("registry_topic").get_parameter_value().string_value
+        self.leader_branch_radii = self.get_parameter(
+            "leader_branch_radii"
+        ).get_parameter_value().double_value
+        self.leader_branch_len = self.get_parameter(
+            "leader_branch_len"
+        ).get_parameter_value().double_value
+        self.num_side_branches = self.get_parameter(
+            "num_side_branches"
+        ).get_parameter_value().double_value
+        self.side_branch_radii = self.get_parameter(
+            "side_branch_radii"
+        ).get_parameter_value().double_value
+        self.side_branch_len = self.get_parameter(
+            "side_branch_len"
+        ).get_parameter_value().double_value
+        self.trellis_angle = np.deg2rad(
+            self.get_parameter("trellis_angle").get_parameter_value().double_value
+        )
+        self.branch_spacing = self.get_parameter(
+            "branch_spacing"
+        ).get_parameter_value().double_value
+        self.trellis_frame = self.get_parameter(
+            "trellis_frame"
+        ).get_parameter_value().string_value
+        self.trellis_prefix = self.get_parameter(
+            "trellis_prefix"
+        ).get_parameter_value().string_value
+        self.registry_topic = self.get_parameter(
+            "registry_topic"
+        ).get_parameter_value().string_value
 
         # In-memory storage
         self.created_coords: Dict[str, Dict[str, float]] = {}
@@ -73,11 +95,11 @@ class TreeSceneNode(Node):
             CollisionObject, 'collision_object', 10
         )
 
-        # Subscriber to trunk registry (from RowPriorMapper)
+        # Subscriber to trunk registry (from RowFastSLAMNode or RowPriorMapper)
         qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
         )
         self.trunk_registry_sub = self.create_subscription(
             TrunkRegistry,
@@ -101,7 +123,7 @@ class TreeSceneNode(Node):
         Update or create trellis templates based on the row-level trunk registry.
 
         For slot index i:
-          - Collision object ID is f"{trellis_prefix}{i}"
+          - Collision object ID is f\"{trellis_prefix}{i}\"
           - If that ID has never been seen, we ADD a new CollisionObject with full
             geometry (leader + side branches).
           - If that ID already exists, we MOVE the existing CollisionObject to
@@ -231,7 +253,7 @@ class TreeSceneNode(Node):
     def update_trellis_position_callback(self, request, response):
         """
         Each call adds a new tree instance at (x, y, z) using the manual service.
-        This is separate from the row_prior_registry-driven map.
+        This is separate from the registry-driven map.
         """
         self.add_tree_instance_at(request.pose, request.side)
 
@@ -284,18 +306,12 @@ class TreeSceneNode(Node):
 
     def get_trellis_orientation(self, trellis_pose: Pose, side: str) -> np.ndarray:
         """
-        Compute the trellis orientation based on side and row-parallel yaw.
-        Returns a quaternion [x, y, z, w].
-        """
-        # 1. Row yaw from RowPriorMapper (includes global row_yaw update)
-        row_R = R.from_quat([
-            trellis_pose.orientation.x,
-            trellis_pose.orientation.y,
-            trellis_pose.orientation.z,
-            trellis_pose.orientation.w,
-        ])
+        Compute trellis orientation without using trunk pose yaw.
 
-        # 2. Side-dependent trellis yaw (around the tree’s local frame)
+        Trunks are assumed to lie along the X-axis of the planning frame.
+        Any global row yaw is encoded in robot odom (odom_slam_best), not in trunk poses.
+        """
+        # Side-dependent yaw around Z for V-trellis arms
         if side == "near":
             trellis_yaw = np.pi / 2.0
         elif side == "far":
@@ -303,17 +319,9 @@ class TreeSceneNode(Node):
         else:
             trellis_yaw = np.pi / 2.0
 
-        # 3. Trellis local rotation: first tilt by trellis_angle, then yaw for side
-        #    This is defined in the local (row-aligned) frame.
-        trellis_local_R = R.from_euler(
-            "xyz", [0.0, self.trellis_angle, trellis_yaw]
-        )
-
-        # 4. Compose: apply row_R first, then trellis_local_R
-        #    (Active rotations: R_total = row_R * trellis_local_R)
-        canopy_R = row_R * trellis_local_R
-        
-        return canopy_R.as_quat()
+        # Local rotation only (no row_R term)
+        trellis_local_R = R.from_euler("xyz", [0.0, self.trellis_angle, trellis_yaw])
+        return trellis_local_R.as_quat()
 
     # ------------ Core helper for manual tree creation ------------
 

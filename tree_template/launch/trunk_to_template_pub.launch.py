@@ -24,7 +24,7 @@ def generate_launch_description():
         ),
         SetEnvironmentVariable(
             name='WIDTH_ESTIMATION_PACKAGE_DATA_PATH',
-            value='/home/marcus/trunk_width_ws/width_estimation_analysis_data'
+            value='/home/marcus/trunk_width_ws/width_estimation_package_data'
         ),
 
         # Pass use_sim_time to the Python script through env var

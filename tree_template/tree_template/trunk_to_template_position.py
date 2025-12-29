@@ -32,7 +32,8 @@ class TrunkClusterToTemplateNode(Node):
       - Tracks detections over time into persistent tracks (one per trunk)
       - For each mature track, decides if it is a new tree and, if so:
           - Classifies side (NEAR/FAR) based on the fitted row datum line
-          - Publishes a TrunkInfo observation on 'trunk_observations'
+          - Publishes a TrunkInfo observation on 'trunk_observations' (TARGET FRAME)
+          - Publishes a TrunkInfo measurement on 'trunk_measurements' (CAMERA FRAME) for FastSLAM
       - Publishes the fitted row datum line as a green Marker on 'trunk_row_datum'
       - Optionally publishes a snapshot of committed trunks on 'trunk_registry'
         (for debugging/visualization only – the authoritative map is RowPriorMapper).
@@ -43,29 +44,39 @@ class TrunkClusterToTemplateNode(Node):
 
         # -------- Parameters --------
         self.declare_parameter("input_topic", "tree_image_data")
-        self.declare_parameter("min_samples", 10)            # min hits per track before committing
-        self.declare_parameter("cluster_timer_period", 3.0)  # how often to evaluate tracks [s]
+        self.declare_parameter("min_samples", 7)            # min hits per track before committing
+        self.declare_parameter("cluster_timer_period", 1.0)  # how often to evaluate tracks [s]
 
         # Track association gates (in TARGET FRAME)
-        self.declare_parameter("track_position_gate", 0.4)   # [m] max distance to associate detection to track
+        self.declare_parameter("track_position_gate", 0.3)   # [m] max distance to associate detection to track
         self.declare_parameter("track_width_gate", 0.02)     # width tol for associating to same track
 
         # "New tree" logic
-        self.declare_parameter("uniqueness_radius", 1.0)     # if > 0, use simple Euclidean threshold [m]
+        self.declare_parameter("uniqueness_radius", 0.3)     # if > 0, use simple Euclidean threshold [m]
 
         # Row axis (along row) and anisotropic gating
         self.declare_parameter("row_axis_x", 1.0)
         self.declare_parameter("row_axis_y", 0.0)
         self.declare_parameter("row_axis_z", 0.0)
-        self.declare_parameter("along_row_tolerance", 0.4)   # [m] along-row tol for "same tree"
-        self.declare_parameter("lateral_tolerance", 0.4)     # [m] lateral tol for "same tree"
+
+        # Side classification mode:
+        #   "datum" => fit row datum line to committed trunks (legacy)
+        #   "slot_alternating" => classify side deterministically by slot index parity
+        self.declare_parameter("side_mode", "datum")
+
+        # Slot-based side parameters (used when side_mode == "slot_alternating")
+        self.declare_parameter("slot_spacing", 0.75)   # meters
+        self.declare_parameter("row_origin_s", 0.0)    # reference s for slot 0
+        self.declare_parameter("start_side", "far")   # slot 0 side
+        self.declare_parameter("along_row_tolerance", 0.25)   # [m] along-row tol for "same tree"
+        self.declare_parameter("lateral_tolerance", 0.25)     # [m] lateral tol for "same tree"
 
         # Frames
         self.declare_parameter("camera_frame", "base_camera_color_optical_frame")
         self.declare_parameter("target_frame", "world")
 
         # Row datum visualization params
-        self.declare_parameter("row_datum_update_rate_hz", 5.0)
+        self.declare_parameter("row_datum_update_rate_hz", 30.0)
         self.declare_parameter("row_datum_line_width", 0.1)
 
         self.input_topic = self.get_parameter("input_topic").value
@@ -92,6 +103,25 @@ class TrunkClusterToTemplateNode(Node):
         else:
             self.row_axis[:] = np.array([1.0, 0.0, 0.0], dtype=float)
 
+
+        # Side/slot settings
+        self.side_mode = str(self.get_parameter("side_mode").value).strip().lower()
+        if self.side_mode not in ("datum", "slot_alternating"):
+            self.get_logger().warn(
+                f"side_mode='{self.side_mode}' not in {{datum, slot_alternating}}; defaulting to 'datum'."
+            )
+            self.side_mode = "datum"
+
+        self.slot_spacing = float(self.get_parameter("slot_spacing").value)
+        self.row_origin_s = float(self.get_parameter("row_origin_s").value)
+
+        self.start_side = str(self.get_parameter("start_side").value).strip().lower()
+        if self.start_side not in ("near", "far"):
+            self.get_logger().warn(
+                f"start_side='{self.start_side}' not in {{near, far}}; defaulting to 'near'."
+            )
+            self.start_side = "near"
+
         self.along_row_tolerance = float(self.get_parameter("along_row_tolerance").value)
         self.lateral_tolerance = float(self.get_parameter("lateral_tolerance").value)
 
@@ -113,9 +143,11 @@ class TrunkClusterToTemplateNode(Node):
         # -------- Tracks --------
         # track_id -> {
         #   "id": int,
-        #   "sum_pos": np.array(3),
+        #   "sum_pos": np.array(3),       # centroid accumulator in TARGET FRAME
         #   "num_pos": int,
-        #   "last_pos": np.array(3),
+        #   "last_pos": np.array(3),      # last detection in TARGET FRAME
+        #   "sum_pos_cam": np.array(3),   # centroid accumulator in CAMERA FRAME
+        #   "last_pos_cam": np.array(3),  # last detection in CAMERA FRAME
         #   "width_sum": float,
         #   "width_count": int,
         #   "width_mean": float | None,
@@ -130,10 +162,18 @@ class TrunkClusterToTemplateNode(Node):
         # Registry of committed trunks (in memory only, for datum & debugging)
         self.committed_trunks: list[TrunkInfo] = []
 
-        # -------- NEW: Publisher for trunk observations --------
+        # -------- Publisher for trunk observations (TARGET FRAME) --------
         self.trunk_obs_pub = self.create_publisher(
             TrunkInfo,
             "trunk_observations",  # RowPriorMapper subscribes to this
+            10,
+        )
+
+        # -------- Publisher for FastSLAM trunk measurements (CAMERA FRAME) --------
+        # RowFastSLAMNode will subscribe to this and treat pose.position as a robot-frame measurement.
+        self.trunk_meas_pub = self.create_publisher(
+            TrunkInfo,
+            "trunk_measurements",
             10,
         )
 
@@ -211,18 +251,25 @@ class TrunkClusterToTemplateNode(Node):
             width = float(widths[i]) if widths is not None else None
 
             # Map 2D (x,y) to a 3D point in camera frame
-            pos_cam = np.array([-xy[0], 0.0, -xy[1]], dtype=float)
+            pos_cam = np.array([xy[0], 0.0, xy[1]], dtype=float)
 
             pos_target = self.transform_to_target_frame(pos_cam, msg.header.stamp)
             if pos_target is None:
+                self.get_logger().warn('transform unavailable; skipping detection.')
                 continue
 
-            self._assign_detection_to_track(t_msg, pos_target, width)
+            # Track stores positions in both TARGET FRAME (for datum + registry)
+            # and CAMERA FRAME (for FastSLAM measurements).
+            self._assign_detection_to_track(t_msg, pos_target, pos_cam, width)
 
     # ---------------- Track assignment ----------------
 
     def _assign_detection_to_track(
-        self, t: float, pos: np.ndarray, width: Optional[float]
+        self,
+        t: float,
+        pos: np.ndarray,
+        pos_cam: np.ndarray,
+        width: Optional[float],
     ):
         """
         Assign detection to the best existing track if:
@@ -263,6 +310,8 @@ class TrunkClusterToTemplateNode(Node):
                 "sum_pos": pos.copy(),
                 "num_pos": 1,
                 "last_pos": pos.copy(),
+                "sum_pos_cam": pos_cam.copy(),
+                "last_pos_cam": pos_cam.copy(),
                 "width_sum": width_sum,
                 "width_count": width_count,
                 "width_mean": width if width is not None else None,
@@ -282,6 +331,8 @@ class TrunkClusterToTemplateNode(Node):
             track["sum_pos"] += pos
             track["num_pos"] += 1
             track["last_pos"] = pos
+            track["sum_pos_cam"] += pos_cam
+            track["last_pos_cam"] = pos_cam
             if width is not None:
                 track["width_sum"] += width
                 track["width_count"] += 1
@@ -300,7 +351,9 @@ class TrunkClusterToTemplateNode(Node):
         """
         Periodically:
           - For each uncommitted track with enough hits, decide if it's a new tree
-            and, if so, classify its side and publish a TrunkInfo observation.
+            and, if so, classify its side and publish:
+              - a TrunkInfo observation in TARGET FRAME on 'trunk_observations'
+              - a TrunkInfo measurement in CAMERA FRAME on 'trunk_measurements'
           - Update the row datum marker.
         """
         if not self.tracks:
@@ -316,6 +369,7 @@ class TrunkClusterToTemplateNode(Node):
                 continue
 
             centroid = track["sum_pos"] / track["num_pos"]
+            centroid_cam = track["sum_pos_cam"] / track["num_pos"]
 
             # Classify side first so we can use it in the uniqueness check
             side = self.classify_side_for_tree(centroid)
@@ -325,36 +379,39 @@ class TrunkClusterToTemplateNode(Node):
 
                 self.get_logger().info(
                     f"New trunk track {track_id} (side={side}) in {self.target_frame} "
-                    f"at {centroid}, publishing TrunkInfo observation."
+                    f"at {centroid}, publishing TrunkInfo observation + measurement."
                 )
 
+                # Pose in TARGET FRAME (for RowPriorMapper / registry)
                 pose = Pose()
                 pose.position.x = float(centroid[0])
                 pose.position.y = float(centroid[1])
                 pose.position.z = float(centroid[2])
-
-                # Orientation here is optional; RowPriorMapper will overwrite yaw from its datum.
-                # You can leave it as identity or use your fitted datum yaw as a better initial guess.
-                quat = self.compute_datum_yaw_quaternion()
-                if quat is not None:
-                    pose.orientation.x = float(quat[0])
-                    pose.orientation.y = float(quat[1])
-                    pose.orientation.z = float(quat[2])
-                    pose.orientation.w = float(quat[3])
-                else:
-                    pose.orientation.w = 1.0
+                pose.orientation.w = 1.0
 
                 width_mean = track["width_mean"]
 
-                # Build and publish TrunkInfo observation
+                # Build and publish TrunkInfo observation in TARGET FRAME
                 tinfo = TrunkInfo()
                 tinfo.pose = pose
                 tinfo.side = side or ""
                 tinfo.width = float(width_mean) if width_mean is not None else float("nan")
-
                 self.trunk_obs_pub.publish(tinfo)
 
-                # Also publish a committed trunk marker
+                # Pose in CAMERA FRAME (for RowFastSLAMNode)
+                meas_pose = Pose()
+                meas_pose.position.x = float(centroid_cam[0])
+                meas_pose.position.y = float(centroid_cam[1])
+                meas_pose.position.z = float(centroid_cam[2])
+                meas_pose.orientation.w = 1.0  # identity; FastSLAM only uses position
+
+                tinfo_meas = TrunkInfo()
+                tinfo_meas.pose = meas_pose
+                tinfo_meas.side = side or ""
+                tinfo_meas.width = float(width_mean) if width_mean is not None else float("nan")
+                self.trunk_meas_pub.publish(tinfo_meas)
+
+                # Also publish a committed trunk marker (TARGET FRAME)
                 self.publish_committed_trunk_marker(pose, track_id)
 
                 # Also store for datum fitting & optional debug registry
@@ -375,42 +432,61 @@ class TrunkClusterToTemplateNode(Node):
 
     # ---------------- Side classification using row datum ----------------
 
+    
+    def _side_for_slot(self, j: int) -> str:
+        """Deterministic alternating side assignment based on slot index."""
+        if self.start_side == "near":
+            return "near" if (j % 2 == 0) else "far"
+        else:
+            return "far" if (j % 2 == 0) else "near"
+
+    def _slot_index_for_position(self, pos_target: np.ndarray) -> int:
+        """Compute the nearest slot index from a world-frame position."""
+        # Use s = row_axis^T * p (absolute projection), then offset by row_origin_s
+        p = np.array([float(pos_target[0]), float(pos_target[1]), 0.0], dtype=float)
+        s_abs = float(np.dot(p, self.row_axis))
+        j = int(np.round((s_abs - self.row_origin_s) / self.slot_spacing))
+        return j
+
     def classify_side_for_tree(self, pos_target: np.ndarray) -> str:
-        """
-        Classify a committed tree as 'near' or 'far' based on the sign of the
-        perpendicular distance from the point to the fitted row datum line
-        y = m x + b in the XY plane.
-        """
-        fit = self._fit_row_datum_line()
-        if fit is None:
-            self.get_logger().warn(
-                "Cannot classify side: not enough committed trunks to fit datum. "
-                "Defaulting to 'unknown'."
+            """
+            Classify a committed tree as 'near' or 'far'.
+
+            Modes:
+              - side_mode == "slot_alternating": side = alternating parity of the nearest slot index
+              - side_mode == "datum": sign of perpendicular distance to fitted row datum line (legacy)
+            """
+            if self.side_mode == "slot_alternating":
+                j = self._slot_index_for_position(pos_target)
+                return self._side_for_slot(j)
+
+            # ---------- legacy datum-based classification ----------
+            fit = self._fit_row_datum_line()
+            if fit is None:
+                self.get_logger().warn(
+                    "Cannot classify side: not enough committed trunks to fit datum. "
+                    "Defaulting to 'unknown'."
+                )
+                return "unknown"
+
+            m, b = fit
+            x = float(pos_target[0])
+            y = float(pos_target[1])
+
+            y_line = m * x + b
+            denom = np.sqrt(m * m + 1.0)
+            if denom < 1e-9:
+                return "unknown"
+
+            signed_dist = (y - y_line) / denom
+            side = "near" if signed_dist < 0.0 else "far"
+
+            self.get_logger().debug(
+                f"Classified tree at (x={x:.2f}, y={y:.2f}) relative to datum "
+                f"y={m:.3f}x+{b:.3f}: signed_dist={signed_dist:.3f} m -> side={side}"
             )
-            return "unknown"
 
-        m, b = fit
-        x = float(pos_target[0])
-        y = float(pos_target[1])
-        y_line = m * x + b
-
-        denom = np.sqrt(m * m + 1.0)
-        if denom < 1e-6:
-            self.get_logger().warn(
-                "Row datum line is nearly degenerate; cannot compute perpendicular distance. "
-                "Defaulting to 'unknown'."
-            )
-            return "unknown"
-
-        signed_dist = (y - y_line) / denom
-        side = "near" if signed_dist < 0.0 else "far"
-
-        self.get_logger().debug(
-            f"Classified tree at (x={x:.2f}, y={y:.2f}) relative to datum "
-            f"y={m:.3f}x+{b:.3f}: signed_dist={signed_dist:.3f} m -> side={side}"
-        )
-
-        return side
+            return side
 
     def _get_all_positions_on_side(self, side: str) -> list[np.ndarray]:
         """
@@ -590,7 +666,7 @@ class TrunkClusterToTemplateNode(Node):
     ) -> tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Convert TreeImageData into:
-          - pts: (N, 2) array of [x, y] points in CAMERA FRAME
+          - pts: (N, 2) array of [x, y] points in CAMERA IMAGE COORDS
           - widths: (N,) array if available, else None
         """
         xs = np.array(msg.xs, dtype=np.float32)
