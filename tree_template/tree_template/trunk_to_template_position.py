@@ -42,72 +42,54 @@ class TrunkClusterToTemplateNode(Node):
     def __init__(self):
         super().__init__("trunk_cluster_to_template_node")
 
-        # -------- Parameters --------
+        # -------- Parameters (declare) --------
         self.declare_parameter("input_topic", "tree_image_data")
-        self.declare_parameter("min_samples", 7)            # min hits per track before committing
-        self.declare_parameter("cluster_timer_period", 1.0)  # how often to evaluate tracks [s]
+        self.declare_parameter("min_samples", 7)
+        self.declare_parameter("cluster_timer_period", 1.0)
 
-        # Track association gates (in TARGET FRAME)
-        self.declare_parameter("track_position_gate", 0.3)   # [m] max distance to associate detection to track
-        self.declare_parameter("track_width_gate", 0.02)     # width tol for associating to same track
+        self.declare_parameter("track_position_gate", 0.3)
+        self.declare_parameter("track_width_gate", 0.02)
+        self.declare_parameter("uniqueness_radius", 0.3)
 
-        # "New tree" logic
-        self.declare_parameter("uniqueness_radius", 0.3)     # if > 0, use simple Euclidean threshold [m]
-
-        # Row axis (along row) and anisotropic gating
         self.declare_parameter("row_axis_x", 1.0)
         self.declare_parameter("row_axis_y", 0.0)
         self.declare_parameter("row_axis_z", 0.0)
 
-        # Side classification mode:
-        #   "datum" => fit row datum line to committed trunks (legacy)
-        #   "slot_alternating" => classify side deterministically by slot index parity
-        self.declare_parameter("side_mode", "datum")
+        self.declare_parameter("side_mode", "trunk_depth")  # "datum" | "slot_alternating" | "trunk_depth"
+        self.declare_parameter("slot_spacing", 0.75)
+        self.declare_parameter("row_origin_s", 0.0)
+        self.declare_parameter("start_side", "far")
+        self.declare_parameter("along_row_tolerance", 0.25)
+        self.declare_parameter("lateral_tolerance", 0.25)
 
-        # Slot-based side parameters (used when side_mode == "slot_alternating")
-        self.declare_parameter("slot_spacing", 0.75)   # meters
-        self.declare_parameter("row_origin_s", 0.0)    # reference s for slot 0
-        self.declare_parameter("start_side", "far")   # slot 0 side
-        self.declare_parameter("along_row_tolerance", 0.25)   # [m] along-row tol for "same tree"
-        self.declare_parameter("lateral_tolerance", 0.25)     # [m] lateral tol for "same tree"
-
-        # Frames
         self.declare_parameter("camera_frame", "base_camera_color_optical_frame")
         self.declare_parameter("target_frame", "odom_slam")
 
-        # Row datum visualization params
         self.declare_parameter("row_datum_line_width", 0.1)
 
-        self.input_topic = self.get_parameter("input_topic").value
+        # -------- Parameters (read + validate) --------
+        self.input_topic = str(self.get_parameter("input_topic").value)
         self.min_samples = int(self.get_parameter("min_samples").value)
         self.cluster_timer_period = float(self.get_parameter("cluster_timer_period").value)
 
         self.track_position_gate = float(self.get_parameter("track_position_gate").value)
         self.track_width_gate = float(self.get_parameter("track_width_gate").value)
-
         self.uniqueness_radius = float(self.get_parameter("uniqueness_radius").value)
 
-        # Row axis (for along/lateral decomposition) used for uniqueness gating
-        self.row_axis = np.array(
-            [
-                float(self.get_parameter("row_axis_x").value),
-                float(self.get_parameter("row_axis_y").value),
-                float(self.get_parameter("row_axis_z").value),
-            ],
-            dtype=float,
-        )
-        norm = np.linalg.norm(self.row_axis)
-        if norm > 1e-6:
-            self.row_axis /= norm
+        row_axis_x = float(self.get_parameter("row_axis_x").value)
+        row_axis_y = float(self.get_parameter("row_axis_y").value)
+        row_axis_z = float(self.get_parameter("row_axis_z").value)
+        self.row_axis = np.array([row_axis_x, row_axis_y, row_axis_z], dtype=float)
+        axis_norm = float(np.linalg.norm(self.row_axis))
+        if axis_norm > 1e-6:
+            self.row_axis = self.row_axis / axis_norm
         else:
-            self.row_axis[:] = np.array([1.0, 0.0, 0.0], dtype=float)
+            self.row_axis = np.array([1.0, 0.0, 0.0], dtype=float)
 
-
-        # Side/slot settings
         self.side_mode = str(self.get_parameter("side_mode").value).strip().lower()
-        if self.side_mode not in ("datum", "slot_alternating"):
+        if self.side_mode not in ("datum", "slot_alternating", "trunk_depth"):
             self.get_logger().warn(
-                f"side_mode='{self.side_mode}' not in {{datum, slot_alternating}}; defaulting to 'datum'."
+                f"side_mode='{self.side_mode}' not in {{datum, slot_alternating, trunk_depth}}; defaulting to 'datum'."
             )
             self.side_mode = "datum"
 
@@ -124,56 +106,39 @@ class TrunkClusterToTemplateNode(Node):
         self.along_row_tolerance = float(self.get_parameter("along_row_tolerance").value)
         self.lateral_tolerance = float(self.get_parameter("lateral_tolerance").value)
 
-        self.camera_frame = self.get_parameter("camera_frame").value
-        self.target_frame = self.get_parameter("target_frame").value
+        self.camera_frame = str(self.get_parameter("camera_frame").value)
+        self.target_frame = str(self.get_parameter("target_frame").value)
 
-        # Row datum visualization params
-        self.row_datum_line_width = float(
-            self.get_parameter("row_datum_line_width").value
-        )
+        self.row_datum_line_width = float(self.get_parameter("row_datum_line_width").value)
 
+        # -------- State --------
         self.tree_image_data_timestamp: Optional[Time] = None
+
+        self.tracks: Dict[int, Dict] = {}
+        self.next_track_id = 0
+        self.committed_trunks: list[TrunkInfo] = []
+
+        # -------- Row datum cache --------
+        self._datum_fit: Optional[tuple[float, float]] = None
+        self._datum_fit_cached_for_version: int = -1
+        self._datum_fit_version: int = 0
 
         # -------- TF2 --------
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # -------- Tracks --------
-        # track_id -> {
-        #   "id": int,
-        #   "sum_pos": np.array(3),       # centroid accumulator in TARGET FRAME
-        #   "num_pos": int,
-        #   "last_pos": np.array(3),      # last detection in TARGET FRAME
-        #   "sum_pos_cam": np.array(3),   # centroid accumulator in CAMERA FRAME
-        #   "last_pos_cam": np.array(3),  # last detection in CAMERA FRAME
-        #   "width_sum": float,
-        #   "width_count": int,
-        #   "width_mean": float | None,
-        #   "first_seen_time": float,
-        #   "last_seen_time": float,
-        #   "hit_count": int,
-        #   "committed": bool,
-        # }
-        self.tracks: Dict[int, Dict] = {}
-        self.next_track_id = 0
+        # -------- Publishers --------
+        self.trunk_obs_pub = self.create_publisher(TrunkInfo, "trunk_observations", 10)
+        self.trunk_meas_pub = self.create_publisher(TrunkInfo, "trunk_measurements", 10)
+        self.row_datum_pub = self.create_publisher(Marker, "trunk_row_datum", 10)
+        self.trunk_marker_pub = self.create_publisher(Marker, "committed_trunk_markers", 10)
 
-        # Registry of committed trunks (in memory only, for datum & debugging)
-        self.committed_trunks: list[TrunkInfo] = []
-
-        # -------- Publisher for trunk observations (TARGET FRAME) --------
-        self.trunk_obs_pub = self.create_publisher(
-            TrunkInfo,
-            "trunk_observations",  # RowPriorMapper subscribes to this
-            10,
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-
-        # -------- Publisher for FastSLAM trunk measurements (CAMERA FRAME) --------
-        # RowFastSLAMNode will subscribe to this and treat pose.position as a robot-frame measurement.
-        self.trunk_meas_pub = self.create_publisher(
-            TrunkInfo,
-            "trunk_measurements",
-            10,
-        )
+        self.trunk_registry_pub = self.create_publisher(TrunkRegistry, "trunk_registry", qos)
 
         # -------- Subscriber --------
         self.sub = self.create_subscription(
@@ -183,43 +148,21 @@ class TrunkClusterToTemplateNode(Node):
             10,
         )
 
-        # -------- Publisher for row datum --------
-        self.row_datum_pub = self.create_publisher(Marker, "trunk_row_datum", 10)
-
-        # -------- Optional publisher for trunk registry (debug) --------
-        qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self.trunk_registry_pub = self.create_publisher(
-            TrunkRegistry,
-            "trunk_registry",
-            qos,
-        )
-
-        # -------- Publisher for committed trunk markers --------
-        self.trunk_marker_pub = self.create_publisher(
-            Marker,
-            "committed_trunk_markers",
-            10,
-        )
-
-        # -------- Timer for track evaluation / committing / updating datum --------
+        # -------- Timer --------
         self.timer = self.create_timer(
-            self.cluster_timer_period, self.track_evaluation_timer_callback
+            self.cluster_timer_period,
+            self.track_evaluation_timer_callback,
         )
 
+        # -------- Startup log --------
         self.get_logger().info(
             "TrunkClusterToTemplateNode started.\n"
             f"  Subscribing to: {self.input_topic}\n"
             f"  min_samples={self.min_samples}\n"
-            f"  Track gates: position={self.track_position_gate:.3f} m, "
-            f"width={self.track_width_gate:.4f}\n"
+            f"  Track gates: position={self.track_position_gate:.3f} m, width={self.track_width_gate:.4f}\n"
             f"  Uniqueness radius: {self.uniqueness_radius:.3f} m\n"
-            f"  Row axis: {self.row_axis}, along_tol={self.along_row_tolerance:.2f}, "
-            f"lat_tol={self.lateral_tolerance:.2f}\n"
-            f"  Side classification: based on near/far side of fitted row datum line.\n"
+            f"  Row axis: {self.row_axis}, along_tol={self.along_row_tolerance:.2f}, lat_tol={self.lateral_tolerance:.2f}\n"
+            f"  Side mode: {self.side_mode}\n"
             f"  Cluster period: {self.cluster_timer_period:.2f} s\n"
             f"  Row datum: line_width={self.row_datum_line_width:.3f}\n"
             f"  Frames: camera_frame='{self.camera_frame}', target_frame='{self.target_frame}'"
@@ -228,38 +171,34 @@ class TrunkClusterToTemplateNode(Node):
     # ---------------- TreeImageData callback ----------------
 
     def tree_image_callback(self, msg: TreeImageData):
-        """
-        For each detection in the frame:
-          - Build a 3D point in CAMERA FRAME
-          - Transform to TARGET FRAME
-          - Assign to an existing track or create a new track
-        """
+        """Transform detections and assign them to tracks."""
         self.tree_image_data_timestamp = msg.header.stamp
         if not msg.object_seen:
             return
 
         t_msg = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        points_2d, widths = self.extract_points_and_widths_from_msg(msg)
 
-        if points_2d.size == 0:
+        points_2d, widths, top_2d, bottom_2d = self.extract_points_and_widths_from_msg(msg)
+        if points_2d.size == 0 or top_2d.size == 0 or bottom_2d.size == 0:
             return
 
-        n = points_2d.shape[0]
-        for i in range(n):
-            xy = points_2d[i]
-            width = float(widths[i]) if widths is not None else None
+        stamp = msg.header.stamp
+        for xy, xy_top, xy_bot, w in zip(points_2d, top_2d, bottom_2d, widths):
+            width = float(w) if widths is not None else None
 
-            # Map 2D (x,y) to a 3D point in camera frame
             pos_cam = np.array([xy[0], 0.0, xy[1]], dtype=float)
+            top_cam = np.array([xy_top[0], 0.0, xy_top[1]], dtype=float)
+            bot_cam = np.array([xy_bot[0], 0.0, xy_bot[1]], dtype=float)
 
-            pos_target = self.transform_to_target_frame(pos_cam, msg.header.stamp)
-            if pos_target is None:
-                self.get_logger().warn('transform unavailable; skipping detection.')
+            pos_t = self.transform_to_target_frame(pos_cam, stamp)
+            top_t = self.transform_to_target_frame(top_cam, stamp)
+            bot_t = self.transform_to_target_frame(bot_cam, stamp)
+
+            if pos_t is None or top_t is None or bot_t is None:
+                self.get_logger().warn("transform unavailable; skipping detection.")
                 continue
 
-            # Track stores positions in both TARGET FRAME (for datum + registry)
-            # and CAMERA FRAME (for FastSLAM measurements).
-            self._assign_detection_to_track(t_msg, pos_target, pos_cam, width)
+            self._assign_detection_to_track(t_msg, pos_t, pos_cam, width, top_t, bot_t)
 
     # ---------------- Track assignment ----------------
 
@@ -269,22 +208,24 @@ class TrunkClusterToTemplateNode(Node):
         pos: np.ndarray,
         pos_cam: np.ndarray,
         width: Optional[float],
+        top_target: np.ndarray,
+        bottom_target: np.ndarray,
     ):
         """
-        Assign detection to the best existing track if:
-          - distance in TARGET FRAME < track_position_gate,
-          - (if width info available) width difference < track_width_gate.
+        Assign detection to the best existing (uncommitted) track if:
+        - distance in TARGET FRAME < track_position_gate
+        - (if width available) width difference < track_width_gate
 
-        Otherwise, create a new track.
+        Otherwise create a new track.
         """
         best_track_id = None
-        best_dist = None
+        best_dist = float("inf")
 
         for track_id, track in self.tracks.items():
             if track["committed"]:
                 continue
 
-            dist = np.linalg.norm(pos - track["last_pos"])
+            dist = float(np.linalg.norm(pos - track["last_pos"]))
             if dist > self.track_position_gate:
                 continue
 
@@ -292,136 +233,142 @@ class TrunkClusterToTemplateNode(Node):
                 if abs(width - track["width_mean"]) > self.track_width_gate:
                     continue
 
-            if best_dist is None or dist < best_dist:
+            if dist < best_dist:
                 best_dist = dist
                 best_track_id = track_id
 
+        # ---------------- Create ----------------
         if best_track_id is None:
-            # Start new track
             track_id = self.next_track_id
             self.next_track_id += 1
 
-            width_sum = width if width is not None else 0.0
+            width_sum = float(width) if width is not None else 0.0
             width_count = 1 if width is not None else 0
+            width_mean = float(width) if width is not None else None
 
-            track = {
+            self.tracks[track_id] = {
                 "id": track_id,
                 "sum_pos": pos.copy(),
                 "num_pos": 1,
                 "last_pos": pos.copy(),
                 "sum_pos_cam": pos_cam.copy(),
                 "last_pos_cam": pos_cam.copy(),
+                "sum_top_target": top_target.copy(),
+                "last_top_target": top_target.copy(),
+                "sum_bottom_target": bottom_target.copy(),
+                "last_bottom_target": bottom_target.copy(),
                 "width_sum": width_sum,
                 "width_count": width_count,
-                "width_mean": width if width is not None else None,
+                "width_mean": width_mean,
                 "first_seen_time": t,
                 "last_seen_time": t,
                 "hit_count": 1,
                 "committed": False,
             }
-            self.tracks[track_id] = track
 
-            self.get_logger().debug(
-                f"Started new track {track_id}: pos={pos}, width={width}"
-            )
-        else:
-            # Update existing track
-            track = self.tracks[best_track_id]
-            track["sum_pos"] += pos
-            track["num_pos"] += 1
-            track["last_pos"] = pos
-            track["sum_pos_cam"] += pos_cam
-            track["last_pos_cam"] = pos_cam
-            if width is not None:
-                track["width_sum"] += width
-                track["width_count"] += 1
-                track["width_mean"] = track["width_sum"] / track["width_count"]
-            track["last_seen_time"] = t
-            track["hit_count"] += 1
+            self.get_logger().debug(f"Started new track {track_id}: pos={pos}, width={width}")
+            return
 
-            self.get_logger().debug(
-                f"Updated track {best_track_id}: "
-                f"last_pos={track['last_pos']}, width_mean={track['width_mean']}"
-            )
+        # ---------------- Update ----------------
+        track = self.tracks[best_track_id]
+
+        track["sum_pos"] += pos
+        track["num_pos"] += 1
+        track["last_pos"] = pos
+        track["sum_pos_cam"] += pos_cam
+        track["last_pos_cam"] = pos_cam
+        track["sum_top_target"] += top_target
+        track["last_top_target"] = top_target
+        track["sum_bottom_target"] += bottom_target
+        track["last_bottom_target"] = bottom_target
+        if width is not None:
+            track["width_sum"] += float(width)
+            track["width_count"] += 1
+            track["width_mean"] = track["width_sum"] / track["width_count"]
+        track["last_seen_time"] = t
+        track["hit_count"] += 1
+
+        self.get_logger().debug(
+            f"Updated track {best_track_id}: last_pos={track['last_pos']}, width_mean={track['width_mean']}"
+        )
 
     # ---------------- Track evaluation / committing timer ----------------
 
     def track_evaluation_timer_callback(self):
         """
         Periodically:
-          - For each uncommitted track with enough hits, decide if it's a new tree
+        - For each uncommitted track with enough hits, decide if it's a new tree
             and, if so, classify its side and publish:
-              - a TrunkInfo observation in TARGET FRAME on 'trunk_observations'
-              - a TrunkInfo measurement in CAMERA FRAME on 'trunk_measurements'
-          - Update the row datum marker.
+            - a TrunkInfo observation in TARGET FRAME on 'trunk_observations'
+            - a TrunkInfo measurement in CAMERA FRAME on 'trunk_measurements'
+        - Update the row datum marker.
         """
         if not self.tracks:
             self.get_logger().debug("No tracks to evaluate.")
             return
 
         new_obs = 0
+
         for track_id, track in self.tracks.items():
-            if track["committed"]:
+            if track["committed"] or track["hit_count"] < self.min_samples:
                 continue
 
-            if track["hit_count"] < self.min_samples:
-                continue
+            inv_n = 1.0 / float(track["num_pos"])
+            centroid = track["sum_pos"] * inv_n
+            centroid_cam = track["sum_pos_cam"] * inv_n
+            top_coord = track["sum_top_target"] * inv_n
+            bottom_coord = track["sum_bottom_target"] * inv_n
 
-            centroid = track["sum_pos"] / track["num_pos"]
-            centroid_cam = track["sum_pos_cam"] / track["num_pos"]
-
-            # Classify side first so we can use it in the uniqueness check
-            side = self.classify_side_for_tree(centroid)
-
-            if self.is_position_new(centroid, side):
-                track["committed"] = True
-
-                self.get_logger().info(
-                    f"New trunk track {track_id} (side={side}) in {self.target_frame} "
-                    f"at {centroid}, publishing TrunkInfo observation + measurement."
-                )
-
-                # Pose in TARGET FRAME (for RowPriorMapper / registry)
-                pose = Pose()
-                pose.position.x = float(centroid[0])
-                pose.position.y = float(centroid[1])
-                pose.position.z = float(centroid[2])
-                pose.orientation.w = 1.0
-
-                width_mean = track["width_mean"]
-
-                # Build and publish TrunkInfo observation in TARGET FRAME
-                tinfo = TrunkInfo()
-                tinfo.pose = pose
-                tinfo.side = side or ""
-                tinfo.width = float(width_mean) if width_mean is not None else float("nan")
-                self.trunk_obs_pub.publish(tinfo)
-
-                # Pose in CAMERA FRAME (for RowFastSLAMNode)
-                meas_pose = Pose()
-                meas_pose.position.x = float(centroid_cam[0])
-                meas_pose.position.y = float(centroid_cam[1])
-                meas_pose.position.z = float(centroid_cam[2])
-                meas_pose.orientation.w = 1.0  # identity; FastSLAM only uses position
-
-                tinfo_meas = TrunkInfo()
-                tinfo_meas.pose = meas_pose
-                tinfo_meas.side = side or ""
-                tinfo_meas.width = float(width_mean) if width_mean is not None else float("nan")
-                self.trunk_meas_pub.publish(tinfo_meas)
-
-                # Also publish a committed trunk marker (TARGET FRAME)
-                self.publish_committed_trunk_marker(pose, track_id)
-
-                # Also store for datum fitting & optional debug registry
-                self.committed_trunks.append(tinfo)
-                self.publish_trunk_registry()
-                new_obs += 1
-            else:
+            side = self.classify_side_for_tree(centroid, top_coord, bottom_coord)
+            if not self.is_position_new(centroid, side):
                 self.get_logger().debug(
-                    f"Track {track_id} centroid {centroid} is not new "
-                    f"(within uniqueness criteria); skipping."
+                    f"Track {track_id} centroid {centroid} is not new (within uniqueness criteria); skipping."
                 )
+                continue
+
+            track["committed"] = True
+
+            self.get_logger().info(
+                f"New trunk track {track_id} (side={side}) in {self.target_frame} at {centroid}, "
+                "publishing TrunkInfo observation + measurement."
+            )
+
+            width_mean = track["width_mean"]
+            width_out = float(width_mean) if width_mean is not None else float("nan")
+            side_out = side or ""
+
+            # --- TARGET FRAME observation ---
+            pose = Pose()
+            pose.position.x = float(centroid[0])
+            pose.position.y = float(centroid[1])
+            pose.position.z = float(centroid[2])
+            pose.orientation.w = 1.0
+
+            tinfo = TrunkInfo()
+            tinfo.pose = pose
+            tinfo.side = side_out
+            tinfo.width = width_out
+            self.trunk_obs_pub.publish(tinfo)
+
+            # --- CAMERA FRAME measurement ---
+            meas_pose = Pose()
+            meas_pose.position.x = float(centroid_cam[0])
+            meas_pose.position.y = float(centroid_cam[1])
+            meas_pose.position.z = float(centroid_cam[2])
+            meas_pose.orientation.w = 1.0  # identity; FastSLAM only uses position
+
+            tinfo_meas = TrunkInfo()
+            tinfo_meas.pose = meas_pose
+            tinfo_meas.side = side_out
+            tinfo_meas.width = width_out
+            self.trunk_meas_pub.publish(tinfo_meas)
+
+            # --- Bookkeeping / viz ---
+            self.publish_committed_trunk_marker(pose, track_id)
+            self.committed_trunks.append(tinfo)
+            self.publish_trunk_registry()
+            new_obs += 1
+            self._datum_fit_version += 1
 
         # Update / republish datum marker based on committed trunks
         self.row_datum_timer_callback()
@@ -430,7 +377,6 @@ class TrunkClusterToTemplateNode(Node):
             self.get_logger().info(f"Published {new_obs} TrunkInfo observation(s).")
 
     # ---------------- Side classification using row datum ----------------
-
     
     def _side_for_slot(self, j: int) -> str:
         """Deterministic alternating side assignment based on slot index."""
@@ -447,45 +393,65 @@ class TrunkClusterToTemplateNode(Node):
         j = int(np.round((s_abs - self.row_origin_s) / self.slot_spacing))
         return j
 
-    def classify_side_for_tree(self, pos_target: np.ndarray) -> str:
-            """
-            Classify a committed tree as 'near' or 'far'.
-
-            Modes:
-              - side_mode == "slot_alternating": side = alternating parity of the nearest slot index
-              - side_mode == "datum": sign of perpendicular distance to fitted row datum line (legacy)
-            """
-            if self.side_mode == "slot_alternating":
-                j = self._slot_index_for_position(pos_target)
-                return self._side_for_slot(j)
-
-            # ---------- legacy datum-based classification ----------
-            fit = self._fit_row_datum_line()
-            if fit is None:
-                self.get_logger().warn(
-                    "Cannot classify side: not enough committed trunks to fit datum. "
-                    "Defaulting to 'unknown'."
-                )
-                return "unknown"
-
-            m, b = fit
-            x = float(pos_target[0])
-            y = float(pos_target[1])
-
-            y_line = m * x + b
-            denom = np.sqrt(m * m + 1.0)
-            if denom < 1e-9:
-                return "unknown"
-
-            signed_dist = (y - y_line) / denom
-            side = "near" if signed_dist < 0.0 else "far"
-
-            self.get_logger().debug(
-                f"Classified tree at (x={x:.2f}, y={y:.2f}) relative to datum "
-                f"y={m:.3f}x+{b:.3f}: signed_dist={signed_dist:.3f} m -> side={side}"
+    def _get_trunk_top_and_bottom_depths(self, top_coord: np.ndarray, bottom_coord: np.ndarray) -> str:
+        """Classify side based on trunk top and bottom depths in TARGET FRAME."""
+        if top_coord[1] > bottom_coord[1]:
+            return "far"
+        elif top_coord[1] < bottom_coord[1]:
+            return "near"
+        else:
+            return "unknown"
+        
+    def _get_datum_side_classification(self, pos_target: np.ndarray) -> str:
+        """Classify side based on perpendicular distance to fitted row datum line."""
+        fit = self._fit_row_datum_line()
+        if fit is None:
+            self.get_logger().warn(
+                "Cannot classify side: not enough committed trunks to fit datum. Defaulting to 'unknown'."
             )
+            return "unknown"
 
-            return side
+        m, b = fit
+        x = float(pos_target[0])
+        y = float(pos_target[1])
+
+        denom = float(np.sqrt(m * m + 1.0))
+        if denom < 1e-9:
+            return "unknown"
+
+        y_line = m * x + b
+        signed_dist = (y - y_line) / denom
+        side = "near" if signed_dist < 0.0 else "far"
+
+        self.get_logger().debug(
+            f"Classified tree at (x={x:.2f}, y={y:.2f}) relative to datum "
+            f"y={m:.3f}x+{b:.3f}: signed_dist={signed_dist:.3f} m -> side={side}"
+        )
+        return side
+
+    def classify_side_for_tree(
+        self,
+        pos_target: np.ndarray,
+        top_coord: np.ndarray,
+        bottom_coord: np.ndarray,
+    ) -> str:
+        """
+        Classify a committed tree as 'near' or 'far'.
+
+        Modes:
+        - side_mode == "slot_alternating": side = alternating parity of the nearest slot index
+        - side_mode == "trunk_depth": side = based on trunk top and bottom depths
+        - side_mode == "datum": sign of perpendicular distance to fitted row datum line (legacy)
+        """
+        if self.side_mode == "slot_alternating":
+            slot_idx = self._slot_index_for_position(pos_target)
+            return self._side_for_slot(slot_idx)
+
+        if self.side_mode == "trunk_depth":
+            return self._get_trunk_top_and_bottom_depths(top_coord, bottom_coord)
+        
+        if self.side_mode == "datum":
+            return self._get_datum_side_classification(pos_target)
 
     def _get_all_positions_on_side(self, side: str) -> list[np.ndarray]:
         """
@@ -528,18 +494,29 @@ class TrunkClusterToTemplateNode(Node):
         """
         Fit a single line y = m x + b to committed trunk positions.
         Returns (m, b) or None if not enough points.
+
+        Cached: recompute only when committed trunks change.
         """
+        # Use cached result if nothing changed
+        if self._datum_fit_cached_for_version == self._datum_fit_version:
+            return self._datum_fit
+
         trunks = self._trunks_for_row_datum()
         if len(trunks) < 2:
+            self._datum_fit = None
+            self._datum_fit_cached_for_version = self._datum_fit_version
             return None
 
-        pts = np.array(trunks, dtype=float)  # shape (N, 2)
+        pts = np.array(trunks, dtype=float)  # (N, 2)
         x = pts[:, 0]
         y = pts[:, 1]
 
         A = np.vstack([x, np.ones_like(x)]).T
         m, b = np.linalg.lstsq(A, y, rcond=None)[0]
-        return float(m), float(b)
+
+        self._datum_fit = (float(m), float(b))
+        self._datum_fit_cached_for_version = self._datum_fit_version
+        return self._datum_fit
 
     def compute_datum_yaw_quaternion(self) -> Optional[np.ndarray]:
         """
@@ -556,18 +533,18 @@ class TrunkClusterToTemplateNode(Node):
         return quat
 
     def row_datum_timer_callback(self):
-        """
-        Update the row datum marker based on current committed trunk positions.
-        """
         fit = self._fit_row_datum_line()
         if fit is None:
             return
 
-        m, b = fit
-        trunks = self._trunks_for_row_datum()
-        pts = np.array(trunks, dtype=float)
-        x = pts[:, 0]
-        self._publish_row_datum_line(m, b, x)
+        m, b = fit  # or m, b, denom if you did the optional step
+
+        positions = self.get_existing_positions()
+        if not positions:
+            return
+
+        xs = np.array([float(p[0]) for p in positions], dtype=float)
+        self._publish_row_datum_line(m, b, xs)
 
     def _trunks_for_row_datum(self) -> list[tuple[float, float]]:
         """
@@ -663,47 +640,82 @@ class TrunkClusterToTemplateNode(Node):
 
     def extract_points_and_widths_from_msg(
         self, msg: TreeImageData
-    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray]:
         """
         Convert TreeImageData into:
-          - pts: (N, 2) array of [x, y] points in CAMERA IMAGE COORDS
-          - widths: (N,) array if available, else None
+        - pts: (N, 2) array of [x, y] points in CAMERA IMAGE COORDS
+        - widths: (N,) array if available, else None
+        - top_pts: (N, 2) array
+        - bottom_pts: (N, 2) array
         """
         xs = np.array(msg.xs, dtype=np.float32)
         ys = np.array(msg.ys, dtype=np.float32)
+        top_xs = np.array(msg.top_xs, dtype=np.float32)
+        top_ys = np.array(msg.top_ys, dtype=np.float32)
+        bottom_xs = np.array(msg.bottom_xs, dtype=np.float32)
+        bottom_ys = np.array(msg.bottom_ys, dtype=np.float32)
+
         widths = np.array(msg.widths, dtype=np.float32) if msg.widths else None
 
+        empty = np.empty((0, 2), dtype=np.float32)
+
+        # ---- basic presence checks ----
         if xs.size == 0 or ys.size == 0:
-            return np.empty((0, 2), dtype=np.float32), None
+            return empty, None, empty, empty
+
+        if top_xs.size == 0 or top_ys.size == 0:
+            return empty, None, empty, empty
+
+        if bottom_xs.size == 0 or bottom_ys.size == 0:
+            return empty, None, empty, empty
 
         if widths is not None and widths.size == 0:
             widths = None
 
+        # ---- enforce consistent lengths ----
         if widths is not None:
-            n = min(xs.size, ys.size, widths.size)
-            if xs.size != n or ys.size != n or widths.size != n:
+            n = min(xs.size, ys.size, top_xs.size, top_ys.size, bottom_xs.size, bottom_ys.size, widths.size)
+            if (
+                xs.size != n or ys.size != n or widths.size != n
+                or top_xs.size != n or top_ys.size != n
+                or bottom_xs.size != n or bottom_ys.size != n
+            ):
                 self.get_logger().warn(
-                    f"Length mismatch in TreeImageData: "
-                    f"len(xs)={xs.size}, len(ys)={ys.size}, len(widths)={widths.size}; "
-                    f"truncating to {n}"
+                    f"Length mismatch in TreeImageData; truncating to {n}"
                 )
+
             xs = xs[:n]
             ys = ys[:n]
+            top_xs = top_xs[:n]
+            top_ys = top_ys[:n]
+            bottom_xs = bottom_xs[:n]
+            bottom_ys = bottom_ys[:n]
             widths = widths[:n]
+
         else:
-            if xs.size != ys.size:
+            n = min(xs.size, ys.size, top_xs.size, top_ys.size, bottom_xs.size, bottom_ys.size)
+            if (
+                xs.size != n or ys.size != n
+                or top_xs.size != n or top_ys.size != n
+                or bottom_xs.size != n or bottom_ys.size != n
+            ):
                 self.get_logger().warn(
-                    f"xs and ys length mismatch: len(xs)={xs.size}, len(ys)={ys.size}"
+                    f"Coordinate length mismatch in TreeImageData; truncating to {n}"
                 )
-                n = min(xs.size, ys.size)
-                xs = xs[:n]
-                ys = ys[:n]
 
-        if xs.size == 0:
-            return np.empty((0, 2), dtype=np.float32), None
+            xs = xs[:n]
+            ys = ys[:n]
+            top_xs = top_xs[:n]
+            top_ys = top_ys[:n]
+            bottom_xs = bottom_xs[:n]
+            bottom_ys = bottom_ys[:n]
 
-        pts = np.stack([xs, ys], axis=1).astype(np.float32)
-        return pts, widths
+        # ---- stack ----
+        pts = np.stack([xs, ys], axis=1)
+        top_pts = np.stack([top_xs, top_ys], axis=1)
+        bottom_pts = np.stack([bottom_xs, bottom_ys], axis=1)
+
+        return pts, widths, top_pts, bottom_pts
 
     def get_existing_positions(self) -> list[np.ndarray]:
         """
