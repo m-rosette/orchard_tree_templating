@@ -29,6 +29,7 @@ setup(
             'row_prior_mapper = tree_template.row_prior_mapper:main',
             'depth_image_to_pointcloud2 = tree_template.depth_image_to_pointcloud2:main',
             'row_fast_slam = tree_template.row_fast_slam:main',
+            'slam_odom_correction_tf = tree_template.slam_odom_correction_tf:main',
         ],
     },
 )

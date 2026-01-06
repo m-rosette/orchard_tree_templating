@@ -73,10 +73,9 @@ class TrunkClusterToTemplateNode(Node):
 
         # Frames
         self.declare_parameter("camera_frame", "base_camera_color_optical_frame")
-        self.declare_parameter("target_frame", "world")
+        self.declare_parameter("target_frame", "odom_slam")
 
         # Row datum visualization params
-        self.declare_parameter("row_datum_update_rate_hz", 30.0)
         self.declare_parameter("row_datum_line_width", 0.1)
 
         self.input_topic = self.get_parameter("input_topic").value
@@ -129,12 +128,11 @@ class TrunkClusterToTemplateNode(Node):
         self.target_frame = self.get_parameter("target_frame").value
 
         # Row datum visualization params
-        self.row_datum_update_rate_hz = float(
-            self.get_parameter("row_datum_update_rate_hz").value
-        )
         self.row_datum_line_width = float(
             self.get_parameter("row_datum_line_width").value
         )
+
+        self.tree_image_data_timestamp: Optional[Time] = None
 
         # -------- TF2 --------
         self.tf_buffer = tf2_ros.Buffer()
@@ -236,6 +234,7 @@ class TrunkClusterToTemplateNode(Node):
           - Transform to TARGET FRAME
           - Assign to an existing track or create a new track
         """
+        self.tree_image_data_timestamp = msg.header.stamp
         if not msg.object_seen:
             return
 
@@ -596,7 +595,8 @@ class TrunkClusterToTemplateNode(Node):
         marker = Marker()
         marker.header = Header()
         marker.header.frame_id = self.target_frame
-        marker.header.stamp = self.get_clock().now().to_msg()
+        # marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.stamp = self.tree_image_data_timestamp if self.tree_image_data_timestamp is not None else self.get_clock().now().to_msg()
         marker.ns = "trunk_row_datum"
         marker.id = 0
         marker.type = Marker.LINE_STRIP
@@ -640,8 +640,8 @@ class TrunkClusterToTemplateNode(Node):
             transform = self.tf_buffer.lookup_transform(
                 self.target_frame,
                 self.camera_frame,
-                Time.from_msg(stamp),
-                timeout=Duration(seconds=0.1),
+                Time(),  # zero time → latest transform
+                timeout=Duration(seconds=0.5),
             )
         except (
             tf2_ros.LookupException,
@@ -772,7 +772,8 @@ class TrunkClusterToTemplateNode(Node):
         """
         marker = Marker()
         marker.header = Header()
-        marker.header.stamp = self.get_clock().now().to_msg()
+        # marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.stamp = self.tree_image_data_timestamp if self.tree_image_data_timestamp is not None else self.get_clock().now().to_msg()
         marker.header.frame_id = self.target_frame
 
         marker.ns = "committed_trunks"

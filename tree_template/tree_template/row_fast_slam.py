@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
@@ -26,13 +27,15 @@ def wrap_angle(theta: float) -> float:
 
 
 def se2_from_odom(msg: Odometry) -> np.ndarray:
-    """Extract [x, y, yaw] from nav_msgs/Odometry."""
+    """Extract [x, y, yaw] from nav_msgs/Odometry using SciPy."""
     p = msg.pose.pose.position
     q = msg.pose.pose.orientation
 
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    yaw = float(np.arctan2(siny_cosp, cosy_cosp))
+    # ROS quaternions are (x, y, z, w)
+    rot = R.from_quat([q.x, q.y, q.z, q.w])
+
+    # Extract yaw (about Z) from ZYX Euler angles
+    yaw = rot.as_euler("zyx", degrees=False)[0]
 
     return np.array([float(p.x), float(p.y), yaw], dtype=float)
 
@@ -305,6 +308,10 @@ class RowFastSLAMNode(Node):
             noise = noise_std * np.random.randn(3)
             p.pose = cur_pose + noise
             p.pose[2] = wrap_angle(p.pose[2])
+
+        # Publish after motion update
+        self._publish_pose_from_best()
+        self._publish_odom_from_best()
 
     def _init_particles(self, init_pose: np.ndarray):
         """Initialize particle set around an initial pose (and optionally seed a template landmark map)."""
@@ -595,8 +602,8 @@ class RowFastSLAMNode(Node):
         p_best = self.particles[best_idx]
 
         ps = PoseStamped()
-        ps.header.frame_id = "world"
-        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.header.frame_id = "odom_slam"
+        ps.header.stamp = self._last_odom_msg.header.stamp if self._last_odom_msg else self.get_clock().now().to_msg()
 
         ps.pose.position.x = float(p_best.pose[0])
         ps.pose.position.y = float(p_best.pose[1])
@@ -609,31 +616,24 @@ class RowFastSLAMNode(Node):
         self.pose_pub.publish(ps)
 
     def _publish_odom_from_best(self):
-        """
-        Publish best-particle pose as nav_msgs/Odometry on odom_best_topic.
-
-        This is the “converged odom” you can feed to consumers that want
-        a single corrected pose stream.
-        """
         if not self.particles:
             return
 
         best_idx = int(np.argmax([p.weight for p in self.particles]))
         p_best = self.particles[best_idx]
 
-        now = self.get_clock().now().to_msg()
-
         odom_out = Odometry()
-        odom_out.header.stamp = now
 
-        # Mirror frames from incoming odom if available, otherwise fall back.
+        # Use the wheel odom stamp to stay aligned with TF consumers
         if self._last_odom_msg is not None:
-            odom_out.header.frame_id = self._last_odom_msg.header.frame_id
-            odom_out.child_frame_id = self._last_odom_msg.child_frame_id
+            odom_out.header.stamp = self._last_odom_msg.header.stamp
             odom_out.twist = self._last_odom_msg.twist
         else:
-            odom_out.header.frame_id = "odom"
-            odom_out.child_frame_id = "amiga__base"
+            odom_out.header.stamp = self.get_clock().now().to_msg()
+
+        # Hard set SLAM frames (do NOT mirror wheel odom frames)
+        odom_out.header.frame_id = "odom_slam"
+        odom_out.child_frame_id = "amiga__base"
 
         odom_out.pose.pose.position.x = float(p_best.pose[0])
         odom_out.pose.pose.position.y = float(p_best.pose[1])
@@ -644,19 +644,6 @@ class RowFastSLAMNode(Node):
         odom_out.pose.pose.orientation.w = float(np.cos(yaw / 2.0))
 
         self.odom_best_pub.publish(odom_out)
-
-        # -------- TF transform odom -> base_link --------
-        t = TransformStamped()
-        t.header.stamp = now
-        t.header.frame_id = odom_out.header.frame_id
-        t.child_frame_id = odom_out.child_frame_id
-
-        t.transform.translation.x = float(p_best.pose[0])
-        t.transform.translation.y = float(p_best.pose[1])
-        t.transform.translation.z = 0.0
-
-        t.transform.rotation = odom_out.pose.pose.orientation
-        self.tf_broadcaster.sendTransform(t)
 
     def _publish_registry_from_best(self):
         """

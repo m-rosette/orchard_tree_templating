@@ -62,15 +62,15 @@ def generate_launch_description():
             }]
         ),
 
-        # row_prior_mapper node
-        Node(
-            package='tree_template',
-            executable='row_prior_mapper',
-            output='screen',
-            parameters=[{
-                'use_sim_time': use_sim_time
-            }]
-        ),
+        # # row_prior_mapper node
+        # Node(
+        #     package='tree_template',
+        #     executable='row_prior_mapper',
+        #     output='screen',
+        #     parameters=[{
+        #         'use_sim_time': use_sim_time
+        #     }]
+        # ),
 
         # depth_image_to_pointcloud2 node
         Node(

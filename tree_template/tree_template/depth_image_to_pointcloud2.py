@@ -78,7 +78,9 @@ class DepthToPointCloudRGBSyncNode(Node):
         # Downsample in u,v for lighter clouds
         self.declare_parameter('stride', 1)
         # ApproximateTimeSynchronizer slop (seconds)
-        self.declare_parameter('sync_slop', 0.01)
+        self.declare_parameter('sync_slop', 0.045) # originally had it at 0.01 but the mean delta is 0.035
+        # ApproximateTimeSynchronizer queue size
+        self.declare_parameter('sync_queue_size', 10)
         # Maximum depth (meters) to keep in the published point cloud
         self.declare_parameter('max_depth', 3.0)
 
@@ -91,6 +93,7 @@ class DepthToPointCloudRGBSyncNode(Node):
         self.depth_scale = self.get_parameter('depth_scale').get_parameter_value().double_value
         self.stride = self.get_parameter('stride').get_parameter_value().integer_value
         self.sync_slop = self.get_parameter('sync_slop').get_parameter_value().double_value
+        self.sync_queue_size = self.get_parameter('sync_queue_size').get_parameter_value().integer_value
         self.max_depth = self.get_parameter('max_depth').get_parameter_value().double_value
 
         if self.stride < 1:
@@ -117,12 +120,7 @@ class DepthToPointCloudRGBSyncNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
-        qos_pub = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
+        qos_pub = qos_sub
 
         # State: last camera infos
         self.last_depth_info: CameraInfo | None = None
@@ -143,7 +141,7 @@ class DepthToPointCloudRGBSyncNode(Node):
         # Approximate time sync between depth + color images
         self.sync = ApproximateTimeSynchronizer(
             [self.depth_img_sub, self.color_img_sub],
-            queue_size=10,
+            queue_size=self.sync_queue_size,
             slop=self.sync_slop,
         )
         self.sync.registerCallback(self.sync_cb)
