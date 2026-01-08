@@ -11,9 +11,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import TransformStamped
 
 from tf2_ros import TransformBroadcaster
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
@@ -25,20 +24,19 @@ def wrap_angle(theta: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return (theta + np.pi) % (2.0 * np.pi) - np.pi
 
+def stamp_to_sec(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
 def se2_from_odom(msg: Odometry) -> np.ndarray:
-    """Extract [x, y, yaw] from nav_msgs/Odometry using SciPy."""
+    """Extract [x, y, yaw] from nav_msgs/Odometry"""
     p = msg.pose.pose.position
     q = msg.pose.pose.orientation
+    yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler("zyx", degrees=False)[0]
+    return np.array([float(p.x), float(p.y), float(yaw)], dtype=float)
 
-    # ROS quaternions are (x, y, z, w)
-    rot = R.from_quat([q.x, q.y, q.z, q.w])
-
-    # Extract yaw (about Z) from ZYX Euler angles
-    yaw = rot.as_euler("zyx", degrees=False)[0]
-
-    return np.array([float(p.x), float(p.y), yaw], dtype=float)
-
+def quat_xyzw_from_yaw(yaw: float) -> np.ndarray:
+    # returns [x, y, z, w]
+    return R.from_euler("z", float(yaw)).as_quat()
 
 # ============= Landmark EKF container =============
 
@@ -77,14 +75,7 @@ class Particle:
 class RowFastSLAMNode(Node):
     """
     FastSLAM (particle filter over robot pose, EKF per landmark) specialized to an orchard row.
-
-    Updates in this version:
-      - Publishes a best-particle Odometry on `odom_slam_best` (configurable).
-      - DOES NOT pivot/rotate landmark map based on global row yaw.
-      - Assumes the trunk template axis is world X (either +X or -X).
-        (Row direction encoded by row_dir_sign.)
     """
-
     def __init__(self):
         super().__init__("row_fast_slam_node")
 
@@ -94,19 +85,18 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("odom_topic", "odom")
         self.declare_parameter("registry_topic", "fastslam_registry")
         self.declare_parameter("pose_topic", "fastslam_pose")
-
-        # NEW: publish best SLAM odom
         self.declare_parameter("odom_best_topic", "odom_slam_best")
 
         # Row structure (slot indexing along the row)
-        self.declare_parameter("slot_spacing", 1.0)   # [m]
-        self.declare_parameter("row_origin_s", 0.0)    # [m] s coordinate of slot 0
-        self.declare_parameter("slot_s_gate", 1.0)     # [m] max |s_meas - s_slot| to accept
+        self.declare_parameter("slot_spacing", 0.75)   # [m]
+        self.declare_parameter("row_origin_s", -0.6)    # [m] s coordinate of slot 0
+        self.declare_parameter("slot_s_gate", 0.35)     # [m] max |s_meas - s_slot| to accept
         self.declare_parameter("snap_downstream_spacing", True)
         self.declare_parameter("downstream_snap_mode", "unseen_only")  # "unseen_only" or "all_downstream"
 
         # Template-map initialization
         self.declare_parameter("use_template_map", True)
+        self.declare_parameter("use_global_row_yaw", True)
         self.declare_parameter("num_slots", 50)
         self.declare_parameter("row_origin_x", -0.6)   # if NaN, use first odom pose
         self.declare_parameter("row_origin_y", 1.8)    # if NaN, use first odom pose
@@ -119,15 +109,26 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("init_d_far", 0.0)
         self.declare_parameter("prior_sigma_s", 1.0)
         self.declare_parameter("prior_sigma_d", 1.0)
-        self.declare_parameter("side_mode", "fixed")   # "fixed" or "geometry"
+        self.declare_parameter("side_mode", "semantic")   # "fixed" or "geometry" or "semantic"
 
         # Measurement noise (std dev) in robot frame
         self.declare_parameter("meas_std_x", 0.05)
         self.declare_parameter("meas_std_y", 0.05)
 
+        # Motion model noise parameters
+        self.declare_parameter("motion_noise.a_trans", 0.2)
+        self.declare_parameter("motion_noise.b_trans", 0.005)
+        self.declare_parameter("motion_noise.c_lat", 0.7)
+        self.declare_parameter("motion_noise.a_rot", 0.2)
+        self.declare_parameter("motion_noise.b_rot", 0.002)
+
         # Resampling
-        self.declare_parameter("resample_interval", 3)
+        self.declare_parameter("resample_interval", 5)
         self.declare_parameter("neff_ratio_threshold", 0.5)
+
+        # Semantic side memory (from TrunkClusterToTemplateNode side classification)
+        self.declare_parameter("semantic_side_min_votes", 3)          # votes needed before we "trust" it
+        self.declare_parameter("semantic_side_fallback", "fixed")     # "fixed" or "unknown"
 
         # ---------- Resolve params ----------
         self.num_particles = int(self.get_parameter("num_particles").value)
@@ -145,6 +146,7 @@ class RowFastSLAMNode(Node):
         self.downstream_snap_mode = str(self.get_parameter("downstream_snap_mode").value)
 
         self.use_template_map = bool(self.get_parameter("use_template_map").value)
+        self.use_global_row_yaw = bool(self.get_parameter("use_global_row_yaw").value)
         self.num_slots = int(self.get_parameter("num_slots").value)
 
         self.row_origin_xy = np.array(
@@ -180,24 +182,44 @@ class RowFastSLAMNode(Node):
         )
         self.R = np.diag(self.meas_std ** 2)
 
+        self.a_trans = float(self.get_parameter("motion_noise.a_trans").value)
+        self.b_trans = float(self.get_parameter("motion_noise.b_trans").value)
+        self.c_lat   = float(self.get_parameter("motion_noise.c_lat").value)
+        self.a_rot   = float(self.get_parameter("motion_noise.a_rot").value)
+        self.b_rot   = float(self.get_parameter("motion_noise.b_rot").value)
+
         self.resample_interval = int(self.get_parameter("resample_interval").value)
         self.neff_ratio_threshold = float(self.get_parameter("neff_ratio_threshold").value)
+
+        self.semantic_side_min_votes = int(self.get_parameter("semantic_side_min_votes").value)
+        self.semantic_side_fallback = str(self.get_parameter("semantic_side_fallback").value).strip().lower()
+        if self.semantic_side_fallback not in ("fixed", "unknown"):
+            self.semantic_side_fallback = "fixed"
+
+        # ---------- Fixed geometry (precompute once) ----------
+        # Row axis: world ±X
+        self.row_axis = np.array([float(self.row_dir_sign), 0.0], dtype=float)
+        self.row_axis /= (np.linalg.norm(self.row_axis) + 1e-12)
+
+        # Lateral: world +Y
+        self.lateral_dir = np.array([0.0, 1.0], dtype=float)
+
+        # Cached basis
+        self.t_hat = self.row_axis.copy()
+        self.n_hat = self.lateral_dir.copy()
 
         # ---------- State ----------
         self.particles: List[Particle] = []
         self.last_odom_pose: Optional[np.ndarray] = None
         self._last_odom_time: Optional[float] = None
         self.measurement_count = 0
-
-        # Keep the last incoming odom message so we can mirror frame_ids / twist if desired
+        self._slot_side_votes: Dict[int, Dict[str, int]] = {}
         self._last_odom_msg: Optional[Odometry] = None
 
         # ---------- Pub/Sub ----------
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.registry_pub = self.create_publisher(TrunkRegistry, self.registry_topic, qos)
         self.pose_pub = self.create_publisher(PoseStamped, self.pose_topic, qos)
-
-        # NEW: best-odom publisher
         self.odom_best_pub = self.create_publisher(Odometry, self.odom_best_topic, qos)
 
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 50)
@@ -213,12 +235,20 @@ class RowFastSLAMNode(Node):
             f"  registry_topic={self.registry_topic}\n"
             f"  pose_topic={self.pose_topic}\n"
             f"  odom_best_topic={self.odom_best_topic}\n"
-            f"  use_template_map={self.use_template_map}, num_slots={self.num_slots}, slot_spacing={self.slot_spacing:.2f}\n"
-            f"  row_axis_fixed=[{self.row_axis[0]:.0f}, {self.row_axis[1]:.0f}] (template assumed on world X)\n"
-            f"  side_mode={self.side_mode}"
+            f"  use_template_map={self.use_template_map}, use_global_row_yaw={self.use_global_row_yaw}\n"
+            f"  num_slots={self.num_slots}, slot_spacing={self.slot_spacing:.2f}, slot_s_gate={self.slot_s_gate:.2f}\n"
+            f"  row_dir_sign={self.row_dir_sign}, side_mode={self.side_mode}"
         )
 
     # ---------- Helpers (row structure) ----------
+
+    def _best_particle(self) -> Optional[Particle]:
+        if not self.particles:
+            return None
+        return self.particles[int(np.argmax([p.weight for p in self.particles]))]
+
+    def _stamp_now(self):
+        return self._last_odom_msg.header.stamp if self._last_odom_msg is not None else self.get_clock().now().to_msg()
 
     def _side_for_index(self, i: int) -> str:
         if self.start_side not in ("near", "far"):
@@ -240,81 +270,112 @@ class RowFastSLAMNode(Node):
         n_hat = self.lateral_dir.astype(float)
         n_hat /= (np.linalg.norm(n_hat) + 1e-12)
         return t_hat, n_hat
+    
+    def _update_semantic_side_votes(self, slot_j: int, side: str):
+        side = (side or "").strip().lower()
+        if side not in ("near", "far"):
+            return
+        if slot_j not in self._slot_side_votes:
+            self._slot_side_votes[slot_j] = {"near": 0, "far": 0}
+        self._slot_side_votes[slot_j][side] += 1
+
+    def _semantic_side_for_slot(self, slot_j: int) -> str:
+        votes = self._slot_side_votes.get(slot_j)
+        if not votes:
+            # no semantic info yet
+            if self.semantic_side_fallback == "fixed":
+                return self._side_for_index(int(slot_j))
+            return "unknown"
+
+        n_near = int(votes.get("near", 0))
+        n_far = int(votes.get("far", 0))
+        total = n_near + n_far
+
+        # If we haven't accumulated enough evidence, fall back (optional)
+        if total < max(self.semantic_side_min_votes, 1):
+            if self.semantic_side_fallback == "fixed":
+                return self._side_for_index(int(slot_j))
+            return "unknown"
+
+        if n_near == n_far:
+            # tie-breaker: either fixed parity or unknown
+            if self.semantic_side_fallback == "fixed":
+                return self._side_for_index(int(slot_j))
+            return "unknown"
+
+        return "near" if n_near > n_far else "far"
 
     # =========================================================
     #  Motion update (FastSLAM step 2)
     # =========================================================
 
-    def odom_callback(self, msg: Odometry):
-        """
-        Motion model anchored on incoming odom.
-
-        Treat the odom pose as the mean, and sample particle poses
-        around it with noise scaled by twist and dt.
-        """
-        self._last_odom_msg = msg
-        cur_pose = se2_from_odom(msg)  # [x, y, yaw]
-
-        t_cur = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+    def _dt_from_stamp(self, stamp) -> float:
+        t_cur = stamp.sec + stamp.nanosec * 1e-9
         if self._last_odom_time is None:
             self._last_odom_time = t_cur
+            return 1e-3
         dt = max(t_cur - self._last_odom_time, 1e-3)
         self._last_odom_time = t_cur
+        return dt
 
-        if self.last_odom_pose is None:
-            if not np.isfinite(self.row_origin_xy).all():
-                self.row_origin_xy = cur_pose[0:2].copy()
+    def _ensure_initialized_from_odom(self, cur_pose: np.ndarray) -> bool:
+        if self.last_odom_pose is not None:
+            return False
 
-            self.last_odom_pose = cur_pose.copy()
-            self._init_particles(cur_pose)
+        if not np.isfinite(self.row_origin_xy).all():
+            self.row_origin_xy = cur_pose[0:2].copy()
 
-            self.get_logger().info(
-                f"Initialized particles at odom pose x={cur_pose[0]:.2f}, y={cur_pose[1]:.2f}, yaw={cur_pose[2]:.2f} rad"
-            )
+        self.last_odom_pose = cur_pose.copy()
+        self._init_particles(cur_pose)
 
-            if self.use_template_map:
-                self._publish_registry_from_best()
-                self._publish_pose_from_best()
-                self._publish_odom_from_best()
+        self.get_logger().info(
+            f"Initialized particles at odom pose x={cur_pose[0]:.2f}, y={cur_pose[1]:.2f}, yaw={cur_pose[2]:.2f} rad"
+        )
+
+        if self.use_template_map:
+            self._publish_registry_from_best()
+        self._publish_pose_from_best()
+        self._publish_odom_from_best()
+        return True
+
+    def _motion_noise_std(self, v: float, omega: float, dt: float) -> np.ndarray:
+        dx_expected = abs(v) * dt
+        dtheta_expected = abs(omega) * dt
+
+        sigma_x = self.a_trans * dx_expected + self.b_trans
+        sigma_y = self.c_lat * sigma_x
+        sigma_theta = self.a_rot * dtheta_expected + self.b_rot
+        return np.array([sigma_x, sigma_y, sigma_theta], dtype=float)
+
+    def odom_callback(self, msg: Odometry):
+        self._last_odom_msg = msg
+        cur_pose = se2_from_odom(msg)
+        dt = self._dt_from_stamp(msg.header.stamp)
+
+        if self._ensure_initialized_from_odom(cur_pose):
             return
 
         self.last_odom_pose = cur_pose.copy()
 
         if not self.particles:
             self._init_particles(cur_pose)
+            self._publish_pose_from_best()
+            self._publish_odom_from_best()
             return
 
-        # Build noise std from twist & dt
-        v = msg.twist.twist.linear.x
-        omega = msg.twist.twist.angular.z
+        v = float(msg.twist.twist.linear.x)
+        omega = float(msg.twist.twist.angular.z)
+        noise_std = self._motion_noise_std(v, omega, dt)
 
-        a_trans = 0.1
-        b_trans = 0.005
-        c_lat   = 0.3
-        a_rot   = 0.1
-        b_rot   = 0.002
-
-        dx_expected = abs(v) * dt
-        dtheta_expected = abs(omega) * dt
-
-        sigma_x = a_trans * dx_expected + b_trans
-        sigma_y = c_lat * sigma_x
-        sigma_theta = a_rot * dtheta_expected + b_rot
-
-        noise_std = np.array([sigma_x, sigma_y, sigma_theta], dtype=float)
-
-        # Sample particle poses around odom pose
+        # Vectorized-ish sampling (still per particle object)
         for p in self.particles:
-            noise = noise_std * np.random.randn(3)
-            p.pose = cur_pose + noise
+            p.pose = cur_pose + noise_std * np.random.randn(3)
             p.pose[2] = wrap_angle(p.pose[2])
 
-        # Publish after motion update
         self._publish_pose_from_best()
         self._publish_odom_from_best()
 
     def _init_particles(self, init_pose: np.ndarray):
-        """Initialize particle set around an initial pose (and optionally seed a template landmark map)."""
         Sigma0 = self._sigma_world_from_row_sigmas()
         landmarks_template: Dict[int, LandmarkEKF] = {}
 
@@ -322,15 +383,11 @@ class RowFastSLAMNode(Node):
             if not np.isfinite(self.row_origin_xy).all():
                 self.row_origin_xy = init_pose[0:2].copy()
 
-            t_hat, n_hat = self._row_basis_2d()
-
             for j in range(self.num_slots):
                 side = self._side_for_index(j)
                 d0 = self.init_d_near if side == "near" else self.init_d_far
                 s0 = self.row_origin_s + j * self.slot_spacing
-
-                # FIXED template: along world X (+/-), lateral world Y
-                mu0 = self.row_origin_xy + s0 * t_hat + d0 * n_hat
+                mu0 = self.row_origin_xy + s0 * self.t_hat + d0 * self.n_hat
                 landmarks_template[j] = LandmarkEKF(mu=mu0.copy(), Sigma=Sigma0.copy())
 
         self.particles = []
@@ -339,9 +396,8 @@ class RowFastSLAMNode(Node):
             pose[0:2] += np.random.randn(2) * 0.01
             pose[2] = wrap_angle(pose[2] + np.random.randn() * 0.005)
 
-            lm_dict: Dict[int, LandmarkEKF] = {}
-            for j, lm in landmarks_template.items():
-                lm_dict[j] = LandmarkEKF(mu=lm.mu.copy(), Sigma=lm.Sigma.copy())
+            lm_dict = {j: LandmarkEKF(mu=lm.mu.copy(), Sigma=lm.Sigma.copy())
+                       for j, lm in landmarks_template.items()}
 
             self.particles.append(Particle(pose=pose, landmarks=lm_dict, weight=1.0))
 
@@ -370,6 +426,8 @@ class RowFastSLAMNode(Node):
         slot_j, mu_world_approx = self._data_association_slot(z)
         if slot_j is None or mu_world_approx is None:
             return
+        
+        self._update_semantic_side_votes(slot_j, msg.side)
 
         # EKF updates per particle
         R_meas = self.R
@@ -377,28 +435,17 @@ class RowFastSLAMNode(Node):
             lm = p.landmarks.get(slot_j, None)
 
             if lm is None:
-                th = p.pose[2]
-                c = np.cos(th)
-                s = np.sin(th)
-
-                dx_w = c * z[0] - s * z[1]
-                dy_w = s * z[0] + c * z[1]
-                mu_init = np.array([p.pose[0] + dx_w, p.pose[1] + dy_w], dtype=float)
-
-                Sigma_init = np.diag([0.5 ** 2, 0.5 ** 2])
-                lm = LandmarkEKF(mu=mu_init, Sigma=Sigma_init)
+                lm = self._init_landmark_from_measurement(p, z)
                 p.landmarks[slot_j] = lm
 
-            self._ekf_update_landmark(p, lm, z, R_meas)
+            self._ekf_update_landmark(p, lm, z, self.R)
             lm.update_width(w_meas)
 
-        # --- spacing grid snap is still OK (it only shifts s-origin / translates slots) ---
+        # Update downstream spacing
         if self.snap_downstream_spacing:
-            t_hat, _ = self._row_basis_2d()
-            s_meas = float(np.dot(mu_world_approx - self.row_origin_xy, t_hat))
-
-            self.row_origin_s = s_meas - slot_j * self.slot_spacing
-            self._apply_downstream_spacing(anchor_j=slot_j)
+            s_meas = float(np.dot(mu_world_approx - self.row_origin_xy, self.t_hat))
+            self.row_origin_s = s_meas - int(slot_j) * self.slot_spacing
+            self._apply_downstream_spacing(anchor_j=int(slot_j))
 
         # Importance weighting
         self._update_weights_after_measurement(z, slot_j, R_meas)
@@ -415,39 +462,29 @@ class RowFastSLAMNode(Node):
 
     # ------------- Data association by slot index -------------
 
-    def _data_association_slot(self, z_robot: np.ndarray) -> Tuple[Optional[int], Optional[np.ndarray]]:
-        """
-        Map a measurement to the nearest slot index along the FIXED row axis (world X).
-
-        Returns (slot_j, mu_world_approx).
-        """
-        if not self.particles:
-            return None, None
-
-        weights = np.array([p.weight for p in self.particles], dtype=float)
-        best_idx = int(np.argmax(weights))
-        p_best = self.particles[best_idx]
-
-        th = p_best.pose[2]
-        c = np.cos(th)
-        s = np.sin(th)
-
+    def _world_from_robot(self, pose: np.ndarray, z_robot: np.ndarray) -> np.ndarray:
+        # mu_world = [x,y] + R(yaw) * z_robot
+        x, y, th = float(pose[0]), float(pose[1]), float(pose[2])
+        c, s = np.cos(th), np.sin(th)
         dx_w = c * z_robot[0] - s * z_robot[1]
         dy_w = s * z_robot[0] + c * z_robot[1]
-        mu_world_approx = np.array([p_best.pose[0] + dx_w, p_best.pose[1] + dy_w], dtype=float)
+        return np.array([x + dx_w, y + dy_w], dtype=float)
 
-        # Along-row coordinate s using fixed row_axis
-        if np.isfinite(self.row_origin_xy).all():
-            s_meas = float(np.dot(mu_world_approx - self.row_origin_xy, self.row_axis))
-        else:
-            s_meas = float(np.dot(self.row_axis, mu_world_approx))
+    def _data_association_slot(self, z_robot: np.ndarray) -> Tuple[Optional[int], Optional[np.ndarray]]:
+        p_best = self._best_particle()
+        if p_best is None:
+            return None, None
 
-        j_float = (s_meas - self.row_origin_s) / self.slot_spacing
-        j_idx = int(round(j_float))
+        mu_world_approx = self._world_from_robot(p_best.pose, z_robot)
+
+        s_meas = float(np.dot(mu_world_approx - self.row_origin_xy, self.row_axis))
+        j_idx = int(round((s_meas - self.row_origin_s) / self.slot_spacing))
 
         s_slot = self.row_origin_s + j_idx * self.slot_spacing
         if abs(s_meas - s_slot) > self.slot_s_gate:
-            self.get_logger().debug(f"Measurement s={s_meas:.2f} too far from slot s_j={s_slot:.2f}; rejecting.")
+            self.get_logger().debug(
+                f"Measurement s={s_meas:.2f} too far from slot s_j={s_slot:.2f}; rejecting."
+            )
             return None, None
 
         if self.use_template_map:
@@ -457,22 +494,29 @@ class RowFastSLAMNode(Node):
 
     # ------------- Landmark EKF update -------------
 
-    def _ekf_update_landmark(self, p: Particle, lm: LandmarkEKF, z: np.ndarray, R_meas: np.ndarray):
+    def _predict_z_and_H(self, pose: np.ndarray, mu_lm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        EKF update for a landmark given particle pose p.pose and measurement z in robot frame.
-
-        z = Rot(-yaw) * (mu - [x,y])
+        z_pred = R(-yaw) * (mu - [x,y])
+        H = R(-yaw)
         """
-        x, y, th = p.pose
-        c = np.cos(th)
-        s = np.sin(th)
+        x, y, th = float(pose[0]), float(pose[1]), float(pose[2])
+        c, s = np.cos(th), np.sin(th)
 
-        dx = lm.mu[0] - x
-        dy = lm.mu[1] - y
+        dx = float(mu_lm[0] - x)
+        dy = float(mu_lm[1] - y)
+
         z_pred = np.array([c * dx + s * dy, -s * dx + c * dy], dtype=float)
-
         H = np.array([[c, s],
                       [-s, c]], dtype=float)
+        return z_pred, H
+
+    def _init_landmark_from_measurement(self, p: Particle, z: np.ndarray) -> LandmarkEKF:
+        mu_init = self._world_from_robot(p.pose, z)
+        Sigma_init = np.diag([0.5 ** 2, 0.5 ** 2])
+        return LandmarkEKF(mu=mu_init, Sigma=Sigma_init)
+
+    def _ekf_update_landmark(self, p: Particle, lm: LandmarkEKF, z: np.ndarray, R_meas: np.ndarray):
+        z_pred, H = self._predict_z_and_H(p.pose, lm.mu)
 
         S = H @ lm.Sigma @ H.T + R_meas
         K = lm.Sigma @ H.T @ np.linalg.inv(S)
@@ -483,79 +527,63 @@ class RowFastSLAMNode(Node):
         lm.seen_count += 1
 
     def _apply_downstream_spacing(self, anchor_j: int):
-        """
-        Enforce s-grid for downstream slots while preserving each slot's lateral offset (world Y).
-        """
-        t_hat, n_hat = self._row_basis_2d()
-
         for p in self.particles:
             for k, lm in p.landmarks.items():
                 if k <= anchor_j:
                     continue
+                if self.downstream_snap_mode == "unseen_only" and lm.seen_count > 0:
+                    continue
 
-                if self.downstream_snap_mode == "unseen_only":
-                    if getattr(lm, "seen_count", 0) > 0:
-                        continue
-
-                s_k = self.row_origin_s + k * self.slot_spacing
-
-                v = lm.mu - self.row_origin_xy
-                d_k = float(np.dot(v, n_hat))
-
-                lm.mu = self.row_origin_xy + s_k * t_hat + d_k * n_hat
+                s_k = self.row_origin_s + int(k) * self.slot_spacing
+                d_k = float(np.dot(lm.mu - self.row_origin_xy, self.n_hat))
+                lm.mu = self.row_origin_xy + s_k * self.t_hat + d_k * self.n_hat
 
     # ------------- Importance weighting -------------
 
     def _update_weights_after_measurement(self, z: np.ndarray, slot_j: int, R_meas: np.ndarray):
-        logw = np.zeros(len(self.particles), dtype=float)
+        logw = np.full(len(self.particles), -50.0, dtype=float)
 
         for i, p in enumerate(self.particles):
-            lm = p.landmarks.get(slot_j, None)
+            lm = p.landmarks.get(slot_j)
             if lm is None:
-                logw[i] = -50.0
                 continue
 
-            x, y, th = p.pose
-            c = np.cos(th)
-            s = np.sin(th)
-
-            dx = lm.mu[0] - x
-            dy = lm.mu[1] - y
-            z_pred = np.array([c * dx + s * dy, -s * dx + c * dy], dtype=float)
-
-            H = np.array([[c, s],
-                          [-s, c]], dtype=float)
+            z_pred, H = self._predict_z_and_H(p.pose, lm.mu)
             S = H @ lm.Sigma @ H.T + R_meas
 
             innov = z - z_pred
             try:
                 Sinv = np.linalg.inv(S)
             except np.linalg.LinAlgError:
-                logw[i] = -50.0
                 continue
 
             maha = float(innov.T @ Sinv @ innov)
             sign, logdet = np.linalg.slogdet(S)
             if sign <= 0:
-                logw[i] = -50.0
                 continue
+
             logw[i] = -0.5 * (maha + logdet)
 
         maxlog = float(np.max(logw))
         w = np.exp(logw - maxlog)
+
         for i, p in enumerate(self.particles):
             p.weight *= float(w[i])
 
         self._normalize_weights()
 
     def _normalize_weights(self):
+        if not self.particles:
+            return
         s = float(sum(p.weight for p in self.particles))
         if s < 1e-12:
+            w0 = 1.0 / float(len(self.particles))
             for p in self.particles:
-                p.weight = 1.0 / max(len(self.particles), 1)
+                p.weight = w0
             return
+        inv = 1.0 / s
         for p in self.particles:
-            p.weight /= s
+            p.weight *= inv
 
     # ------------- Resampling -------------
 
@@ -567,12 +595,12 @@ class RowFastSLAMNode(Node):
         if not self.particles:
             return
         neff = self._effective_sample_size()
-        ratio = neff / float(len(self.particles))
-        if ratio > self.neff_ratio_threshold:
+        if (neff / float(len(self.particles))) > self.neff_ratio_threshold:
             return
 
         w = np.array([p.weight for p in self.particles], dtype=float)
         cdf = np.cumsum(w)
+
         N = len(self.particles)
         step = 1.0 / N
         start = np.random.uniform(0.0, step)
@@ -581,14 +609,17 @@ class RowFastSLAMNode(Node):
         idxs = np.searchsorted(cdf, u)
 
         new_particles: List[Particle] = []
+        w0 = 1.0 / float(N)
+
         for idx in idxs:
-            p = self.particles[int(idx)]
-            lm_new: Dict[int, LandmarkEKF] = {}
-            for j, lm in p.landmarks.items():
-                lm_new[j] = LandmarkEKF(mu=lm.mu.copy(), Sigma=lm.Sigma.copy(),
-                                        seen_count=lm.seen_count,
-                                        width_sum=lm.width_sum, width_count=lm.width_count)
-            new_particles.append(Particle(pose=p.pose.copy(), landmarks=lm_new, weight=1.0 / N))
+            src = self.particles[int(idx)]
+            lm_new = {
+                j: LandmarkEKF(mu=lm.mu.copy(), Sigma=lm.Sigma.copy(),
+                               seen_count=lm.seen_count,
+                               width_sum=lm.width_sum, width_count=lm.width_count)
+                for j, lm in src.landmarks.items()
+            }
+            new_particles.append(Particle(pose=src.pose.copy(), landmarks=lm_new, weight=w0))
 
         self.particles = new_particles
         self._normalize_weights()
@@ -596,42 +627,39 @@ class RowFastSLAMNode(Node):
     # ------------- Publishing -------------
 
     def _publish_pose_from_best(self):
-        if not self.particles:
+        p_best = self._best_particle()
+        if p_best is None:
             return
-        best_idx = int(np.argmax([p.weight for p in self.particles]))
-        p_best = self.particles[best_idx]
 
         ps = PoseStamped()
         ps.header.frame_id = "odom_slam"
-        ps.header.stamp = self._last_odom_msg.header.stamp if self._last_odom_msg else self.get_clock().now().to_msg()
+        ps.header.stamp = self._stamp_now()
 
         ps.pose.position.x = float(p_best.pose[0])
         ps.pose.position.y = float(p_best.pose[1])
         ps.pose.position.z = 0.0
 
-        yaw = float(p_best.pose[2])
-        ps.pose.orientation.z = float(np.sin(yaw / 2.0))
-        ps.pose.orientation.w = float(np.cos(yaw / 2.0))
+        q = quat_xyzw_from_yaw(float(p_best.pose[2]))
+        ps.pose.orientation.x = float(q[0])
+        ps.pose.orientation.y = float(q[1])
+        ps.pose.orientation.z = float(q[2])
+        ps.pose.orientation.w = float(q[3])
 
         self.pose_pub.publish(ps)
 
     def _publish_odom_from_best(self):
-        if not self.particles:
+        p_best = self._best_particle()
+        if p_best is None:
             return
-
-        best_idx = int(np.argmax([p.weight for p in self.particles]))
-        p_best = self.particles[best_idx]
 
         odom_out = Odometry()
 
-        # Use the wheel odom stamp to stay aligned with TF consumers
         if self._last_odom_msg is not None:
             odom_out.header.stamp = self._last_odom_msg.header.stamp
             odom_out.twist = self._last_odom_msg.twist
         else:
             odom_out.header.stamp = self.get_clock().now().to_msg()
 
-        # Hard set SLAM frames (do NOT mirror wheel odom frames)
         odom_out.header.frame_id = "odom_slam"
         odom_out.child_frame_id = "amiga__base"
 
@@ -639,82 +667,100 @@ class RowFastSLAMNode(Node):
         odom_out.pose.pose.position.y = float(p_best.pose[1])
         odom_out.pose.pose.position.z = 0.0
 
-        yaw = float(p_best.pose[2])
-        odom_out.pose.pose.orientation.z = float(np.sin(yaw / 2.0))
-        odom_out.pose.pose.orientation.w = float(np.cos(yaw / 2.0))
+        q = quat_xyzw_from_yaw(float(p_best.pose[2]))
+        odom_out.pose.pose.orientation.x = float(q[0])
+        odom_out.pose.pose.orientation.y = float(q[1])
+        odom_out.pose.pose.orientation.z = float(q[2])
+        odom_out.pose.pose.orientation.w = float(q[3])
 
         self.odom_best_pub.publish(odom_out)
 
     def _publish_registry_from_best(self):
-        """
-        Publish TrunkRegistry from the best particle's map.
-
-        IMPORTANT: trunk orientations are identity here (we are not encoding row yaw in trunks).
-        """
-        if not self.particles:
-            return
-        best_idx = int(np.argmax([p.weight for p in self.particles]))
-        p_best = self.particles[best_idx]
-        if not p_best.landmarks:
+        p_best = self._best_particle()
+        if p_best is None or not p_best.landmarks:
             return
 
-        reg = TrunkRegistry()
-        trunks: List[TrunkInfo] = []
         items = sorted(p_best.landmarks.items(), key=lambda kv: kv[0])
 
+        row_yaw = self._estimate_row_yaw_from_best()
+        row_q = quat_xyzw_from_yaw(row_yaw) if (row_yaw is not None) else np.array([0.0, 0.0, 0.0, 1.0])
+
+        # Decide side per slot index once
         if self.side_mode == "fixed":
-            for j, lm in items:
-                ti = TrunkInfo()
-                ti.pose.position.x = float(lm.mu[0])
-                ti.pose.position.y = float(lm.mu[1])
-                ti.pose.position.z = 0.0
-                ti.pose.orientation.w = 1.0  # identity
-                ti.side = self._side_for_index(int(j))
-                ti.width = lm.width_mean if np.isfinite(lm.width_mean) else float("nan")
-                trunks.append(ti)
-            reg.trunks = trunks
-            self.registry_pub.publish(reg)
-            return
+            side_by_j = {int(j): self._side_for_index(int(j)) for j, _ in items}
+        elif self.side_mode == "semantic":
+            side_by_j = {int(j): self._semantic_side_for_slot(int(j)) for j, _ in items}
+        elif self.side_mode == "geometry":
+            side_by_j = self._geometry_sides_for_items(items, p_best.pose[0:2])
+        else:
+            side_by_j = {int(j): self._side_for_index(int(j)) for j, _ in items}
 
-        # geometry-based side (still allowed, but uses fixed lateral_dir)
-        d_lats = [float(np.dot(self.lateral_dir, lm.mu)) for _, lm in items]
-        d_lats_arr = np.array(d_lats, dtype=float)
-
-        if d_lats_arr.size < 2:
-            for j, lm in items:
-                ti = TrunkInfo()
-                ti.pose.position.x = float(lm.mu[0])
-                ti.pose.position.y = float(lm.mu[1])
-                ti.pose.position.z = 0.0
-                ti.pose.orientation.w = 1.0
-                ti.side = "near"
-                ti.width = lm.width_mean if np.isfinite(lm.width_mean) else float("nan")
-                trunks.append(ti)
-            reg.trunks = trunks
-            self.registry_pub.publish(reg)
-            return
-
-        center_lat = float(np.mean(d_lats_arr))
-        robot_xy = p_best.pose[0:2]
-        d_robot = float(np.dot(self.lateral_dir, robot_xy))
-        robot_offset = d_robot - center_lat
-        robot_side_sign = 1.0 if abs(robot_offset) < 1e-6 else np.sign(robot_offset)
-
-        for (j, lm), d_lat in zip(items, d_lats_arr):
-            offset = float(d_lat - center_lat)
-            same_side = (np.sign(offset) == robot_side_sign) if abs(offset) >= 1e-6 else True
-
+        trunks: List[TrunkInfo] = []
+        for j, lm in items:
             ti = TrunkInfo()
             ti.pose.position.x = float(lm.mu[0])
             ti.pose.position.y = float(lm.mu[1])
             ti.pose.position.z = 0.0
-            ti.pose.orientation.w = 1.0
-            ti.side = "near" if same_side else "far"
+
+            if self.use_global_row_yaw and row_yaw is not None:
+                ti.pose.orientation.x = float(row_q[0])
+                ti.pose.orientation.y = float(row_q[1])
+                ti.pose.orientation.z = float(row_q[2])
+                ti.pose.orientation.w = float(row_q[3])
+            else:
+                ti.pose.orientation.w = 1.0
+
+            ti.side = side_by_j[int(j)]
             ti.width = lm.width_mean if np.isfinite(lm.width_mean) else float("nan")
             trunks.append(ti)
 
+        reg = TrunkRegistry()
         reg.trunks = trunks
         self.registry_pub.publish(reg)
+
+    def _geometry_sides_for_items(self, items, robot_xy: np.ndarray) -> Dict[int, str]:
+        d_lats = np.array([float(np.dot(self.lateral_dir, lm.mu)) for _, lm in items], dtype=float)
+        if d_lats.size < 2:
+            return {int(j): "near" for j, _ in items}
+
+        center_lat = float(np.mean(d_lats))
+        d_robot = float(np.dot(self.lateral_dir, robot_xy))
+        robot_side_sign = 1.0 if abs(d_robot - center_lat) < 1e-6 else np.sign(d_robot - center_lat)
+
+        out: Dict[int, str] = {}
+        for (j, _), d_lat in zip(items, d_lats):
+            offset = float(d_lat - center_lat)
+            same_side = (np.sign(offset) == robot_side_sign) if abs(offset) >= 1e-6 else True
+            out[int(j)] = "near" if same_side else "far"
+        return out
+
+    def _estimate_row_yaw_from_best(self) -> Optional[float]:
+        p_best = self._best_particle()
+        if p_best is None:
+            return None
+
+        pts = np.array([lm.mu for _, lm in sorted(p_best.landmarks.items())], dtype=float)
+        if pts.shape[0] < 2:
+            return None
+
+        mu = pts.mean(axis=0)
+        X = pts - mu
+        C = (X.T @ X) / max(pts.shape[0] - 1, 1)
+
+        eigvals, eigvecs = np.linalg.eigh(C)
+        v = eigvecs[:, int(np.argmax(eigvals))]
+
+        yaw = float(np.arctan2(v[1], v[0]))
+
+        # enforce direction convention
+        if self.row_dir_sign == -1:
+            if np.cos(yaw) > 0:
+                yaw = wrap_angle(yaw + np.pi)
+        else:
+            if np.cos(yaw) < 0:
+                yaw = wrap_angle(yaw + np.pi)
+
+        return yaw
 
 
 def main(args=None):

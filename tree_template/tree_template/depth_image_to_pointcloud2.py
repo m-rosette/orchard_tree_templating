@@ -14,13 +14,7 @@ from rclpy.qos import (
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
 from std_msgs.msg import Header
 
-# ---- message_filters import (with typo guard) ----
-try:
-    from message_filters import ApproximateTimeSynchronizer, Subscriber
-except Exception:
-    # If the above typo line accidentally triggers, this ensures the real import is used.
-    from message_filters import ApproximateTimeSynchronizer, Subscriber
-
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 
 # ---- Optional median filter ----
 try:
@@ -390,7 +384,7 @@ class DepthToPointCloudRGBSyncNode(Node):
 
         # Publish
         header = Header()
-        header.stamp = depth_img.header.stamp
+        header.stamp = self.get_clock().now().to_msg()
         header.frame_id = depth_info.header.frame_id or depth_img.header.frame_id
 
         pc2_msg = create_point_cloud2_xyzrgb(header, points_xyz, colors_rgb)

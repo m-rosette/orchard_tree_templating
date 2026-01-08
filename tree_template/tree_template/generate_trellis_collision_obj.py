@@ -313,15 +313,24 @@ class TreeSceneNode(Node):
         """
         # Side-dependent yaw around Z for V-trellis arms
         if side == "near":
-            trellis_yaw = np.pi / 2.0
-        elif side == "far":
             trellis_yaw = -np.pi / 2.0
+        elif side == "far":
+            trellis_yaw = np.pi / 2.0
         else:
             trellis_yaw = np.pi / 2.0
 
-        # Local rotation only (no row_R term)
+        # Global row yaw comes in via trunk.pose.orientation
+        row_R = R.from_quat([
+            trellis_pose.orientation.x,
+            trellis_pose.orientation.y,
+            trellis_pose.orientation.z,
+            trellis_pose.orientation.w,
+        ])
+
         trellis_local_R = R.from_euler("xyz", [0.0, self.trellis_angle, trellis_yaw])
-        return trellis_local_R.as_quat()
+
+        canopy_R = row_R * trellis_local_R
+        return canopy_R.as_quat()
 
     # ------------ Core helper for manual tree creation ------------
 

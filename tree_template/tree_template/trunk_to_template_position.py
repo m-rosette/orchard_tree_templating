@@ -44,12 +44,12 @@ class TrunkClusterToTemplateNode(Node):
 
         # -------- Parameters (declare) --------
         self.declare_parameter("input_topic", "tree_image_data")
-        self.declare_parameter("min_samples", 7)
+        self.declare_parameter("min_samples", 10)
         self.declare_parameter("cluster_timer_period", 1.0)
 
-        self.declare_parameter("track_position_gate", 0.3)
-        self.declare_parameter("track_width_gate", 0.02)
-        self.declare_parameter("uniqueness_radius", 0.3)
+        self.declare_parameter("track_position_gate", 0.5)
+        self.declare_parameter("track_width_gate", 0.03)
+        self.declare_parameter("uniqueness_radius", 0.4)
 
         self.declare_parameter("row_axis_x", 1.0)
         self.declare_parameter("row_axis_y", 0.0)
@@ -186,7 +186,8 @@ class TrunkClusterToTemplateNode(Node):
         for xy, xy_top, xy_bot, w in zip(points_2d, top_2d, bottom_2d, widths):
             width = float(w) if widths is not None else None
 
-            pos_cam = np.array([xy[0], 0.0, xy[1]], dtype=float)
+            # TODO: Confirm coordinate conventions here
+            pos_cam = np.array([xy[0], 0.0, -xy_bot[1]], dtype=float)
             top_cam = np.array([xy_top[0], 0.0, xy_top[1]], dtype=float)
             bot_cam = np.array([xy_bot[0], 0.0, xy_bot[1]], dtype=float)
 
