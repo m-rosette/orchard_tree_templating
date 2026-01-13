@@ -1,5 +1,4 @@
-float64 x
-float64 y
-float64 z
+geometry_msgs/Pose pose
+string side   # "near", "far", or "unknown"
 ---
 bool success

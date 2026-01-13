@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os
+from glob import glob
 
 package_name = 'tree_template'
 
@@ -10,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*launch.[pxy][yma]*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -21,6 +24,12 @@ setup(
     entry_points={
         'console_scripts': [
             'tree_template = tree_template.generate_trellis_collision_obj:main',
+            'trunk_to_template_position = tree_template.trunk_to_template_position:main',
+            'trunk_row_datum = tree_template.row_datum:main',
+            'row_prior_mapper = tree_template.row_prior_mapper:main',
+            'depth_image_to_pointcloud2 = tree_template.depth_image_to_pointcloud2:main',
+            'row_fast_slam = tree_template.row_fast_slam:main',
+            'slam_odom_correction_tf = tree_template.slam_odom_correction_tf:main',
         ],
     },
 )

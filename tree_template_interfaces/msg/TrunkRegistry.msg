@@ -1,0 +1,2 @@
+# TrunkRegistry.msg
+TrunkInfo[] trunks
