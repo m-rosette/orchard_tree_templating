@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 from typing import Dict, Optional
-import os
 
 import numpy as np
 
@@ -12,14 +11,13 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from std_msgs.msg import Header
-from geometry_msgs.msg import PointStamped, PoseArray, Pose, Point
+from geometry_msgs.msg import Pose, Point, PoseStamped
 from visualization_msgs.msg import Marker
 
 from pf_orchard_interfaces.msg import TreeImageData
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
 
 import tf2_ros
-from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point
 
 from scipy.spatial.transform import Rotation as R
 
@@ -50,6 +48,7 @@ class TrunkClusterToTemplateNode(Node):
         self.declare_parameter("track_position_gate", 0.5)
         self.declare_parameter("track_width_gate", 0.03)
         self.declare_parameter("uniqueness_radius", 0.4)
+        self.declare_parameter("use_trunk_width_addition", True)
 
         self.declare_parameter("row_axis_x", 1.0)
         self.declare_parameter("row_axis_y", 0.0)
@@ -75,6 +74,7 @@ class TrunkClusterToTemplateNode(Node):
         self.track_position_gate = float(self.get_parameter("track_position_gate").value)
         self.track_width_gate = float(self.get_parameter("track_width_gate").value)
         self.uniqueness_radius = float(self.get_parameter("uniqueness_radius").value)
+        self.use_trunk_width_addition = bool(self.get_parameter("use_trunk_width_addition").value)
 
         row_axis_x = float(self.get_parameter("row_axis_x").value)
         row_axis_y = float(self.get_parameter("row_axis_y").value)
@@ -123,6 +123,16 @@ class TrunkClusterToTemplateNode(Node):
         self._datum_fit_cached_for_version: int = -1
         self._datum_fit_version: int = 0
 
+        # --- Registry publish throttling ---
+        self._last_registry_pub_time = 0.0
+        self._registry_pub_min_period = 0.25  # seconds (2 Hz)
+
+        # --- Datum marker publish control ---
+        self._last_datum_published_version = -1
+
+        # cache committed positions as numpy for fast uniqueness checks ---
+        self._committed_pos_np = np.empty((0, 3), dtype=np.float64)  # grows on commit
+
         # -------- TF2 --------
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -132,6 +142,7 @@ class TrunkClusterToTemplateNode(Node):
         self.trunk_meas_pub = self.create_publisher(TrunkInfo, "trunk_measurements", 10)
         self.row_datum_pub = self.create_publisher(Marker, "trunk_row_datum", 10)
         self.trunk_marker_pub = self.create_publisher(Marker, "committed_trunk_markers", 10)
+        self.row_datum_pose_pub = self.create_publisher(PoseStamped, "row_datum_pose", 10)
 
         qos = QoSProfile(
             depth=1,
@@ -176,30 +187,65 @@ class TrunkClusterToTemplateNode(Node):
         if not msg.object_seen:
             return
 
-        t_msg = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-
         points_2d, widths, top_2d, bottom_2d = self.extract_points_and_widths_from_msg(msg)
         if points_2d.size == 0 or top_2d.size == 0 or bottom_2d.size == 0:
             return
 
-        stamp = msg.header.stamp
-        for xy, xy_top, xy_bot, w in zip(points_2d, top_2d, bottom_2d, widths):
-            width = float(w) if widths is not None else None
+        t_msg = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-            # TODO: Confirm coordinate conventions here
-            pos_cam = np.array([xy[0], 0.0, -xy_bot[1]], dtype=float)
-            top_cam = np.array([xy_top[0], 0.0, xy_top[1]], dtype=float)
-            bot_cam = np.array([xy_bot[0], 0.0, xy_bot[1]], dtype=float)
+        # TF once per frame
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.target_frame,
+                self.camera_frame,
+                Time(), # latest available
+                timeout=Duration(seconds=0.05),
+            )
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(f"TF lookup failed: {e}")
+            return
+        
+        T = self._transformstamped_to_T(tf_msg)
+        n = points_2d.shape[0]
 
-            pos_t = self.transform_to_target_frame(pos_cam, stamp)
-            top_t = self.transform_to_target_frame(top_cam, stamp)
-            bot_t = self.transform_to_target_frame(bot_cam, stamp)
+        pos_cam = np.empty((n, 3), dtype=np.float64)
+        top_cam = np.empty((n, 3), dtype=np.float64)
+        bot_cam = np.empty((n, 3), dtype=np.float64)
 
-            if pos_t is None or top_t is None or bot_t is None:
-                self.get_logger().warn("transform unavailable; skipping detection.")
-                continue
+        if self.use_trunk_width_addition and widths is not None:
+            # Adjust 2D points to account for trunk radius
+            radii = widths.astype(np.float64) * 0.5
+            points_2d[:, 1] += radii
+            top_2d[:, 1] += radii
+            bottom_2d[:, 1] += radii
 
-            self._assign_detection_to_track(t_msg, pos_t, pos_cam, width, top_t, bot_t)
+        pos_cam[:, 1] = 0.0
+        top_cam[:, 1] = 0.0
+        bot_cam[:, 1] = 0.0
+
+        pos_cam[:, 0] = points_2d[:, 0]
+        # pos_cam[:, 2] = points_2d[:, 1]
+        pos_cam[:, 2] = bottom_2d[:, 1] # use bottom z for trunk base
+
+        top_cam[:, 0] = top_2d[:, 0]
+        top_cam[:, 2] = top_2d[:, 1]
+
+        bot_cam[:, 0] = bottom_2d[:, 0]
+        bot_cam[:, 2] = bottom_2d[:, 1]
+
+        # Transform (batch)
+        pos_t = self._apply_T_batch(T, pos_cam)
+        top_t = self._apply_T_batch(T, top_cam)
+        bot_t = self._apply_T_batch(T, bot_cam)
+
+        if widths is None:
+            for p_t, p_c, t_t, b_t in zip(pos_t, pos_cam, top_t, bot_t):
+                self._assign_detection_to_track(t_msg, p_t, p_c, None, t_t, b_t)
+        else:
+            for p_t, p_c, w, t_t, b_t in zip(pos_t, pos_cam, widths, top_t, bot_t):
+                self._assign_detection_to_track(t_msg, p_t, p_c, float(w), t_t, b_t)
 
     # ---------------- Track assignment ----------------
 
@@ -297,42 +343,38 @@ class TrunkClusterToTemplateNode(Node):
 
     def track_evaluation_timer_callback(self):
         """
-        Periodically:
-        - For each uncommitted track with enough hits, decide if it's a new tree
-            and, if so, classify its side and publish:
-            - a TrunkInfo observation in TARGET FRAME on 'trunk_observations'
-            - a TrunkInfo measurement in CAMERA FRAME on 'trunk_measurements'
-        - Update the row datum marker.
+        Periodically evaluate tracks and commit mature ones.
         """
         if not self.tracks:
-            self.get_logger().debug("No tracks to evaluate.")
             return
 
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        # Cache these once for this tick
+        committed_changed = False
         new_obs = 0
 
         for track_id, track in self.tracks.items():
             if track["committed"] or track["hit_count"] < self.min_samples:
                 continue
 
-            inv_n = 1.0 / float(track["num_pos"])
+            inv_n = 1.0 / track["num_pos"]
             centroid = track["sum_pos"] * inv_n
             centroid_cam = track["sum_pos_cam"] * inv_n
             top_coord = track["sum_top_target"] * inv_n
             bottom_coord = track["sum_bottom_target"] * inv_n
 
             side = self.classify_side_for_tree(centroid, top_coord, bottom_coord)
+
+            # Uniqueness check
             if not self.is_position_new(centroid, side):
-                self.get_logger().debug(
-                    f"Track {track_id} centroid {centroid} is not new (within uniqueness criteria); skipping."
-                )
                 continue
 
+            # Commit track
             track["committed"] = True
-
-            self.get_logger().info(
-                f"New trunk track {track_id} (side={side}) in {self.target_frame} at {centroid}, "
-                "publishing TrunkInfo observation + measurement."
-            )
+            committed_changed = True
+            self._last_datum_published_version = self._datum_fit_version
+            self._datum_fit_version += 1
 
             width_mean = track["width_mean"]
             width_out = float(width_mean) if width_mean is not None else float("nan")
@@ -356,7 +398,7 @@ class TrunkClusterToTemplateNode(Node):
             meas_pose.position.x = float(centroid_cam[0])
             meas_pose.position.y = float(centroid_cam[1])
             meas_pose.position.z = float(centroid_cam[2])
-            meas_pose.orientation.w = 1.0  # identity; FastSLAM only uses position
+            meas_pose.orientation.w = 1.0
 
             tinfo_meas = TrunkInfo()
             tinfo_meas.pose = meas_pose
@@ -364,18 +406,28 @@ class TrunkClusterToTemplateNode(Node):
             tinfo_meas.width = width_out
             self.trunk_meas_pub.publish(tinfo_meas)
 
-            # --- Bookkeeping / viz ---
+            # --- Viz / bookkeeping ---
             self.publish_committed_trunk_marker(pose, track_id)
             self.committed_trunks.append(tinfo)
-            self.publish_trunk_registry()
-            new_obs += 1
-            self._datum_fit_version += 1
 
-        # Update / republish datum marker based on committed trunks
-        self.row_datum_timer_callback()
+            self._committed_pos_np = np.vstack(
+                (self._committed_pos_np, np.array([[centroid[0], centroid[1], centroid[2]]], dtype=np.float64))
+            )
+
+            new_obs += 1
+
+        # Throttle registry publish (only if there was any change AND enough time elapsed)
+        if committed_changed and (now - self._last_registry_pub_time) >= self._registry_pub_min_period:
+            self.publish_trunk_registry()
+            self._last_registry_pub_time = now
+
+        # Publish datum marker only when committed set changed since last publish
+        if self._last_datum_published_version != self._datum_fit_version:
+            self.row_datum_timer_callback()
+            self._last_datum_published_version = self._datum_fit_version
 
         if new_obs > 0:
-            self.get_logger().info(f"Published {new_obs} TrunkInfo observation(s).")
+            self.get_logger().debug(f"Published {new_obs} TrunkInfo observation(s).")
 
     # ---------------- Side classification using row datum ----------------
     
@@ -454,41 +506,6 @@ class TrunkClusterToTemplateNode(Node):
         if self.side_mode == "datum":
             return self._get_datum_side_classification(pos_target)
 
-    def _get_all_positions_on_side(self, side: str) -> list[np.ndarray]:
-        """
-        Return all existing trunk positions that lie on the specified side
-        ("near" or "far") of the fitted row datum line.
-        """
-        if side not in ("near", "far"):
-            return []
-
-        fit = self._fit_row_datum_line()
-        if fit is None:
-            return []
-
-        m, b = fit
-        denom = np.sqrt(m * m + 1.0)
-        if denom < 1e-6:
-            return []
-
-        positions = self.get_existing_positions()
-
-        same_side_positions: list[np.ndarray] = []
-        for pos in positions:
-            if pos.shape[0] < 2:
-                continue
-
-            x = float(pos[0])
-            y = float(pos[1])
-            y_line = m * x + b
-            signed_dist = (y - y_line) / denom
-            current_side = "near" if signed_dist < 0.0 else "far"
-
-            if current_side == side:
-                same_side_positions.append(pos)
-
-        return same_side_positions
-
     # ---------------- Row datum (line fit) helpers ----------------
 
     def _fit_row_datum_line(self) -> Optional[tuple[float, float]]:
@@ -519,44 +536,40 @@ class TrunkClusterToTemplateNode(Node):
         self._datum_fit_cached_for_version = self._datum_fit_version
         return self._datum_fit
 
-    def compute_datum_yaw_quaternion(self) -> Optional[np.ndarray]:
-        """
-        Computes the yaw quaternion for the fitted row datum line.
-        Returns np.array([x, y, z, w]) or None if the line cannot be fit.
-        """
-        fit = self._fit_row_datum_line()
-        if fit is None:
-            return None
-
-        m, _ = fit
-        theta = np.arctan2(m, 1.0)  # yaw angle
-        quat = R.from_euler("z", theta).as_quat()  # [x, y, z, w]
-        return quat
-
     def row_datum_timer_callback(self):
+        """
+        Publish the fitted row datum line marker using cached committed positions.
+
+        Requires:
+        - self._committed_pos_np: np.ndarray of shape (M,3)
+            (or it will fall back to your existing committed_trunks list)
+        """
         fit = self._fit_row_datum_line()
         if fit is None:
             return
 
-        m, b = fit  # or m, b, denom if you did the optional step
+        m, b = fit
 
-        positions = self.get_existing_positions()
-        if not positions:
+        # Prefer cached numpy positions if available
+        pos_np = getattr(self, "_committed_pos_np", None)
+        if isinstance(pos_np, np.ndarray) and pos_np.shape[0] > 0:
+            xs = pos_np[:, 0]  # instant slice, no list comprehension
+            self._publish_row_datum_line(m, b, xs)
+
+            # Also publish yaw pose
+            yaw = np.arctan2(m, 1.0)  # yaw angle
+            self._publish_row_datum_pose(yaw)
             return
 
-        xs = np.array([float(p[0]) for p in positions], dtype=float)
-        self._publish_row_datum_line(m, b, xs)
+    def _trunks_for_row_datum(self):
+        pos_np = getattr(self, "_committed_pos_np", None)
+        if isinstance(pos_np, np.ndarray) and pos_np.shape[0] >= 2:
+            # return list of (x,y) tuples for lstsq
+            return [tuple(xy) for xy in pos_np[:, :2]]
 
-    def _trunks_for_row_datum(self) -> list[tuple[float, float]]:
-        """
-        Extract (x, y) pairs for line fitting from committed trunk poses.
-        """
+        # fallback
         positions = self.get_existing_positions()
-        trunks: list[tuple[float, float]] = []
-        for p in positions:
-            if p.shape[0] >= 2:
-                trunks.append((float(p[0]), float(p[1])))
-        return trunks
+        return [(float(p[0]), float(p[1])) for p in positions if p.shape[0] >= 2]
 
     def _publish_row_datum_line(self, m: float, b: float, xs: np.ndarray):
         if xs.size == 0:
@@ -601,41 +614,53 @@ class TrunkClusterToTemplateNode(Node):
 
         self.row_datum_pub.publish(marker)
 
-    # ---------------- TF helper ----------------
-
-    def transform_to_target_frame(self, pos_cam: np.ndarray, stamp) -> Optional[np.ndarray]:
-        """
-        Transform a 3D point from camera_frame to target_frame using TF2.
-        """
-        ps = PointStamped()
-        ps.header.stamp = stamp
-        ps.header.frame_id = self.camera_frame
-        ps.point.x = float(pos_cam[0])
-        ps.point.y = float(pos_cam[1])
-        ps.point.z = float(pos_cam[2])
-
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.target_frame,
-                self.camera_frame,
-                Time(),  # zero time → latest transform
-                timeout=Duration(seconds=0.5),
-            )
-        except (
-            tf2_ros.LookupException,
-            tf2_ros.ConnectivityException,
-            tf2_ros.ExtrapolationException,
-        ) as e:
-            self.get_logger().warn(
-                f"Failed to lookup transform {self.camera_frame} -> {self.target_frame}: {e}"
-            )
-            return None
-
-        ps_out = do_transform_point(ps, transform)
-        return np.array(
-            [ps_out.point.x, ps_out.point.y, ps_out.point.z],
-            dtype=float,
+    def _publish_row_datum_pose(self, yaw: float):
+        ps = PoseStamped()
+        ps.header.frame_id = self.target_frame
+        ps.header.stamp = (
+            self.tree_image_data_timestamp
+            if self.tree_image_data_timestamp is not None
+            else self.get_clock().now().to_msg()
         )
+
+        ps.pose.position.x = 0.0
+        ps.pose.position.y = 0.0
+        ps.pose.position.z = 0.0
+
+        q = R.from_euler("z", float(yaw)).as_quat()  # [x,y,z,w]
+        ps.pose.orientation.x = float(q[0])
+        ps.pose.orientation.y = float(q[1])
+        ps.pose.orientation.z = float(q[2])
+        ps.pose.orientation.w = float(q[3])
+
+        self.row_datum_pose_pub.publish(ps)
+
+    # ---------------- TF helper ----------------
+    
+    def _transformstamped_to_T(self, tf_msg) -> np.ndarray:
+        """
+        Convert geometry_msgs/TransformStamped into a 4x4 homogeneous transform matrix.
+        Maps points from source frame -> target frame as: p_t = T @ [p_s; 1]
+        """
+        t = tf_msg.transform.translation
+        q = tf_msg.transform.rotation
+
+        # scipy Rotation expects [x, y, z, w]
+        Rm = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()  # (3,3)
+
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = Rm
+        T[:3, 3] = np.array([t.x, t.y, t.z], dtype=np.float64)
+        return T
+
+    def _apply_T_batch(self, T: np.ndarray, P: np.ndarray) -> np.ndarray:
+        """
+        Apply 4x4 homogeneous transform to many points.
+        P: (N,3)
+        returns: (N,3)
+        """
+        # (N,3) @ (3,3).T + (3,) -> (N,3)
+        return (P @ T[:3, :3].T) + T[:3, 3]
 
     # ---------------- Helper methods ----------------
 
@@ -729,44 +754,25 @@ class TrunkClusterToTemplateNode(Node):
         return positions
 
     def is_position_new(self, pos: np.ndarray, side: Optional[str] = None) -> bool:
-        """
-        Decide if 'pos' (in TARGET FRAME) corresponds to a new tree.
-
-        Uses committed trunk positions (in memory) only.
-        """
-        all_existing = self.get_existing_positions()
-        if not all_existing:
+        if getattr(self, "_committed_pos_np", None) is None or self._committed_pos_np.size == 0:
             return True
 
-        # Side-aware uniqueness check
+        # Radius check (fast vectorized)
         if self.uniqueness_radius > 0.0:
-            if side in ("near", "far"):
-                same_side_positions = self._get_all_positions_on_side(side)
+            d = self._committed_pos_np - pos.reshape(1, 3)
+            d2 = np.einsum("ij,ij->i", d, d)  # squared distance
+            return not np.any(d2 < (self.uniqueness_radius ** 2))
 
-                # If nothing on this side yet, treat as new
-                if not same_side_positions:
-                    return True
-
-                for existing in same_side_positions:
-                    if np.linalg.norm(pos - existing) < self.uniqueness_radius:
-                        return False
-                return True
-
-            # Fallback: original behavior (no valid side info)
-            for existing in all_existing:
-                if np.linalg.norm(pos - existing) < self.uniqueness_radius:
-                    return False
-            return True
-
-        # Row-based anisotropic check (unchanged)
-        for existing in all_existing:
+        # Fallback to your anisotropic check if radius disabled
+        for ti in self.committed_trunks:
+            p = ti.pose.position
+            existing = np.array([p.x, p.y, p.z], dtype=float)
             delta = pos - existing
-            s = np.dot(delta, self.row_axis)  # along-row difference
+            s = np.dot(delta, self.row_axis)
             lateral_vec = delta - s * self.row_axis
             d_lat = np.linalg.norm(lateral_vec)
             if abs(s) < self.along_row_tolerance and d_lat < self.lateral_tolerance:
                 return False
-
         return True
 
     def publish_trunk_registry(self):

@@ -89,8 +89,8 @@ class RowFastSLAMNode(Node):
 
         # Row structure (slot indexing along the row)
         self.declare_parameter("slot_spacing", 0.75)   # [m]
-        self.declare_parameter("row_origin_s", -0.6)    # [m] s coordinate of slot 0
-        self.declare_parameter("slot_s_gate", 0.35)     # [m] max |s_meas - s_slot| to accept
+        self.declare_parameter("row_origin_s", 0.6)    # [m] s coordinate of slot 0
+        self.declare_parameter("slot_s_gate", 0.25)     # [m] max |s_meas - s_slot| to accept
         self.declare_parameter("snap_downstream_spacing", True)
         self.declare_parameter("downstream_snap_mode", "unseen_only")  # "unseen_only" or "all_downstream"
 
@@ -98,33 +98,32 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("use_template_map", True)
         self.declare_parameter("use_global_row_yaw", True)
         self.declare_parameter("num_slots", 50)
-        self.declare_parameter("row_origin_x", -0.6)   # if NaN, use first odom pose
-        self.declare_parameter("row_origin_y", 1.8)    # if NaN, use first odom pose
-
-        # NEW: row direction sign along X axis. (+1 => +X, -1 => -X)
-        self.declare_parameter("row_dir_sign", -1)
+        self.declare_parameter("row_origin_x", 0.6)   # if NaN, use first odom pose
+        self.declare_parameter("row_origin_y", -1.8)    # if NaN, use first odom pose
+        self.declare_parameter("row_dir_sign", 1) # (+1 => +X, -1 => -X)
+        self.declare_parameter("row_datum_pose_topic", "row_datum_pose")
 
         self.declare_parameter("start_side", "near")   # slot 0 side
         self.declare_parameter("init_d_near", 0.0)
         self.declare_parameter("init_d_far", 0.0)
-        self.declare_parameter("prior_sigma_s", 1.0)
-        self.declare_parameter("prior_sigma_d", 1.0)
+        self.declare_parameter("prior_sigma_s", 0.6)
+        self.declare_parameter("prior_sigma_d", 0.6)
         self.declare_parameter("side_mode", "semantic")   # "fixed" or "geometry" or "semantic"
 
         # Measurement noise (std dev) in robot frame
-        self.declare_parameter("meas_std_x", 0.05)
-        self.declare_parameter("meas_std_y", 0.05)
+        self.declare_parameter("meas_std_x", 0.10) # left/right
+        self.declare_parameter("meas_std_y", 0.3) # forward/back
 
         # Motion model noise parameters
-        self.declare_parameter("motion_noise.a_trans", 0.2)
-        self.declare_parameter("motion_noise.b_trans", 0.005)
-        self.declare_parameter("motion_noise.c_lat", 0.7)
-        self.declare_parameter("motion_noise.a_rot", 0.2)
-        self.declare_parameter("motion_noise.b_rot", 0.002)
+        self.declare_parameter("motion_noise.a_trans", 0.1)
+        self.declare_parameter("motion_noise.b_trans", 0.001)
+        self.declare_parameter("motion_noise.c_lat", 0.5)
+        self.declare_parameter("motion_noise.a_rot", 0.1)
+        self.declare_parameter("motion_noise.b_rot", 0.005)
 
         # Resampling
-        self.declare_parameter("resample_interval", 5)
-        self.declare_parameter("neff_ratio_threshold", 0.5)
+        self.declare_parameter("resample_interval", 10)
+        self.declare_parameter("neff_ratio_threshold", 0.3)
 
         # Semantic side memory (from TrunkClusterToTemplateNode side classification)
         self.declare_parameter("semantic_side_min_votes", 3)          # votes needed before we "trust" it
@@ -160,6 +159,7 @@ class RowFastSLAMNode(Node):
         self.row_dir_sign = int(self.get_parameter("row_dir_sign").value)
         if self.row_dir_sign not in (-1, 1):
             self.row_dir_sign = -1
+        self.row_datum_pose_topic = str(self.get_parameter("row_datum_pose_topic").value)
 
         self.start_side = str(self.get_parameter("start_side").value).strip().lower()
         self.init_d_near = float(self.get_parameter("init_d_near").value)
@@ -204,6 +204,9 @@ class RowFastSLAMNode(Node):
         # Lateral: world +Y
         self.lateral_dir = np.array([0.0, 1.0], dtype=float)
 
+        self.row_yaw_est: Optional[float] = None
+        self.row_yaw_alpha = 0.2  # smoothing (0.0 = no smoothing, 0.9 = heavy smoothing)
+
         # Cached basis
         self.t_hat = self.row_axis.copy()
         self.n_hat = self.lateral_dir.copy()
@@ -224,7 +227,8 @@ class RowFastSLAMNode(Node):
 
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 50)
         self.meas_sub = self.create_subscription(TrunkInfo, self.measurement_topic, self.measurement_callback, 50)
-
+        self.row_datum_sub = self.create_subscription(PoseStamped, self.row_datum_pose_topic, self.row_datum_pose_callback, 10)
+        
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self.get_logger().info(
@@ -417,7 +421,7 @@ class RowFastSLAMNode(Node):
         if not self.particles or self.last_odom_pose is None:
             return
 
-        z = np.array([-msg.pose.position.x, msg.pose.position.z], dtype=float)
+        z = np.array([msg.pose.position.x, msg.pose.position.z], dtype=float)
         if np.linalg.norm(z) < 1e-3:
             return
 
@@ -548,25 +552,45 @@ class RowFastSLAMNode(Node):
             if lm is None:
                 continue
 
+            # z_pred: predicted measurement for this landmark (position in the robot frame)
+            # H: measurement Jacobian (2x2) wrt landmark position in world frame
             z_pred, H = self._predict_z_and_H(p.pose, lm.mu)
+
+            # lm.Sigma: landmark EKF covariance for this particle/slot
+            # R_meas: diagonal measurement noise covariance which is the square of self.meas_std for x,y
+            # S: covariance
             S = H @ lm.Sigma @ H.T + R_meas
 
+            # innov: innovation = difference between actual and predicted measurement
             innov = z - z_pred
             try:
                 Sinv = np.linalg.inv(S)
             except np.linalg.LinAlgError:
                 continue
 
+            # Mahalanobis distance: how big is the innovation compared to expected uncertainty
+            #    small maha -> measurement matches prediction well
+            #    large maha -> measurement is unlikely given prediction
             maha = float(innov.T @ Sinv @ innov)
+            # Log-determinant of S: encapsulates normalized measurement uncertainty
+            #    log -> numerical stability
+            #    determinate -> volume of uncertainty
+            #    sign -> should be positive for valid covariance
             sign, logdet = np.linalg.slogdet(S)
             if sign <= 0:
                 continue
 
+            # Log-weight update: log-likelihood of measurement given prediction (multivariate Gaussian)
+            #    this implements only the exponent part (normalization constant omitted)
             logw[i] = -0.5 * (maha + logdet)
 
+        # maxlog: numerical stability
         maxlog = float(np.max(logw))
+
+        # Convert log-weights to normal weights (unnormalized)
         w = np.exp(logw - maxlog)
 
+        # Apply weights to particles
         for i, p in enumerate(self.particles):
             p.weight *= float(w[i])
 
@@ -575,12 +599,16 @@ class RowFastSLAMNode(Node):
     def _normalize_weights(self):
         if not self.particles:
             return
+        # Sum of weights
         s = float(sum(p.weight for p in self.particles))
+        # Avoid division by zero
         if s < 1e-12:
+            # reset to uniform weights
             w0 = 1.0 / float(len(self.particles))
             for p in self.particles:
                 p.weight = w0
             return
+        # Normalize
         inv = 1.0 / s
         for p in self.particles:
             p.weight *= inv
@@ -682,7 +710,7 @@ class RowFastSLAMNode(Node):
 
         items = sorted(p_best.landmarks.items(), key=lambda kv: kv[0])
 
-        row_yaw = self._estimate_row_yaw_from_best()
+        row_yaw = self.row_yaw_est if self.row_yaw_est is not None else self._estimate_row_yaw_from_best()
         row_q = quat_xyzw_from_yaw(row_yaw) if (row_yaw is not None) else np.array([0.0, 0.0, 0.0, 1.0])
 
         # Decide side per slot index once
@@ -761,6 +789,30 @@ class RowFastSLAMNode(Node):
                 yaw = wrap_angle(yaw + np.pi)
 
         return yaw
+
+    def row_datum_pose_callback(self, msg: PoseStamped):
+        q = msg.pose.orientation
+        yaw = float(R.from_quat([q.x, q.y, q.z, q.w]).as_euler("zyx")[0])
+
+        # angle-safe exponential smoothing
+        if self.row_yaw_est is None:
+            self.row_yaw_est = yaw
+        else:
+            a = float(self.row_yaw_alpha)
+            c = a * np.cos(self.row_yaw_est) + (1.0 - a) * np.cos(yaw)
+            s = a * np.sin(self.row_yaw_est) + (1.0 - a) * np.sin(yaw)
+            self.row_yaw_est = float(np.arctan2(s, c))
+
+        th = float(self.row_yaw_est)
+
+        # Update row basis used by slotting/template/snapping
+        self.t_hat = np.array([np.cos(th), np.sin(th)], dtype=float) * float(self.row_dir_sign)
+        self.t_hat /= (np.linalg.norm(self.t_hat) + 1e-12)
+        self.n_hat = np.array([-self.t_hat[1], self.t_hat[0]], dtype=float)
+
+        # If you still use these elsewhere, keep them consistent:
+        self.row_axis = self.t_hat.copy()
+        self.lateral_dir = self.n_hat.copy()
 
 
 def main(args=None):

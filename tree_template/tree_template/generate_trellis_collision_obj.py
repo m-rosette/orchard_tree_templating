@@ -32,7 +32,7 @@ class TreeSceneNode(Node):
         self.declare_parameter("side_branch_len", 2.0)
         self.declare_parameter("trellis_angle", -18.435)  # Martin's angle (deg)
         self.declare_parameter("branch_spacing", 0.5)      # m
-        self.declare_parameter("trellis_frame", "odom")
+        self.declare_parameter("trellis_frame", "odom_slam")
         self.declare_parameter("trellis_prefix", "v_trellis_tree_")
 
         # Topic providing the row-level map of trunks.
