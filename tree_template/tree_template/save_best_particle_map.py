@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
+from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
@@ -155,7 +156,14 @@ class TrunkRegistryDumpToYaml(Node):
         return res
 
     def _write_yaml(self, data: Dict):
-        tmp = self.out_path.with_suffix(self.out_path.suffix + ".tmp")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        out_path = self.out_path.with_name(
+            f"{self.out_path.stem}_{ts}{self.out_path.suffix}"
+        )
+
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+
         with open(tmp, "w") as f:
             corr = data.get("initial_odom_correction")
             gps = data.get("initial_gps_fix")
@@ -170,11 +178,10 @@ class TrunkRegistryDumpToYaml(Node):
                     f"[{corr[0]:.6f}, {corr[1]:.6f}, {corr[2]:.6f}]\n"
                 )
 
-            # initial_gps_fix: [lat, lon, alt]
+            # initial_gps_fix
             if gps is None:
                 f.write("initial_gps_fix: null\n")
             else:
-                # keep more precision for lat/lon
                 f.write(
                     f"initial_gps_fix: "
                     f"[{gps[0]:.8f}, {gps[1]:.8f}, {gps[2]:.3f}]\n"
@@ -189,7 +196,9 @@ class TrunkRegistryDumpToYaml(Node):
                     xy = trees[i]
                     f.write(f"  {i}: [{xy[0]:.6f}, {xy[1]:.6f}]\n")
 
-        tmp.replace(self.out_path)
+        tmp.replace(out_path)
+
+        self.get_logger().info(f"Wrote YAML: {out_path}")
 
 
 def main():

@@ -32,7 +32,7 @@ def stamp_to_sec(stamp) -> float:
 
 class SlamOdomCorrectionTf(Node):
     """
-    Publishes TF: odom_slam -> odom
+    Publishes TF: map -> odom
 
     - Computes correction using ApproximateTimeSynchronizer (wheel odom + slam odom).
     - Caches the latest correction.
@@ -48,20 +48,20 @@ class SlamOdomCorrectionTf(Node):
         self.declare_parameter("slam_odom_topic", "/odom_slam_best")
 
         self.declare_parameter("odom_frame", "odom")
-        self.declare_parameter("odom_slam_frame", "odom_slam")
+        self.declare_parameter("map_frame", "map")
 
         self.declare_parameter("sync_queue_size", 50)
         self.declare_parameter("sync_slop_sec", 0.05)
         self.declare_parameter("sync_allow_headerless", False)
 
         # Continuous publishing
-        self.declare_parameter("publish_rate_hz", 50.0)     # timer publish rate
-        self.declare_parameter("publish_on_wheel_odom", True)
+        self.declare_parameter("publish_rate_hz", 30.0)     # timer publish rate
+        self.declare_parameter("publish_on_wheel_odom", False)
 
         wheel_topic = self.get_parameter("wheel_odom_topic").value
         slam_topic = self.get_parameter("slam_odom_topic").value
         self.odom_frame = self.get_parameter("odom_frame").value
-        self.odom_slam_frame = self.get_parameter("odom_slam_frame").value
+        self.map_frame = self.get_parameter("map_frame").value
 
         qsize = int(self.get_parameter("sync_queue_size").value)
         slop = float(self.get_parameter("sync_slop_sec").value)
@@ -110,7 +110,7 @@ class SlamOdomCorrectionTf(Node):
         self.get_logger().info(
             f"Computing correction from wheel='{wheel_topic}' and slam='{slam_topic}' "
             f"(slop={slop}s, queue={qsize}).\n"
-            f"Publishing TF {self.odom_slam_frame} -> {self.odom_frame} continuously "
+            f"Publishing TF {self.map_frame} -> {self.odom_frame} continuously "
             f"(rate={self.publish_rate_hz:.1f}Hz, publish_on_wheel_odom={self.publish_on_wheel_odom})."
         )
 
@@ -134,9 +134,9 @@ class SlamOdomCorrectionTf(Node):
             self.get_logger().debug(
                 f"wheel_odom.frame_id='{wheel_odom.header.frame_id}' expected '{self.odom_frame}'"
             )
-        if slam_odom.header.frame_id and slam_odom.header.frame_id != self.odom_slam_frame:
+        if slam_odom.header.frame_id and slam_odom.header.frame_id != self.map_frame:
             self.get_logger().debug(
-                f"slam_odom.frame_id='{slam_odom.header.frame_id}' expected '{self.odom_slam_frame}'"
+                f"slam_odom.frame_id='{slam_odom.header.frame_id}' expected '{self.map_frame}'"
             )
 
         # wheel: base pose in odom
@@ -144,12 +144,12 @@ class SlamOdomCorrectionTf(Node):
         wy = float(wheel_odom.pose.pose.position.y)
         wyaw = quat_to_yaw(wheel_odom.pose.pose.orientation)
 
-        # slam: base pose in odom_slam
+        # slam: base pose in map
         sx = float(slam_odom.pose.pose.position.x)
         sy = float(slam_odom.pose.pose.position.y)
         syaw = quat_to_yaw(slam_odom.pose.pose.orientation)
 
-        # Compute correction T(odom_slam -> odom)
+        # Compute correction T(map -> odom)
         dyaw = wyaw - syaw
         dyaw = (dyaw + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -183,7 +183,7 @@ class SlamOdomCorrectionTf(Node):
 
         t = TransformStamped()
         t.header.stamp = self._last_wheel_stamp
-        t.header.frame_id = self.odom_slam_frame
+        t.header.frame_id = self.map_frame
         t.child_frame_id = self.odom_frame
 
         t.transform.translation.x = self._dx

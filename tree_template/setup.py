@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*launch.[pxy][yma]*')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,6 +31,8 @@ setup(
             'depth_image_to_pointcloud2 = tree_template.depth_image_to_pointcloud2:main',
             'row_fast_slam = tree_template.row_fast_slam:main',
             'slam_odom_correction_tf = tree_template.slam_odom_correction_tf:main',
+            'odom_reframer_calibrated = tree_template.odom_reframer_calibrated:main',
+            'trunk_detection_relay = tree_template.trunk_detection_relay:main',
         ],
     },
 )

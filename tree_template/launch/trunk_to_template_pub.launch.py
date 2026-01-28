@@ -9,7 +9,6 @@ from launch.conditions import IfCondition
 def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
-    reframe_odom = LaunchConfiguration('reframe_odom')
 
     return LaunchDescription([
 
@@ -60,10 +59,20 @@ def generate_launch_description():
             }]
         ),
 
-        # trunk_to_template_position node
+        # # trunk_to_template_position node
+        # Node(
+        #     package='tree_template',
+        #     executable='trunk_to_template_position',
+        #     output='screen',
+        #     parameters=[{
+        #         'use_sim_time': use_sim_time
+        #     }]
+        # ),
+
+        # trunk_detection_relay node
         Node(
             package='tree_template',
-            executable='trunk_to_template_position',
+            executable='trunk_detection_relay',
             output='screen',
             parameters=[{
                 'use_sim_time': use_sim_time
@@ -90,14 +99,25 @@ def generate_launch_description():
             }]
         ),
         
-        # Static transforms for odom_slam
+        # Static transforms for map
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
-            arguments=["0", "0", "0", "0", "0", "0", "world", "odom_slam"],
+            arguments=["0", "0", "0", "0", "0", "0", "world", "map"],
             output="screen",
             parameters=[{
                 'use_sim_time': use_sim_time,
             }],
         ),
+
+        # Odometry reframer node (to align recorded odom to start at zero)
+        Node(
+            package='tree_template', 
+            executable='odom_reframer_calibrated', 
+            name='odom_reframer', 
+            parameters=[{
+                'use_sim_time': use_sim_time,
+            }],
+        ),
+
     ])
