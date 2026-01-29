@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*launch.[pxy][yma]*')),
+        (os.path.join('share', package_name, 'config', 'nav'), glob('config/nav/*.yaml')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
@@ -33,6 +34,7 @@ setup(
             'slam_odom_correction_tf = tree_template.slam_odom_correction_tf:main',
             'odom_reframer_calibrated = tree_template.odom_reframer_calibrated:main',
             'trunk_detection_relay = tree_template.trunk_detection_relay:main',
+            'save_best_particle_map = tree_template.save_best_particle_map:main',
         ],
     },
 )

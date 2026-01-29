@@ -115,51 +115,51 @@ class TrunkDetectionRelay(Node):
 
         n0 = int(pts.shape[0])
 
-        # # -------------------------------------------------
-        # # Build a single validity mask across all criteria
-        # # -------------------------------------------------
-        # valid = np.ones((n0,), dtype=bool)
+        # -------------------------------------------------
+        # Build a single validity mask across all criteria
+        # -------------------------------------------------
+        valid = np.ones((n0,), dtype=bool)
 
-        # # Class gating (if classifications present)
-        # if classes is not None and classes.size == n0:
-        #     valid &= (classes == self.required_class)
+        # Class gating (if classifications present)
+        if classes is not None and classes.size == n0:
+            valid &= (classes == self.required_class)
 
-        # # Width gating (if widths present and threshold enabled)
-        # if widths is not None and widths.size == n0 and self.min_trunk_width > 0.0:
-        #     valid &= np.isfinite(widths)
-        #     valid &= (widths >= self.min_trunk_width)
+        # Width gating (if widths present and threshold enabled)
+        if widths is not None and widths.size == n0 and self.min_trunk_width > 0.0:
+            valid &= np.isfinite(widths)
+            valid &= (widths >= self.min_trunk_width)
 
-        # kept = int(np.sum(valid))
-        # dropped = int(n0 - kept)
+        kept = int(np.sum(valid))
+        dropped = int(n0 - kept)
 
-        # # Log rejections even if NOTHING passes (throttled)
-        # if dropped > 0 and self.log_rejection_every_n_msgs != 0:
-        #     self._rej_log_counter += 1
-        #     if (self._rej_log_counter % self.log_rejection_every_n_msgs) == 0:
-        #         # Provide useful breakdown if available
-        #         parts = [f"kept={kept}/{n0}"]
+        # Log rejections even if NOTHING passes (throttled)
+        if dropped > 0 and self.log_rejection_every_n_msgs != 0:
+            self._rej_log_counter += 1
+            if (self._rej_log_counter % self.log_rejection_every_n_msgs) == 0:
+                # Provide useful breakdown if available
+                parts = [f"kept={kept}/{n0}"]
 
-        #         if classes is not None and classes.size == n0:
-        #             bad_class = int(np.sum(classes != self.required_class))
-        #             parts.append(f"bad_class={bad_class}")
+                if classes is not None and classes.size == n0:
+                    bad_class = int(np.sum(classes != self.required_class))
+                    parts.append(f"bad_class={bad_class}")
 
-        #         if widths is not None and widths.size == n0 and self.min_trunk_width > 0.0:
-        #             bad_width = int(np.sum(~np.isfinite(widths) | (widths < self.min_trunk_width)))
-        #             parts.append(f"bad_width={bad_width} (<{self.min_trunk_width:.3f}m)")
+                if widths is not None and widths.size == n0 and self.min_trunk_width > 0.0:
+                    bad_width = int(np.sum(~np.isfinite(widths) | (widths < self.min_trunk_width)))
+                    parts.append(f"bad_width={bad_width} (<{self.min_trunk_width:.3f}m)")
 
-        #         self.get_logger().warn("Detection filtering: " + ", ".join(parts))
+                self.get_logger().warn("Detection filtering: " + ", ".join(parts))
 
-        # if kept == 0:
-        #     return
+        if kept == 0:
+            return
 
-        # # Apply mask
-        # pts = pts[valid]
-        # top_pts = top_pts[valid]
-        # bottom_pts = bottom_pts[valid]
-        # if widths is not None and widths.size == n0:
-        #     widths = widths[valid]
-        # else:
-        #     widths = None  # avoid mismatched lengths downstream
+        # Apply mask
+        pts = pts[valid]
+        top_pts = top_pts[valid]
+        bottom_pts = bottom_pts[valid]
+        if widths is not None and widths.size == n0:
+            widths = widths[valid]
+        else:
+            widths = None  # avoid mismatched lengths downstream
 
         n = int(pts.shape[0])
 

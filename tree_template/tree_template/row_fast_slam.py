@@ -85,12 +85,12 @@ class RowFastSLAMNode(Node):
       - NEW: measurement-informed pose proposal (FastSLAM 2.0 style) to reduce wheel slip issues
     """
     def __init__(self):
-        super().__init__("row_fast_slam_node")
+        super().__init__("row_fast_slam")
 
         # ---------- Parameters ----------
         self.declare_parameter("num_particles", 500)
         self.declare_parameter("measurement_topic", "trunk_measurements_raw")
-        self.declare_parameter("odom_topic", "/odometry/local")
+        self.declare_parameter("odom_topic", "/odometry/filtered")
         self.declare_parameter("registry_topic", "fastslam_registry")
         self.declare_parameter("odom_best_topic", "odom_slam_best")
 
@@ -102,14 +102,20 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("downstream_snap_mode", "unseen_only")  # "unseen_only" or "all_downstream"
 
         # Template-map initialization
-        self.declare_parameter("use_template_map", True)
+        self.declare_parameter("use_template_map", False)
+        self.declare_parameter("publish_unseen_template_landmarks", False) # If False, we will NOT publish template landmarks until they've been seen at least N times.
+        self.declare_parameter("min_seen_count_to_publish", 1)
         self.declare_parameter("use_global_row_yaw", True)
-        self.declare_parameter("num_slots", 68) # Marcus manually counted 68 trunk in Jostan's dataset for row 12 (not sure which are "polinators")
+        self.declare_parameter("num_slots", 48) # Marcus manually counted 68 trunk in Jostan's dataset for row 12 (not sure which are "polinators")
+        self.declare_parameter("exceed_slot_num", False) # Allow dynamic extension beyond num_slots (when template map is enabled)
+        self.declare_parameter("max_extra_slots", 0)  # 0 disables cap
         self.declare_parameter("row_origin_x", float("nan"))          # if NaN, use first odom pose
         self.declare_parameter("row_origin_y", float("nan"))         # if NaN, use first odom pose
         self.declare_parameter("row_dir_sign", 1)            # (+1 => +X, -1 => -X)
         self.declare_parameter("row_datum_pose_topic", "row_datum_pose")
-
+        self.declare_parameter("max_back_assoc", 0)
+        self.declare_parameter("max_fwd_assoc", 2)
+        
         self.declare_parameter("start_side", "near")       # slot 0 side (for template parity)
         self.declare_parameter("init_d_near", 0.0)
         self.declare_parameter("init_d_far", 0.0)
@@ -170,8 +176,17 @@ class RowFastSLAMNode(Node):
         self.downstream_snap_mode = str(self.get_parameter("downstream_snap_mode").value)
 
         self.use_template_map = bool(self.get_parameter("use_template_map").value)
+        self.publish_unseen_template_landmarks = bool(self.get_parameter("publish_unseen_template_landmarks").value)
+        self.min_seen_count_to_publish = int(self.get_parameter("min_seen_count_to_publish").value)
+        if self.min_seen_count_to_publish < 0:
+            self.min_seen_count_to_publish = 0
         self.use_global_row_yaw = bool(self.get_parameter("use_global_row_yaw").value)
         self.num_slots = int(self.get_parameter("num_slots").value)
+        self.exceed_slot_num = bool(self.get_parameter("exceed_slot_num").value)
+        self.max_extra_slots = int(self.get_parameter("max_extra_slots").value)
+        if self.max_extra_slots < 0:
+            self.max_extra_slots = 0
+
 
         self.row_origin_xy = np.array(
             [
@@ -186,6 +201,8 @@ class RowFastSLAMNode(Node):
             self.row_dir_sign = 1
 
         self.row_datum_pose_topic = str(self.get_parameter("row_datum_pose_topic").value)
+        self.max_back_assoc = int(self.get_parameter("max_back_assoc").value)
+        self.max_fwd_assoc = int(self.get_parameter("max_fwd_assoc").value)
 
         self.start_side = str(self.get_parameter("start_side").value).strip().lower()
         self.init_d_near = float(self.get_parameter("init_d_near").value)
@@ -310,8 +327,6 @@ class RowFastSLAMNode(Node):
                 "maha_p95",
                 "logdet_mean",
                 "logdet_p95",
-                "gate_pen_mean",
-                "gate_pen_p95",
                 "rowprior_pen_mean",
                 "rowprior_pen_p95",
                 "reject_reason_counts",
@@ -390,7 +405,6 @@ class RowFastSLAMNode(Node):
         self.row_axis = self.t_hat.copy()
         self.lateral_dir = self.n_hat.copy()
 
-
     def _bootstrap_row_yaw_from_odom(self, yaw_meas: float):
         """
         If the row origin is taken from odom (row_origin_x/y are NaN), set row yaw as the
@@ -418,6 +432,44 @@ class RowFastSLAMNode(Node):
             self.get_logger().info(
                 f"Row yaw bootstrap complete using first {self._yaw_bootstrap_n} odom yaws: yaw={th_mean:.3f} rad"
             )
+    
+    def _extend_template_slots_to(self, new_max_slot: int) -> None:
+        """
+        Ensure slots [0..new_max_slot] exist in every particle when use_template_map is enabled.
+        Extends self.num_slots accordingly.
+        """
+        if (not self.use_template_map) or (not self.particles):
+            return
+
+        new_max_slot = int(new_max_slot)
+        if new_max_slot < self.num_slots:
+            return
+
+        # Optional cap
+        if self.max_extra_slots > 0:
+            allowed_max = (self.num_slots - 1) + self.max_extra_slots
+            if new_max_slot > allowed_max:
+                new_max_slot = allowed_max
+
+        Sigma0 = self._sigma_world_from_row_sigmas()
+
+        start_j = int(self.num_slots)
+        end_j = int(new_max_slot)
+
+        for p in self.particles:
+            for j in range(start_j, end_j + 1):
+                if j in p.landmarks:
+                    continue
+                d0 = self._template_d_for_slot(j)
+                s0 = self.row_origin_s + j * self.slot_spacing
+                mu0 = self.row_origin_xy + s0 * self.t_hat + d0 * self.n_hat
+                p.landmarks[j] = LandmarkEKF(mu=mu0.copy(), Sigma=Sigma0.copy())
+
+        self.num_slots = end_j + 1
+
+        self.get_logger().info(
+            f"Extended template slots: num_slots={self.num_slots} (added {start_j}..{end_j})"
+        )
 
 
     # =========================================================
@@ -636,7 +688,8 @@ class RowFastSLAMNode(Node):
             slot_j = 0
 
         # Template-map bounds check
-        if self.use_template_map and not (0 <= slot_j < self.num_slots):
+        if self.use_template_map and slot_j >= self.num_slots:
+            # Should only happen if we hit a max_extra_slots cap
             self._dbg_reject("assoc_oob_template")
             return
 
@@ -650,7 +703,6 @@ class RowFastSLAMNode(Node):
 
         maha_arr = np.full(n_particles, np.nan, dtype=float)
         logdet_arr = np.full(n_particles, np.nan, dtype=float)
-        gate_pen_arr = np.zeros(n_particles, dtype=float)
 
         for i, p in enumerate(self.particles):
             lm = p.landmarks.get(slot_j, None)
@@ -770,8 +822,6 @@ class RowFastSLAMNode(Node):
                 _p95(maha_arr),
                 safe_nanmean(logdet_arr),
                 _p95(logdet_arr),
-                float(np.mean(gate_pen_arr)),
-                _p95(gate_pen_arr),
                 reject_snapshot,
             ])
 
@@ -903,13 +953,11 @@ class RowFastSLAMNode(Node):
             j_idx = j_cand
         else:
             # allow small backward correction, avoid large back-jumps
-            max_back = 0
-            max_fwd = 2
             j_idx = j_cand
-            if j_idx < last - max_back:
-                j_idx = last - max_back
-            if j_idx > last + max_fwd:
-                j_idx = last + max_fwd
+            if j_idx < last - self.max_back_assoc:
+                j_idx = last - self.max_back_assoc
+            if j_idx > last + self.max_fwd_assoc:
+                j_idx = last + self.max_fwd_assoc
 
         # ---- Gate in s ----
         s_slot = origin_s + float(j_idx) * float(self.slot_spacing)
@@ -917,10 +965,19 @@ class RowFastSLAMNode(Node):
         if abs(s_meas - s_slot) > float(self.slot_s_gate):
             return None, None
 
-        # ---- Template bounds ----
+        # ---- Template bounds (optionally extend) ----
         if self.use_template_map:
-            if not (0 <= j_idx < self.num_slots):
+            if j_idx < 0:
                 return None, None
+
+            if j_idx >= self.num_slots:
+                if self.exceed_slot_num:
+                    self._extend_template_slots_to(j_idx)
+                    # If we hit the cap, extension may not reach j_idx
+                    if j_idx >= self.num_slots:
+                        return None, None
+                else:
+                    return None, None
 
         self.assoc_last_slot = int(j_idx)
         return int(j_idx), mu_world_approx
@@ -1140,6 +1197,11 @@ class RowFastSLAMNode(Node):
 
         trunks: List[TrunkInfo] = []
         for j, lm in items:
+            # --- Template prior "strength" knob: do not publish unseen template slots ---
+            if self.use_template_map and (not self.publish_unseen_template_landmarks):
+                if lm.seen_count < self.min_seen_count_to_publish:
+                    continue
+
             ti = TrunkInfo()
             ti.pose.position.x = float(lm.mu[0])
             ti.pose.position.y = float(lm.mu[1])

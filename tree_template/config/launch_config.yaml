@@ -1,0 +1,145 @@
+# tree_template/config/launch_config.yaml
+
+trunk_detection_relay:
+  ros__parameters:
+    input_topic: tree_image_data
+    camera_frame: base_camera_color_optical_frame
+    output_frame: amiga__base
+    output_topic: trunk_measurements_raw
+
+    use_trunk_width_addition: true
+
+    min_trunk_width: 0.03
+    required_class: 0
+    log_rejection_every_n_msgs: 3
+
+    publish_debug_markers: true
+    debug_marker_topic: trunk_measurements_raw_markers
+    debug_marker_scale: 0.20
+
+
+row_fast_slam:
+  ros__parameters:
+    num_particles: 500
+    measurement_topic: trunk_measurements_raw
+    odom_topic: /odometry/filtered
+    registry_topic: fastslam_registry
+    odom_best_topic: odom_slam_best
+
+    slot_spacing: 1.0612
+    row_origin_s: 0.6
+    slot_s_gate: 0.3
+    snap_downstream_spacing: false
+    downstream_snap_mode: unseen_only
+
+    use_template_map: true
+    publish_unseen_template_landmarks: false
+    min_seen_count_to_publish: 1
+    use_global_row_yaw: true
+    num_slots: 50
+    exceed_slot_num: true
+    max_extra_slots: 20  
+    row_origin_x: .nan
+    row_origin_y: .nan
+    row_dir_sign: 1
+    row_datum_pose_topic: row_datum_pose
+    max_back_assoc: 0
+    max_fwd_assoc: 2
+
+    start_side: near
+    init_d_near: 0.0
+    init_d_far: 0.0
+    prior_sigma_s: 1.2
+    prior_sigma_d: 1.2
+    side_mode: semantic
+
+    meas_std_y_lat: 0.22
+    meas_std_x_fwd: 0.5
+
+    motion_noise.a_trans: 0.55
+    motion_noise.b_trans: 0.5
+    motion_noise.c_lat: 0.2
+    motion_noise.a_rot: 0.3
+    motion_noise.b_rot: 1.0
+
+    resample_interval: 10
+    neff_ratio_threshold: 0.5
+
+    semantic_side_min_votes: 3
+    semantic_side_fallback: fixed
+
+    proposal.enable: false
+    proposal.min_pose_std_xy: 0.8
+    proposal.min_pose_std_yaw: 0.8
+
+    debug.log_every_n_meas: 0
+    debug.csv_enable: true
+    debug.csv_path: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
+    debug.csv_flush_every_n: 1
+
+
+odom_reframer:
+  ros__parameters:
+    input_odom_topic: /odometry/filtered
+    output_odom_topic: /odom
+    odom_frame: odom
+    base_frame: amiga__base
+
+    recenter: true
+
+    rotate_pos_deg: 0.0
+    rotate_yaw_deg: 180.0
+    rotate_orientation_only: true
+
+    use_now_stamp: false
+    copy_twist: true
+
+    gps_topic: /ublox_gps_corrected/fix
+    gps_min_status: 0
+    gps_require_finite_cov: false
+
+
+slam_odom_correction_tf:
+  ros__parameters:
+    wheel_odom_topic: /odom
+    slam_odom_topic: /odom_slam_best
+
+    odom_frame: odom
+    map_frame: map
+
+    sync_queue_size: 50
+    sync_slop_sec: 0.05
+    sync_allow_headerless: false
+
+    publish_rate_hz: 30.0
+    publish_on_wheel_odom: false
+
+
+tree_scene_node:
+  ros__parameters:
+    leader_branch_radii: 0.08
+    leader_branch_len: 2.0
+    num_side_branches: 4.0
+    side_branch_radii: 0.04
+    side_branch_len: 2.0
+
+    trellis_angle: -18.435
+    branch_spacing: 0.5
+    trellis_frame: map
+    trellis_prefix: v_trellis_tree_
+
+    registry_topic: fastslam_registry
+
+
+save_best_particle_map:
+  ros__parameters:
+    trunk_topic: /fastslam_registry
+    odom_corr_topic: /initial_odom_correction
+    gps_topic: /initial_gps_fix
+    out: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/slam_measurements/slam_trunks.yaml
+
+    require_odom_correction: false
+    require_gps_fix: false
+    require_trunks: true
+
+    service_name: dump_trunk_yaml

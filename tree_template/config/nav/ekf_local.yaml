@@ -15,7 +15,8 @@ ekf_local:
     publish_acceleration: false
 
     # Wheel odometry
-    odom0: /a200_0398/platform/odom/filtered
+    # odom0: /a200_0398/platform/odom/filtered
+    odom0: /from_bag/odometry
     odom0_queue_size: 10
     odom0_differential: false
     odom0_relative: false

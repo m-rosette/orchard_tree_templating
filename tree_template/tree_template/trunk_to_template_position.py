@@ -62,7 +62,7 @@ class TrunkClusterToTemplateNode(Node):
         self.declare_parameter("lateral_tolerance", 0.25)
 
         self.declare_parameter("camera_frame", "base_camera_color_optical_frame")
-        self.declare_parameter("target_frame", "odom_slam")
+        self.declare_parameter("target_frame", "map")
 
         self.declare_parameter("row_datum_line_width", 0.1)
 

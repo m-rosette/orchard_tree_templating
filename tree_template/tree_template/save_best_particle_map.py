@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -25,51 +24,43 @@ def _point_to_list(p: Optional[Point]) -> Optional[List[float]]:
     return [_f(p.x), _f(p.y), _f(p.z)]
 
 
-class TrunkRegistryDumpToYaml(Node):
+class SaveBestParticleMap(Node):
     """
-    Single-shot YAML dump node.
-
-    Subscribes to:
-      - TrunkRegistry (best particle)
-      - initial_odom_correction (geometry_msgs/Point)
-      - initial_gps_fix (geometry_msgs/Point) where:
-          x=latitude, y=longitude, z=altitude_m
-
-    On Trigger service call:
-      - Writes ONE YAML file containing the latest values
-      - Overwrites any existing file
-
-    YAML format:
-
-    initial_odom_correction: [x, y, z]
-    initial_gps_fix: [lat, lon, alt_m]
-    trees:
-      0: [x, y]
-      1: [x, y]
-      ...
+    Single-shot YAML dump node. Trigger service writes one YAML file with a timestamp suffix.
     """
 
-    def __init__(
-        self,
-        trunk_topic: str,
-        odom_corr_topic: str,
-        gps_topic: str,
-        out_path: str,
-        require_odom_correction: bool,
-        require_gps_fix: bool,
-        require_trunks: bool,
-    ):
-        super().__init__("trunk_registry_dump_to_yaml")
+    def __init__(self):
+        super().__init__("save_best_particle_map")
 
-        self.trunk_topic = trunk_topic
-        self.odom_corr_topic = odom_corr_topic
-        self.gps_topic = gps_topic
-        self.out_path = Path(out_path)
+        # ----------------------------
+        # Parameters (ROS2)
+        # ----------------------------
+        self.declare_parameter("trunk_topic", "/fastslam_registry")
+        self.declare_parameter("odom_corr_topic", "/initial_odom_correction")
+        self.declare_parameter("gps_topic", "/initial_gps_fix")
+        self.declare_parameter(
+            "out",
+            "/home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/slam_measurements/slam_trunks.yaml",
+        )
+
+        self.declare_parameter("require_odom_correction", False)
+        self.declare_parameter("require_gps_fix", False)
+        self.declare_parameter("require_trunks", False)
+
+        self.declare_parameter("service_name", "dump_trunk_yaml")
+
+        # Resolve params
+        self.trunk_topic = str(self.get_parameter("trunk_topic").value)
+        self.odom_corr_topic = str(self.get_parameter("odom_corr_topic").value)
+        self.gps_topic = str(self.get_parameter("gps_topic").value)
+        self.out_path = Path(str(self.get_parameter("out").value))
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.require_odom_correction = bool(require_odom_correction)
-        self.require_gps_fix = bool(require_gps_fix)
-        self.require_trunks = bool(require_trunks)
+        self.require_odom_correction = bool(self.get_parameter("require_odom_correction").value)
+        self.require_gps_fix = bool(self.get_parameter("require_gps_fix").value)
+        self.require_trunks = bool(self.get_parameter("require_trunks").value)
+
+        self.service_name = str(self.get_parameter("service_name").value)
 
         qos = QoSProfile(
             depth=10,
@@ -85,15 +76,15 @@ class TrunkRegistryDumpToYaml(Node):
         self.create_subscription(Point, self.odom_corr_topic, self._odom_corr_cb, qos)
         self.create_subscription(Point, self.gps_topic, self._gps_cb, qos)
 
-        self.srv = self.create_service(Trigger, "dump_trunk_yaml", self._on_trigger)
+        self.srv = self.create_service(Trigger, self.service_name, self._on_trigger)
 
         self.get_logger().info(
             f"Subscribing:\n"
-            f"  trunk registry:         {self.trunk_topic}\n"
-            f"  initial odom correction:{self.odom_corr_topic}\n"
-            f"  initial gps fix:        {self.gps_topic}\n"
-            f"Output YAML: {self.out_path}\n"
-            f"Service: /dump_trunk_yaml\n"
+            f"  trunk registry:          {self.trunk_topic}\n"
+            f"  initial odom correction: {self.odom_corr_topic}\n"
+            f"  initial gps fix:         {self.gps_topic}\n"
+            f"Output YAML base: {self.out_path}\n"
+            f"Service: /{self.service_name}\n"
             f"require_odom_correction={self.require_odom_correction}, "
             f"require_gps_fix={self.require_gps_fix}, require_trunks={self.require_trunks}"
         )
@@ -142,7 +133,7 @@ class TrunkRegistryDumpToYaml(Node):
         }
 
         try:
-            self._write_yaml(data)
+            out_path = self._write_yaml(data)
         except Exception as e:
             res.success = False
             res.message = f"Failed writing YAML: {e}"
@@ -150,18 +141,17 @@ class TrunkRegistryDumpToYaml(Node):
 
         res.success = True
         res.message = (
-            f"Wrote YAML with {len(trees)} trunks. "
+            f"Wrote YAML: {out_path} ({len(trees)} trunks). "
             f"odom_corr={'yes' if self._latest_odom_corr else 'no'}, gps_fix={'yes' if self._latest_gps_fix else 'no'}."
         )
         return res
 
-    def _write_yaml(self, data: Dict):
+    def _write_yaml(self, data: Dict) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         out_path = self.out_path.with_name(
             f"{self.out_path.stem}_{ts}{self.out_path.suffix}"
         )
-
         tmp = out_path.with_suffix(out_path.suffix + ".tmp")
 
         with open(tmp, "w") as f:
@@ -169,25 +159,16 @@ class TrunkRegistryDumpToYaml(Node):
             gps = data.get("initial_gps_fix")
             trees = data.get("trees", {})
 
-            # initial_odom_correction
             if corr is None:
                 f.write("initial_odom_correction: null\n")
             else:
-                f.write(
-                    f"initial_odom_correction: "
-                    f"[{corr[0]:.6f}, {corr[1]:.6f}, {corr[2]:.6f}]\n"
-                )
+                f.write(f"initial_odom_correction: [{corr[0]:.6f}, {corr[1]:.6f}, {corr[2]:.6f}]\n")
 
-            # initial_gps_fix
             if gps is None:
                 f.write("initial_gps_fix: null\n")
             else:
-                f.write(
-                    f"initial_gps_fix: "
-                    f"[{gps[0]:.8f}, {gps[1]:.8f}, {gps[2]:.3f}]\n"
-                )
+                f.write(f"initial_gps_fix: [{gps[0]:.8f}, {gps[1]:.8f}, {gps[2]:.3f}]\n")
 
-            # trees
             f.write("trees:\n")
             if not trees:
                 f.write("  {}\n")
@@ -197,36 +178,17 @@ class TrunkRegistryDumpToYaml(Node):
                     f.write(f"  {i}: [{xy[0]:.6f}, {xy[1]:.6f}]\n")
 
         tmp.replace(out_path)
-
         self.get_logger().info(f"Wrote YAML: {out_path}")
+        return out_path
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trunk_topic", default="/fastslam_registry")
-    ap.add_argument("--odom_corr_topic", default="/initial_odom_correction")
-    ap.add_argument("--gps_topic", default="/initial_gps_fix")
-    ap.add_argument("--out", default="/home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/slam_measurements/slam_trunks.yaml")
-
-    ap.add_argument("--require_odom_correction", action="store_true")
-    ap.add_argument("--require_gps_fix", action="store_true")
-    ap.add_argument("--require_trunks", action="store_true")
-
-    args = ap.parse_args()
-
-    rclpy.init()
-    node = TrunkRegistryDumpToYaml(
-        trunk_topic=args.trunk_topic,
-        odom_corr_topic=args.odom_corr_topic,
-        gps_topic=args.gps_topic,
-        out_path=args.out,
-        require_odom_correction=args.require_odom_correction,
-        require_gps_fix=args.require_gps_fix,
-        require_trunks=args.require_trunks,
-    )
+def main(args=None):
+    rclpy.init(args=args)
+    node = SaveBestParticleMap()
     try:
         rclpy.spin(node)
     finally:
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

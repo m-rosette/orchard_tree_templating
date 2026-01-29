@@ -35,7 +35,8 @@ class OdomReframer(Node):
 
         # --- GPS additions ---
         # self.declare_parameter("gps_topic", "/gps/pvt") 
-        self.declare_parameter("gps_topic", "/ublox_gps_corrected/fix")
+        # self.declare_parameter("gps_topic", "/ublox_gps_corrected/fix")
+        self.declare_parameter("gps_topic", "/fix")
         self.declare_parameter("gps_min_status", 0)         # 0=STATUS_FIX, 1=SBAS, 2=GBAS (NavSatStatus)
         self.declare_parameter("gps_require_finite_cov", False)
 
@@ -229,7 +230,7 @@ class OdomReframer(Node):
         t.transform.translation.y = float(pos_out[1])
         t.transform.translation.z = float(pos_out[2])
         t.transform.rotation = q_out
-        # self.tf_broadcaster.sendTransform(t)
+        self.tf_broadcaster.sendTransform(t)
 
 
 def main(args=None):
