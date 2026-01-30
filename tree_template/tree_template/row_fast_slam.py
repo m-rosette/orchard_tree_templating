@@ -152,6 +152,15 @@ class RowFastSLAMNode(Node):
         self._dbg_meas_counter = 0
 
         self.declare_parameter("init_row_yaw_avg_count", 200)  # number of initial odom yaws to average
+
+        # Template prior (soft anchor toward template slot position)
+        self.declare_parameter("template_prior.enable", True)
+        self.declare_parameter("template_prior.sigma_s", 0.8)     # m along-row
+        self.declare_parameter("template_prior.sigma_d", 0.6)     # m lateral
+        self.declare_parameter("template_prior.decay_k", 3.0)     # hits; larger = prior lasts longer
+        self.declare_parameter("template_prior.max_seen", 8)      # stop applying after this many hits
+        self.declare_parameter("template_prior.w", 1.0)           # weight multiplier
+
         self.init_row_yaw_avg_count = max(1, int(self.get_parameter("init_row_yaw_avg_count").value))
 
         # Track whether row origin came from odom (NaN params) and yaw bootstrapping state
@@ -239,6 +248,18 @@ class RowFastSLAMNode(Node):
         self.proposal_min_pose_std_yaw = float(self.get_parameter("proposal.min_pose_std_yaw").value)
 
         self.debug_log_every_n_meas = int(self.get_parameter("debug.log_every_n_meas").value)
+
+        self.template_prior_enable = bool(self.get_parameter("template_prior.enable").value)
+        self.template_prior_sigma_s = float(self.get_parameter("template_prior.sigma_s").value)
+        self.template_prior_sigma_d = float(self.get_parameter("template_prior.sigma_d").value)
+        self.template_prior_decay_k = float(self.get_parameter("template_prior.decay_k").value)
+        self.template_prior_max_seen = int(self.get_parameter("template_prior.max_seen").value)
+        self.template_prior_w = float(self.get_parameter("template_prior.w").value)
+
+        if self.template_prior_decay_k <= 1e-6:
+            self.template_prior_decay_k = 1e-6
+        if self.template_prior_max_seen < 0:
+            self.template_prior_max_seen = 0
 
         # ---------- Row basis ----------
         self.row_yaw_est: Optional[float] = None
@@ -470,6 +491,52 @@ class RowFastSLAMNode(Node):
         self.get_logger().info(
             f"Extended template slots: num_slots={self.num_slots} (added {start_j}..{end_j})"
         )
+
+    def _template_mu0_for_slot(self, j: int) -> np.ndarray:
+        """
+        Expected (template) world position for slot j, based on current row_origin_xy, row_origin_s, and row basis.
+        """
+        j = int(j)
+        s0 = float(self.row_origin_s) + float(j) * float(self.slot_spacing)
+        d0 = float(self._template_d_for_slot(j))
+        return (self.row_origin_xy + s0 * self.t_hat + d0 * self.n_hat).astype(float)
+
+    def _template_prior_alpha(self, seen_count: int) -> float:
+        """
+        Decay schedule: strong early, fades with seen_count.
+        Using exp(-k/decay_k). You can swap to 1/(k+1) if you prefer.
+        """
+        k = float(max(int(seen_count), 0))
+        if self.template_prior_max_seen > 0 and k >= float(self.template_prior_max_seen):
+            return 0.0
+        return float(np.exp(-k / float(self.template_prior_decay_k)))
+
+    def _apply_template_prior_logw(self, lm: LandmarkEKF, j: int) -> float:
+        """
+        Return a log-weight increment (<= 0) based on how far landmark lm is from template position for slot j.
+        Penalizes in (s,d) coordinates with sigmas.
+        """
+        if not (self.use_template_map and self.template_prior_enable):
+            return 0.0
+
+        alpha = self._template_prior_alpha(lm.seen_count)
+        if alpha <= 0.0:
+            return 0.0
+
+        mu0 = self._template_mu0_for_slot(j)
+        e = (lm.mu - mu0).astype(float)  # world error (2,)
+
+        # Convert error into row coordinates (s along row, d lateral)
+        e_s = float(np.dot(e, self.t_hat))
+        e_d = float(np.dot(e, self.n_hat))
+
+        sig_s = max(float(self.template_prior_sigma_s), 1e-6)
+        sig_d = max(float(self.template_prior_sigma_d), 1e-6)
+
+        # Gaussian penalty (drop constants; they just shift all weights equally)
+        pen = 0.5 * ((e_s / sig_s) ** 2 + (e_d / sig_d) ** 2)
+
+        return -float(self.template_prior_w) * float(alpha) * float(pen)
 
 
     # =========================================================
@@ -715,6 +782,10 @@ class RowFastSLAMNode(Node):
                     lm = self._init_landmark_from_measurement(p, z)
                     p.landmarks[slot_j] = lm
 
+            # --- Template soft anchor prior (encourages slot j to stay near its template position early) ---
+            if self.use_template_map and self.template_prior_enable:
+                logw[i] += self._apply_template_prior_logw(lm, slot_j)
+
             # Classic likelihood if proposal disabled OR landmark not yet reliable
             if (not self.proposal_enable) or (lm.seen_count <= 0):
                 z_pred, H_lm, _Jx = self._predict_z_Hland_Jpose(p.pose, lm.mu)
@@ -763,7 +834,17 @@ class RowFastSLAMNode(Node):
                 logw[i] += -0.5 * (maha + logdet)
 
                 K = Pbar @ J_x.T @ Sinv
-                xhat = p.pose + (K @ innov)
+
+                # --- proposal correction (clamped) ---
+                dx = (K @ innov)
+                dx[2] = wrap_angle(float(dx[2]))
+
+                # Clamp proposal correction magnitude (prevents teleport-to-wrong-slot collapse)
+                dx[0] = float(np.clip(dx[0], -0.25, 0.25))   # meters
+                dx[1] = float(np.clip(dx[1], -0.25, 0.25))   # meters
+                dx[2] = float(np.clip(dx[2], -0.20, 0.20))   # radians (~11 deg)
+
+                xhat = p.pose + dx
                 xhat[2] = wrap_angle(float(xhat[2]))
 
                 Phat = (np.eye(3) - K @ J_x) @ Pbar
@@ -899,21 +980,30 @@ class RowFastSLAMNode(Node):
         if self.last_odom_pose is None:
             return None, None
 
-        # ---- Use weighted-mean pose for stable association ----
-        w = np.array([p.weight for p in self.particles], dtype=float)
-        sw = float(np.sum(w))
-        if sw <= 1e-12:
-            w[:] = 1.0 / float(len(w))
+        # ---- Pose reference for association ----
+        if self.proposal_enable:
+            pb = self._best_particle()
+            if pb is None:
+                return None, None
+            pose_ref = pb.pose.copy()
+
         else:
-            w /= sw
+            # ---- Use weighted-mean pose for stable association ----
+            w = np.array([p.weight for p in self.particles], dtype=float)
+            sw = float(np.sum(w))
+            if sw <= 1e-12:
+                w[:] = 1.0 / float(len(w))
+            else:
+                w /= sw
 
-        poses = np.stack([p.pose for p in self.particles], axis=0)
-        xy = np.sum(poses[:, 0:2] * w[:, None], axis=0)
-        c = float(np.sum(np.cos(poses[:, 2]) * w))
-        s = float(np.sum(np.sin(poses[:, 2]) * w))
-        yaw = float(np.arctan2(s, c))
+            poses = np.stack([p.pose for p in self.particles], axis=0)
+            xy = np.sum(poses[:, 0:2] * w[:, None], axis=0)
+            c = float(np.sum(np.cos(poses[:, 2]) * w))
+            s = float(np.sum(np.sin(poses[:, 2]) * w))
+            yaw = float(np.arctan2(s, c))
 
-        pose_ref = np.array([xy[0], xy[1], yaw], dtype=float)
+            pose_ref = np.array([xy[0], xy[1], yaw], dtype=float)
+
         mu_world_approx = self._world_from_robot(pose_ref, z_robot)  # (2,)
 
         # ---- Stable association origin (xy anchor) ----

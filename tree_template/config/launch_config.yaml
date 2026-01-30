@@ -69,14 +69,20 @@ row_fast_slam:
     semantic_side_fallback: fixed
 
     proposal.enable: false
-    proposal.min_pose_std_xy: 0.8
-    proposal.min_pose_std_yaw: 0.8
+    proposal.min_pose_std_xy: 0.10
+    proposal.min_pose_std_yaw: 0.08
 
     debug.log_every_n_meas: 0
     debug.csv_enable: true
     debug.csv_path: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
     debug.csv_flush_every_n: 1
 
+    template_prior.enable: true
+    template_prior.sigma_s: 0.9     # start loose in s
+    template_prior.sigma_d: 0.5     # tighter laterally
+    template_prior.decay_k: 3.0
+    template_prior.max_seen: 8
+    template_prior.w: 1.0
 
 odom_reframer:
   ros__parameters:
