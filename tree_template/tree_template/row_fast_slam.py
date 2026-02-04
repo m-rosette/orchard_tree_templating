@@ -12,8 +12,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
@@ -111,6 +112,8 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("max_extra_slots", 0)  # 0 disables cap
         self.declare_parameter("row_origin_x", float("nan"))          # if NaN, use first odom pose
         self.declare_parameter("row_origin_y", float("nan"))         # if NaN, use first odom pose
+        self.declare_parameter("row_origin_lat_offset_m", 0.0)  # + = robot +Y (camera optical Z)
+        self.declare_parameter("row_origin_fwd_offset_m", 0.0)  # optional: + = robot +X
         self.declare_parameter("row_dir_sign", 1)            # (+1 => +X, -1 => -X)
         self.declare_parameter("row_datum_pose_topic", "row_datum_pose")
         self.declare_parameter("max_back_assoc", 0)
@@ -161,6 +164,9 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("template_prior.max_seen", 8)      # stop applying after this many hits
         self.declare_parameter("template_prior.w", 1.0)           # weight multiplier
 
+        self.declare_parameter("meas_max_lag_sec", 0.5)
+        self.meas_max_lag_sec = float(self.get_parameter("meas_max_lag_sec").value)
+
         self.init_row_yaw_avg_count = max(1, int(self.get_parameter("init_row_yaw_avg_count").value))
 
         # Track whether row origin came from odom (NaN params) and yaw bootstrapping state
@@ -204,6 +210,8 @@ class RowFastSLAMNode(Node):
             ],
             dtype=float,
         )
+        self.row_origin_lat_offset_m = float(self.get_parameter("row_origin_lat_offset_m").value)
+        self.row_origin_fwd_offset_m = float(self.get_parameter("row_origin_fwd_offset_m").value)
 
         self.row_dir_sign = int(self.get_parameter("row_dir_sign").value)
         if self.row_dir_sign not in (-1, 1):
@@ -222,8 +230,8 @@ class RowFastSLAMNode(Node):
 
         self.meas_std = np.array(
             [
-                float(self.get_parameter("meas_std_y_lat").value),
                 float(self.get_parameter("meas_std_x_fwd").value),
+                float(self.get_parameter("meas_std_y_lat").value),
             ],
             dtype=float,
         )
@@ -288,9 +296,30 @@ class RowFastSLAMNode(Node):
         self.registry_pub = self.create_publisher(TrunkRegistry, self.registry_topic, qos)
         self.odom_best_pub = self.create_publisher(Odometry, self.odom_best_topic, qos)
 
-        self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 50)
-        self.meas_sub = self.create_subscription(TrunkInfo, self.measurement_topic, self.measurement_callback, 50)
-        self.row_datum_sub = self.create_subscription(PoseStamped, self.row_datum_pose_topic, self.row_datum_pose_callback, 10)
+        odom_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=50,  # odom can be higher
+            reliability=ReliabilityPolicy.BEST_EFFORT,  # bag replay friendly; ok for odom
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        meas_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,  # key change: do NOT backlog detections
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        datum_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, odom_qos)
+        self.meas_sub = self.create_subscription(TrunkInfo, self.measurement_topic, self.measurement_callback, meas_qos)
+        self.row_datum_sub = self.create_subscription(PoseStamped, self.row_datum_pose_topic, self.row_datum_pose_callback, datum_qos)
 
         self.get_logger().info(
             "RowFastSLAMNode started.\n"
@@ -551,6 +580,31 @@ class RowFastSLAMNode(Node):
         dt = max(t_cur - self._last_odom_time, 1e-3)
         self._last_odom_time = t_cur
         return dt
+    
+    def _stamp_to_sec(self, stamp) -> float:
+        return float(stamp.sec) + 1e-9 * float(stamp.nanosec)
+
+    def _meas_time_sec(self, msg: TrunkInfo) -> float:
+        # Prefer TrunkInfo.stamp if present and non-zero
+        if hasattr(msg, "stamp"):
+            try:
+                t = self._stamp_to_sec(msg.stamp)
+                if t > 1e-6:
+                    return t
+            except Exception:
+                pass
+
+        # Fallback to header.stamp if present and non-zero
+        if hasattr(msg, "header"):
+            try:
+                t = self._stamp_to_sec(msg.header.stamp)
+                if t > 1e-6:
+                    return t
+            except Exception:
+                pass
+
+        # Last resort: now
+        return float(self.get_clock().now().nanoseconds) * 1e-9
 
     def _ensure_initialized_from_odom(self, cur_pose: np.ndarray) -> bool:
         if self.last_odom_pose is not None:
@@ -600,6 +654,22 @@ class RowFastSLAMNode(Node):
                     f"Initialized row axis from initial odom yaw: yaw={th:.3f} rad, "
                     f"t_hat=[{self.t_hat[0]:.3f}, {self.t_hat[1]:.3f}]"
                 )
+        
+        if self._row_origin_from_odom and not getattr(self, "_row_origin_offset_applied", False):
+            df = float(getattr(self, "row_origin_fwd_offset_m", 0.0))
+            dl = float(getattr(self, "row_origin_lat_offset_m", 0.0))
+
+            if abs(df) > 1e-9 or abs(dl) > 1e-9:
+                th0 = float(self.row_yaw_est) if (self.row_yaw_est is not None) else float(cur_pose[2])
+                c0, s0 = float(np.cos(th0)), float(np.sin(th0))
+
+                # body -> world
+                dx_w = c0 * df - s0 * dl
+                dy_w = s0 * df + c0 * dl
+
+                self.row_origin_xy = self.row_origin_xy + np.array([dx_w, dy_w], dtype=float)
+
+            self._row_origin_offset_applied = True
 
         # --- Particle initialization ---
         self.last_odom_pose = cur_pose.copy()
@@ -713,22 +783,27 @@ class RowFastSLAMNode(Node):
     # =========================================================
 
     def measurement_callback(self, msg: TrunkInfo):
+        t_meas_sec = self._meas_time_sec(msg)
+
         if not self.particles or self.last_odom_pose is None:
             self._dbg_reject("uninitialized")
             return
 
+        t_now = float(self.get_clock().now().nanoseconds) * 1e-9
+        lag = t_now - t_meas_sec
+        if lag > float(self.meas_max_lag_sec):
+            self._dbg_reject("meas_too_old")
+            return
+
         # ---- Parse measurement (robot frame) ----
-        y_lat = float(msg.pose.position.y)
         x_fwd = float(msg.pose.position.x)
+        y_lat = float(msg.pose.position.y)
 
         if not np.isfinite(y_lat) or not np.isfinite(x_fwd):
             self._dbg_reject("nan_measurement")
             return
-        # if x_fwd < 0.0:
-        #     self._dbg_reject("x_fwd_negative")
-        #     return
 
-        z = np.array([y_lat, x_fwd], dtype=float)
+        z = np.array([x_fwd, y_lat], dtype=float)
         r = float(np.linalg.norm(z))
         if r < 1e-3 or r > 15.0:
             self._dbg_reject("range_gate")
@@ -868,11 +943,12 @@ class RowFastSLAMNode(Node):
 
         # ---- Debug CSV row ----
         if getattr(self, "debug_csv_enable", False) and (self._dbg_csv is not None):
-            if getattr(self, "_last_odom_msg", None) is not None:
-                st = self._last_odom_msg.header.stamp
-                t_sec = float(st.sec) + 1e-9 * float(st.nanosec)
-            else:
-                t_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            # if getattr(self, "_last_odom_msg", None) is not None:
+            #     st = self._last_odom_msg.header.stamp
+            #     t_sec = float(st.sec) + 1e-9 * float(st.nanosec)
+            # else:
+            #     t_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+            t_sec = t_meas_sec
 
             neff = float(self._effective_sample_size())
             wts = np.array([p.weight for p in self.particles], dtype=float)
@@ -888,8 +964,8 @@ class RowFastSLAMNode(Node):
                 t_sec,
                 int(self.measurement_count),
                 int(slot_j),
-                float(z[0]),
-                float(z[1]),
+                float(z[0]), # z_x_fwd
+                float(z[1]), # z_y_lat
                 float(r),
                 int(self.proposal_enable),
                 neff,
@@ -961,8 +1037,8 @@ class RowFastSLAMNode(Node):
         rx, ry, th = float(pose[0]), float(pose[1]), float(pose[2])
         c, s = float(np.cos(th)), float(np.sin(th))
 
-        y_lat = float(z_robot[0])
-        x_fwd = float(z_robot[1])
+        x_fwd = float(z_robot[0])
+        y_lat = float(z_robot[1])
 
         dx_w = c * x_fwd - s * y_lat
         dy_w = s * x_fwd + c * y_lat
@@ -1084,10 +1160,12 @@ class RowFastSLAMNode(Node):
         x_fwd = c * dx + s * dy
         y_lat = -s * dx + c * dy
 
-        z_pred = np.array([y_lat, x_fwd], dtype=float)
+        # z = [x_fwd, y_lat]
+        z_pred = np.array([x_fwd, y_lat], dtype=float)
 
-        H = np.array([[-s,  c],
-                      [ c,  s]], dtype=float)
+        # H_lm = d z / d [lm_x, lm_y]
+        H = np.array([[ c,  s],
+                    [-s,  c]], dtype=float)
         return z_pred, H
 
     def _predict_z_Hland_Jpose(self, pose: np.ndarray, mu_lm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1099,13 +1177,16 @@ class RowFastSLAMNode(Node):
 
         x_fwd = c * dx + s * dy
         y_lat = -s * dx + c * dy
-        z_pred = np.array([y_lat, x_fwd], dtype=float)
 
-        H_lm = np.array([[-s,  c],
-                         [ c,  s]], dtype=float)
+        # z = [x_fwd, y_lat]
+        z_pred = np.array([x_fwd, y_lat], dtype=float)
 
-        J_x = np.array([[ s, -c, -x_fwd],
-                        [-c, -s,  y_lat]], dtype=float)
+        # d z / d landmark
+        H_lm = np.array([[ c,  s],
+                        [-s,  c]], dtype=float)
+
+        J_x = np.array([[-c, -s,  y_lat],
+                        [ s, -c, -x_fwd]], dtype=float)
 
         return z_pred, H_lm, J_x
 
@@ -1293,6 +1374,10 @@ class RowFastSLAMNode(Node):
                     continue
 
             ti = TrunkInfo()
+            if self._last_odom_msg is not None:
+                ti.stamp = self._last_odom_msg.header.stamp
+            else:
+                ti.stamp = self.get_clock().now().to_msg()
             ti.pose.position.x = float(lm.mu[0])
             ti.pose.position.y = float(lm.mu[1])
             ti.pose.position.z = 0.0
@@ -1392,8 +1477,12 @@ class RowFastSLAMNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RowFastSLAMNode()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down RowFastSLAMNode...")
     finally:
@@ -1401,6 +1490,7 @@ def main(args=None):
             node._dbg_close()
         except Exception:
             pass
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             try:

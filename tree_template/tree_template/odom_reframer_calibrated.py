@@ -5,9 +5,10 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import TransformStamped, Quaternion, Point
+from geometry_msgs.msg import TransformStamped, Quaternion, Point, Pose
 from tf2_ros import TransformBroadcaster
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import NavSatFix
@@ -17,25 +18,23 @@ class OdomReframer(Node):
     def __init__(self):
         super().__init__("odom_reframer")
 
-        # self.declare_parameter("input_odom_topic", "/filter/state")
         self.declare_parameter("input_odom_topic", "/odometry/local")
         self.declare_parameter("output_odom_topic", "/odom")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "amiga__base")
+        self.declare_parameter("publish_tf", True)
 
         self.declare_parameter("recenter", False)
 
         # Split position vs orientation corrections
         self.declare_parameter("rotate_pos_deg", 0.0)          # keep 0.0 if motion direction is already correct
-        self.declare_parameter("rotate_yaw_deg", 0.0)        # fix heading being 180 off
+        self.declare_parameter("rotate_yaw_deg", 0.0)          # fix heading being 180 off
         self.declare_parameter("rotate_orientation_only", True)
 
         self.declare_parameter("use_now_stamp", False)
         self.declare_parameter("copy_twist", True)
 
         # --- GPS additions ---
-        # self.declare_parameter("gps_topic", "/gps/pvt") 
-        # self.declare_parameter("gps_topic", "/ublox_gps_corrected/fix")
         self.declare_parameter("gps_topic", "/fix")
         self.declare_parameter("gps_min_status", 0)         # 0=STATUS_FIX, 1=SBAS, 2=GBAS (NavSatStatus)
         self.declare_parameter("gps_require_finite_cov", False)
@@ -44,6 +43,7 @@ class OdomReframer(Node):
         self.output_topic = str(self.get_parameter("output_odom_topic").value)
         self.odom_frame = str(self.get_parameter("odom_frame").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
+        self.publish_tf = bool(self.get_parameter("publish_tf").value)
 
         self.recenter = bool(self.get_parameter("recenter").value)
 
@@ -63,17 +63,30 @@ class OdomReframer(Node):
         self.R_pos = R.from_euler("z", self.rotate_pos_deg, degrees=True) if abs(self.rotate_pos_deg) > 1e-6 else None
         self.R_yaw = R.from_euler("z", self.rotate_yaw_deg, degrees=True) if abs(self.rotate_yaw_deg) > 1e-6 else None
 
-        self.initial_offset: np.ndarray | None = None
+        # --- Initial odom pose ---
+        # Always capture/publish the first raw odom Pose (for downstream YAML dumping),
+        # but only store initial_pos for recenter subtraction when recenter=True.
+        self.initial_pose_msg: Pose | None = None
+        self.initial_pos: np.ndarray | None = None
+
+        # Ensure we only publish these "initials" once (they're latched anyway, but nice for clarity)
+        self._published_initial_odom = False
+        self._published_initial_gps = False
 
         self.sub = self.create_subscription(Odometry, input_topic, self.odom_callback, 10)
         self.pub = self.create_publisher(Odometry, self.output_topic, 10)
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        self.initial_offset_pub = self.create_publisher(Point, "initial_odom_correction", 1)
-        self.initial_gps_pub = self.create_publisher(Point, "initial_gps_fix", 1) # publish initial GPS as a Point: x=lat, y=lon, z=alt (meters)
-        self.gps_sub = self.create_subscription(NavSatFix, self.gps_topic, self.gps_callback, 10)
+        # Latched QoS for initials (so late subscribers still get them)
+        qos_latched = QoSProfile(depth=1)
+        qos_latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        qos_latched.reliability = ReliabilityPolicy.RELIABLE
 
-        self.timer = self.create_timer(3.0, self.publish_initials)
+        # NOTE: create_publisher signature is (msg_type, topic, qos_profile)
+        self.initial_offset_pub = self.create_publisher(Pose, "initial_odom_correction", qos_latched)
+        self.initial_gps_pub = self.create_publisher(Point, "initial_gps_fix", qos_latched)
+
+        self.gps_sub = self.create_subscription(NavSatFix, self.gps_topic, self.gps_callback, 10)
 
         self.get_logger().info(
             "OdomReframer started.\n"
@@ -84,35 +97,60 @@ class OdomReframer(Node):
             f"  rotate_yaw_deg={self.rotate_yaw_deg} (orientation)\n"
             f"  rotate_orientation_only={self.rotate_orientation_only}\n"
             f"  gps_topic={self.gps_topic}\n"
-            f"  use_now_stamp={self.use_now_stamp}"
+            f"  use_now_stamp={self.use_now_stamp}\n"
+            "  initials: publishing once with TRANSIENT_LOCAL durability"
         )
 
     def _get_stamp(self, msg: Odometry):
         return self.get_clock().now().to_msg() if self.use_now_stamp else msg.header.stamp
 
-    def _capture_initial_offset(self, p: np.ndarray):
-        if self.recenter and self.initial_offset is None:
-            self.initial_offset = p.copy()
-            self.get_logger().info(
-                f"Captured initial offset: x={self.initial_offset[0]:.3f}, "
-                f"y={self.initial_offset[1]:.3f}, z={self.initial_offset[2]:.3f}"
-            )
+    def _maybe_capture_and_publish_initial_pose(self, msg: Odometry, pos_vec: np.ndarray) -> None:
+        """
+        Capture the first odom Pose (raw) and publish it ONCE on initial_odom_correction.
+
+        - Always captures/publishes for downstream consumers (like your YAML dump node).
+        - Only stores initial_pos for subtraction when recenter=True.
+        """
+        if self.initial_pose_msg is not None:
+            return
+
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+
+        pose = Pose()
+        pose.position.x = float(p.x)
+        pose.position.y = float(p.y)
+        pose.position.z = float(p.z)
+        pose.orientation = q
+
+        self.initial_pose_msg = pose
+
+        # Only store initial_pos for recenter subtraction if enabled
+        if self.recenter:
+            self.initial_pos = pos_vec.copy()
+
+        # Publish ONCE (latched topic)
+        if not self._published_initial_odom:
+            self.initial_offset_pub.publish(self.initial_pose_msg)
+            self._published_initial_odom = True
+
+        self.get_logger().info(
+            "Captured initial odom pose and published once:\n"
+            f"  pos=({pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f})\n"
+            f"  quat=({pose.orientation.x:.4f}, {pose.orientation.y:.4f}, "
+            f"{pose.orientation.z:.4f}, {pose.orientation.w:.4f})\n"
+            f"  recenter_store={'yes' if self.recenter else 'no'}"
+        )
 
     def _gps_is_acceptable(self, msg: NavSatFix) -> bool:
-        # basic sanity: finite lat/lon
         if not np.isfinite(msg.latitude) or not np.isfinite(msg.longitude):
             return False
-
-        # NavSatFix.status.status: -1 no fix, 0 fix, 1 SBAS, 2 GBAS
         if msg.status.status < self.gps_min_status:
             return False
-
-        # optional: reject NaN covariance entries
         if self.gps_require_finite_cov:
             cov = np.array(msg.position_covariance, dtype=np.float64)
             if not np.all(np.isfinite(cov)):
                 return False
-
         return True
 
     def gps_callback(self, msg: NavSatFix):
@@ -122,32 +160,25 @@ class OdomReframer(Node):
             return
 
         self.initial_gps = msg
+
+        # Publish ONCE (latched topic): x=lat, y=lon, z=alt(m)
+        if not self._published_initial_gps:
+            gps_pt = Point()
+            gps_pt.x = float(msg.latitude)
+            gps_pt.y = float(msg.longitude)
+            gps_pt.z = float(msg.altitude)
+            self.initial_gps_pub.publish(gps_pt)
+            self._published_initial_gps = True
+
         self.get_logger().info(
-            f"Captured initial GPS fix: lat={msg.latitude:.8f}, lon={msg.longitude:.8f}, alt={msg.altitude:.3f}, "
+            f"Captured initial GPS and published once: lat={msg.latitude:.8f}, lon={msg.longitude:.8f}, alt={msg.altitude:.3f}, "
             f"status={msg.status.status}"
         )
 
-    def publish_initials(self):
-        # publish initial odom correction (your existing behavior)
-        if self.initial_offset is not None:
-            pt_msg = Point()
-            pt_msg.x = float(self.initial_offset[0])
-            pt_msg.y = float(self.initial_offset[1])
-            pt_msg.z = float(self.initial_offset[2])
-            self.initial_offset_pub.publish(pt_msg)
-
-        # publish initial gps fix (lat, lon, alt)
-        if self.initial_gps is not None:
-            gps_pt = Point()
-            gps_pt.x = float(self.initial_gps.latitude)
-            gps_pt.y = float(self.initial_gps.longitude)
-            gps_pt.z = float(self.initial_gps.altitude)
-            self.initial_gps_pub.publish(gps_pt)
-
     def _relative_position(self, p: np.ndarray) -> np.ndarray:
-        if not self.recenter or self.initial_offset is None:
+        if not self.recenter or self.initial_pos is None:
             return p
-        return p - self.initial_offset
+        return p - self.initial_pos
 
     @staticmethod
     def _quat_to_rot(q: Quaternion) -> R:
@@ -161,11 +192,15 @@ class OdomReframer(Node):
     def odom_callback(self, msg: Odometry):
         stamp = self._get_stamp(msg)
 
-        pos = np.array(
-            [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z],
-            dtype=np.float64,
-        )
-        self._capture_initial_offset(pos)
+        # --- Extract full pose (position + orientation) from Odometry ---
+        p_in = msg.pose.pose.position
+        q_in = msg.pose.pose.orientation
+
+        pos = np.array([p_in.x, p_in.y, p_in.z], dtype=np.float64)
+
+        # Capture + publish initial pose once (raw from first odom)
+        self._maybe_capture_and_publish_initial_pose(msg, pos)
+
         rel = self._relative_position(pos)
 
         # --- Position: keep as-is unless you set rotate_pos_deg ---
@@ -174,20 +209,15 @@ class OdomReframer(Node):
         else:
             pos_out = rel
 
-        # --- Orientation: apply yaw correction (180 deg) ---
-        q_in = msg.pose.pose.orientation
+        # --- Orientation: apply yaw correction (e.g. 180 deg) ---
         if self.R_yaw is not None:
             R_in = self._quat_to_rot(q_in)
-            # Pre-multiply is the typical frame-style correction
             R_out = self.R_yaw * R_in
             q_out = self._rot_to_quat_msg(R_out)
         else:
             q_out = q_in
 
-        # If you want orientation-only correction while keeping position exactly as before,
-        # ensure rotate_pos_deg is 0 and rotate_orientation_only True.
         if self.rotate_orientation_only:
-            # explicitly keep whatever your translation is currently doing
             pos_out = rel if self.R_pos is None else pos_out
 
         # ---------- publish Odometry ----------
@@ -205,15 +235,12 @@ class OdomReframer(Node):
         if self.copy_twist:
             out.twist = msg.twist
 
-            # If we rotated the pose orientation, rotate twist vectors too
             if self.R_yaw is not None:
-                # Rotate linear velocity (v) in the child/base frame
                 v = out.twist.twist.linear
                 v_vec = np.array([v.x, v.y, v.z], dtype=np.float64)
                 v_rot = self.R_yaw.apply(v_vec)
                 v.x, v.y, v.z = float(v_rot[0]), float(v_rot[1]), float(v_rot[2])
 
-                # Rotate angular velocity (w) in the child/base frame
                 w = out.twist.twist.angular
                 w_vec = np.array([w.x, w.y, w.z], dtype=np.float64)
                 w_rot = self.R_yaw.apply(w_vec)
@@ -222,15 +249,16 @@ class OdomReframer(Node):
         self.pub.publish(out)
 
         # ---------- publish TF ----------
-        t = TransformStamped()
-        t.header.stamp = stamp
-        t.header.frame_id = self.odom_frame
-        t.child_frame_id = self.base_frame
-        t.transform.translation.x = float(pos_out[0])
-        t.transform.translation.y = float(pos_out[1])
-        t.transform.translation.z = float(pos_out[2])
-        t.transform.rotation = q_out
-        self.tf_broadcaster.sendTransform(t)
+        if self.publish_tf:
+            t = TransformStamped()
+            t.header.stamp = stamp
+            t.header.frame_id = self.odom_frame
+            t.child_frame_id = self.base_frame
+            t.transform.translation.x = float(pos_out[0])
+            t.transform.translation.y = float(pos_out[1])
+            t.transform.translation.z = float(pos_out[2])
+            t.transform.rotation = q_out
+            self.tf_broadcaster.sendTransform(t)
 
 
 def main(args=None):

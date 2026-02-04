@@ -20,15 +20,15 @@ trunk_detection_relay:
 
 row_fast_slam:
   ros__parameters:
-    num_particles: 500
-    measurement_topic: trunk_measurements_raw
+    num_particles: 2000
+    measurement_topic: /trunk_measurements_raw
     odom_topic: /odometry/filtered
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
 
     slot_spacing: 1.0612
-    row_origin_s: 0.6
-    slot_s_gate: 0.3
+    row_origin_s: 0.0
+    slot_s_gate: 0.5
     snap_downstream_spacing: false
     downstream_snap_mode: unseen_only
 
@@ -41,10 +41,13 @@ row_fast_slam:
     max_extra_slots: 20  
     row_origin_x: .nan
     row_origin_y: .nan
+    row_origin_lat_offset_m: 0.0
+    row_origin_fwd_offset_m: 0.0
     row_dir_sign: 1
     row_datum_pose_topic: row_datum_pose
-    max_back_assoc: 0
-    max_fwd_assoc: 2
+    init_row_yaw_avg_count: 100
+    max_back_assoc: 1
+    max_fwd_assoc: 4
 
     start_side: near
     init_d_near: 0.0
@@ -53,24 +56,24 @@ row_fast_slam:
     prior_sigma_d: 1.2
     side_mode: semantic
 
-    meas_std_y_lat: 0.22
+    meas_std_y_lat: 0.3
     meas_std_x_fwd: 0.5
 
-    motion_noise.a_trans: 0.55
-    motion_noise.b_trans: 0.5
-    motion_noise.c_lat: 0.2
-    motion_noise.a_rot: 0.3
-    motion_noise.b_rot: 1.0
+    motion_noise.a_trans: 0.4
+    motion_noise.b_trans: 0.35
+    motion_noise.c_lat: 0.15
+    motion_noise.a_rot: 0.15
+    motion_noise.b_rot: 0.5
 
-    resample_interval: 10
-    neff_ratio_threshold: 0.5
+    resample_interval: 5
+    neff_ratio_threshold: 0.7
 
     semantic_side_min_votes: 3
     semantic_side_fallback: fixed
 
     proposal.enable: false
-    proposal.min_pose_std_xy: 0.10
-    proposal.min_pose_std_yaw: 0.08
+    proposal.min_pose_std_xy: 0.05
+    proposal.min_pose_std_yaw: 0.03
 
     debug.log_every_n_meas: 0
     debug.csv_enable: true
@@ -78,11 +81,11 @@ row_fast_slam:
     debug.csv_flush_every_n: 1
 
     template_prior.enable: true
-    template_prior.sigma_s: 0.9     # start loose in s
-    template_prior.sigma_d: 0.5     # tighter laterally
-    template_prior.decay_k: 3.0
-    template_prior.max_seen: 8
-    template_prior.w: 1.0
+    template_prior.sigma_s: 1.0     # start loose in s
+    template_prior.sigma_d: 0.1     # tighter laterally
+    template_prior.decay_k: 1.0
+    template_prior.max_seen: 20
+    template_prior.w: 3.0
 
 odom_reframer:
   ros__parameters:
@@ -90,17 +93,18 @@ odom_reframer:
     output_odom_topic: /odom
     odom_frame: odom
     base_frame: amiga__base
+    publish_tf: true
 
-    recenter: true
+    recenter: false
 
-    rotate_pos_deg: 0.0
-    rotate_yaw_deg: 180.0
-    rotate_orientation_only: true
+    rotate_pos_deg: 180.0
+    rotate_yaw_deg: 0.0
+    rotate_orientation_only: false
 
     use_now_stamp: false
     copy_twist: true
 
-    gps_topic: /ublox_gps_corrected/fix
+    gps_topic: /fix
     gps_min_status: 0
     gps_require_finite_cov: false
 
@@ -118,7 +122,7 @@ slam_odom_correction_tf:
     sync_allow_headerless: false
 
     publish_rate_hz: 30.0
-    publish_on_wheel_odom: false
+    publish_on_wheel_odom: true
 
 
 tree_scene_node:
@@ -142,10 +146,10 @@ save_best_particle_map:
     trunk_topic: /fastslam_registry
     odom_corr_topic: /initial_odom_correction
     gps_topic: /initial_gps_fix
-    out: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/slam_measurements/slam_trunks.yaml
+    out: /home/marcus/trunk_width_ws/pf_localization_package_data/slam_measurements/slam_trunks.yaml
 
-    require_odom_correction: false
-    require_gps_fix: false
+    require_odom_correction: true
+    require_gps_fix: true
     require_trunks: true
 
     service_name: dump_trunk_yaml

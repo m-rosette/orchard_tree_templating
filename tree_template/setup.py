@@ -35,6 +35,8 @@ setup(
             'odom_reframer_calibrated = tree_template.odom_reframer_calibrated:main',
             'trunk_detection_relay = tree_template.trunk_detection_relay:main',
             'save_best_particle_map = tree_template.save_best_particle_map:main',
+            'bag_data_extractor = tree_template.bag_data_extractor:main',
+            'bag_data_replayer = tree_template.bag_data_replayer:main',
         ],
     },
 )

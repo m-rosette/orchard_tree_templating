@@ -169,13 +169,13 @@ class TrunkDetectionRelay(Node):
             radii = widths.astype(np.float64) * 0.5
             z_depth = z_depth + radii
 
-        # --- Lateral in your message convention: left-positive ---
-        x_left = pts[:, 0].astype(np.float64)
+        # --- Lateral in your message convention ---
+        x = pts[:, 0].astype(np.float64)
 
         # Build point in camera OPTICAL frame for TF:
         # Optical: X=RIGHT, Y=DOWN, Z=FORWARD(depth)
         pos_cam = np.empty((n, 3), dtype=np.float64)
-        pos_cam[:, 0] = -x_left   # optical X (RIGHT)
+        pos_cam[:, 0] = -x         # optical X (RIGHT)
         pos_cam[:, 1] = 0.0       # optical Y (DOWN)
         pos_cam[:, 2] = z_depth   # optical Z (FORWARD / depth)
 
@@ -202,8 +202,13 @@ class TrunkDetectionRelay(Node):
             ti = TrunkInfo()
             ti.pose = Pose()
 
-            ti.pose.position.x = by                # SLAM forward
-            ti.pose.position.y = lat_sign * bx     # SLAM lateral (left+)
+            if hasattr(msg, "header"):
+                ti.stamp = msg.header.stamp
+            else:
+                ti.stamp = self.get_clock().now().to_msg()
+
+            ti.pose.position.x = bx                # SLAM forward
+            ti.pose.position.y = lat_sign * by     # SLAM lateral (left+)
             ti.pose.position.z = 0.0
 
             ti.pose.orientation.w = 1.0

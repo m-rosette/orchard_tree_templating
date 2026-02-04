@@ -89,15 +89,6 @@ def generate_launch_description():
             parameters=[params_file, {"use_sim_time": use_sim_time}],
         ),
 
-        # Static transform: world -> map
-        Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            arguments=["0", "0", "0", "0", "0", "0", "world", "map"],
-            output="screen",
-            parameters=[{"use_sim_time": use_sim_time}],
-        ),
-
         # Odometry reframer node
         Node(
             package="tree_template",
