@@ -1,1 +1,4 @@
 __pycache__*
+tree_template/debug_data/
+tree_template/extracted_bag_data/
+tree_template/slam_measurements/

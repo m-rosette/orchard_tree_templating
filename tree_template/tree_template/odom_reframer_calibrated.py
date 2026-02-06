@@ -39,6 +39,10 @@ class OdomReframer(Node):
         self.declare_parameter("gps_min_status", 0)         # 0=STATUS_FIX, 1=SBAS, 2=GBAS (NavSatStatus)
         self.declare_parameter("gps_require_finite_cov", False)
 
+        # --- Averaging of initial readings ---
+        self.declare_parameter("initial_odom_samples", 30)   # number of odom readings to average
+        self.declare_parameter("initial_gps_samples", 30)    # number of gps readings to average
+
         input_topic = str(self.get_parameter("input_odom_topic").value)
         self.output_topic = str(self.get_parameter("output_odom_topic").value)
         self.odom_frame = str(self.get_parameter("odom_frame").value)
@@ -59,6 +63,15 @@ class OdomReframer(Node):
         self.gps_min_status = int(self.get_parameter("gps_min_status").value)
         self.gps_require_finite_cov = bool(self.get_parameter("gps_require_finite_cov").value)
         self.initial_gps: NavSatFix | None = None
+
+        # --- Averaging parameters ---
+        self.initial_odom_samples = int(self.get_parameter("initial_odom_samples").value)
+        self.initial_gps_samples = int(self.get_parameter("initial_gps_samples").value)
+
+        # --- Accumulation buffers ---
+        self.odom_positions: list[np.ndarray] = []  # accumulate position vectors
+        self.odom_orientations: list[R] = []        # accumulate rotation objects
+        self.gps_readings: list[NavSatFix] = []     # accumulate GPS readings
 
         self.R_pos = R.from_euler("z", self.rotate_pos_deg, degrees=True) if abs(self.rotate_pos_deg) > 1e-6 else None
         self.R_yaw = R.from_euler("z", self.rotate_yaw_deg, degrees=True) if abs(self.rotate_yaw_deg) > 1e-6 else None
@@ -98,6 +111,8 @@ class OdomReframer(Node):
             f"  rotate_orientation_only={self.rotate_orientation_only}\n"
             f"  gps_topic={self.gps_topic}\n"
             f"  use_now_stamp={self.use_now_stamp}\n"
+            f"  initial_odom_samples={self.initial_odom_samples}\n"
+            f"  initial_gps_samples={self.initial_gps_samples}\n"
             "  initials: publishing once with TRANSIENT_LOCAL durability"
         )
 
@@ -106,28 +121,47 @@ class OdomReframer(Node):
 
     def _maybe_capture_and_publish_initial_pose(self, msg: Odometry, pos_vec: np.ndarray) -> None:
         """
-        Capture the first odom Pose (raw) and publish it ONCE on initial_odom_correction.
+        Accumulate odom readings until we have initial_odom_samples, then compute average.
 
-        - Always captures/publishes for downstream consumers (like your YAML dump node).
+        - Accumulates position and orientation from incoming messages.
+        - Once we reach the target sample count, averages them and publishes ONCE.
         - Only stores initial_pos for subtraction when recenter=True.
         """
         if self.initial_pose_msg is not None:
             return
 
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
+        # Accumulate this reading
+        self.odom_positions.append(pos_vec.copy())
+        q_in = msg.pose.pose.orientation
+        R_in = self._quat_to_rot(q_in)
+        self.odom_orientations.append(R_in)
+
+        # Check if we have enough samples
+        if len(self.odom_positions) < self.initial_odom_samples:
+            self.get_logger().debug(
+                f"Accumulating odom: {len(self.odom_positions)}/{self.initial_odom_samples}"
+            )
+            return
+
+        # Average positions
+        pos_avg = np.mean(np.array(self.odom_positions), axis=0)
+
+        # Average orientations: convert all to rotation vectors, average, convert back
+        rot_vecs = np.array([rot.as_rotvec() for rot in self.odom_orientations])
+        rot_vec_avg = np.mean(rot_vecs, axis=0)
+        R_avg = R.from_rotvec(rot_vec_avg)
 
         pose = Pose()
-        pose.position.x = float(p.x)
-        pose.position.y = float(p.y)
-        pose.position.z = float(p.z)
-        pose.orientation = q
+        pose.position.x = float(pos_avg[0])
+        pose.position.y = float(pos_avg[1])
+        pose.position.z = float(pos_avg[2])
+        pose.orientation = self._rot_to_quat_msg(R_avg)
 
         self.initial_pose_msg = pose
 
         # Only store initial_pos for recenter subtraction if enabled
         if self.recenter:
-            self.initial_pos = pos_vec.copy()
+            self.initial_pos = pos_avg.copy()
 
         # Publish ONCE (latched topic)
         if not self._published_initial_odom:
@@ -135,7 +169,7 @@ class OdomReframer(Node):
             self._published_initial_odom = True
 
         self.get_logger().info(
-            "Captured initial odom pose and published once:\n"
+            f"Captured and averaged {self.initial_odom_samples} odom readings, published initial pose:\n"
             f"  pos=({pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f})\n"
             f"  quat=({pose.orientation.x:.4f}, {pose.orientation.y:.4f}, "
             f"{pose.orientation.z:.4f}, {pose.orientation.w:.4f})\n"
@@ -159,20 +193,40 @@ class OdomReframer(Node):
         if not self._gps_is_acceptable(msg):
             return
 
+        # Accumulate this reading
+        self.gps_readings.append(msg)
+
+        # Check if we have enough samples
+        if len(self.gps_readings) < self.initial_gps_samples:
+            self.get_logger().debug(
+                f"Accumulating GPS: {len(self.gps_readings)}/{self.initial_gps_samples}"
+            )
+            return
+
+        # Average GPS readings
+        lats = np.array([gps.latitude for gps in self.gps_readings])
+        lons = np.array([gps.longitude for gps in self.gps_readings])
+        alts = np.array([gps.altitude for gps in self.gps_readings])
+
+        lat_avg = float(np.mean(lats))
+        lon_avg = float(np.mean(lons))
+        alt_avg = float(np.mean(alts))
+
+        # Store the first message as reference (for status field, etc.)
         self.initial_gps = msg
 
         # Publish ONCE (latched topic): x=lat, y=lon, z=alt(m)
         if not self._published_initial_gps:
             gps_pt = Point()
-            gps_pt.x = float(msg.latitude)
-            gps_pt.y = float(msg.longitude)
-            gps_pt.z = float(msg.altitude)
+            gps_pt.x = lat_avg
+            gps_pt.y = lon_avg
+            gps_pt.z = alt_avg
             self.initial_gps_pub.publish(gps_pt)
             self._published_initial_gps = True
 
         self.get_logger().info(
-            f"Captured initial GPS and published once: lat={msg.latitude:.8f}, lon={msg.longitude:.8f}, alt={msg.altitude:.3f}, "
-            f"status={msg.status.status}"
+            f"Captured and averaged {self.initial_gps_samples} GPS readings, published initial fix: "
+            f"lat={lat_avg:.8f}, lon={lon_avg:.8f}, alt={alt_avg:.3f}, status={self.gps_readings[0].status.status}"
         )
 
     def _relative_position(self, p: np.ndarray) -> np.ndarray:

@@ -269,7 +269,7 @@ class SaveBestParticleMap(Node):
             if gps is None:
                 f.write("initial_gps_fix: null\n")
             else:
-                f.write(f"initial_gps_fix: [{gps[0]:.8f}, {gps[1]:.8f}, {gps[2]:.3f}]\n")
+                f.write(f"initial_gps_fix: [{gps[0]}, {gps[1]}, {gps[2]}]\n")
 
             # NEW
             f.write("robot_path:\n")

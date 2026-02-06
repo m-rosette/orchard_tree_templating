@@ -16,7 +16,6 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
@@ -112,10 +111,7 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("max_extra_slots", 0)  # 0 disables cap
         self.declare_parameter("row_origin_x", float("nan"))          # if NaN, use first odom pose
         self.declare_parameter("row_origin_y", float("nan"))         # if NaN, use first odom pose
-        self.declare_parameter("row_origin_lat_offset_m", 0.0)  # + = robot +Y (camera optical Z)
-        self.declare_parameter("row_origin_fwd_offset_m", 0.0)  # optional: + = robot +X
         self.declare_parameter("row_dir_sign", 1)            # (+1 => +X, -1 => -X)
-        self.declare_parameter("row_datum_pose_topic", "row_datum_pose")
         self.declare_parameter("max_back_assoc", 0)
         self.declare_parameter("max_fwd_assoc", 2)
         
@@ -145,6 +141,16 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("semantic_side_min_votes", 3)
         self.declare_parameter("semantic_side_fallback", "fixed")  # "fixed" or "unknown"
 
+        # Innovation gating (optional): reject measurement updates if median Mahalanobis is too large.
+        # Set <= 0.0 to disable.
+        self.declare_parameter("maha_gate_median", 0.0)  # dimensionless (Mahalanobis^2)
+        self.declare_parameter("maha_gate_min_particles", 50)
+        
+        # Landmark covariance floor (optional): prevents EKF landmarks from becoming unrealistically overconfident.
+        # Set <= 0.0 to disable a component.
+        self.declare_parameter("landmark_sigma_floor_x", 0.15)  # meters (world X)
+        self.declare_parameter("landmark_sigma_floor_y", 0.15)  # meters (world Y)
+
         # Measurement-informed pose proposal (FastSLAM 2.0)
         self.declare_parameter("proposal.enable", False)
         self.declare_parameter("proposal.min_pose_std_xy", 0.08)     # m
@@ -152,9 +158,8 @@ class RowFastSLAMNode(Node):
 
         # Debug
         self.declare_parameter("debug.log_every_n_meas", 0)          # 0 disables
-        self._dbg_meas_counter = 0
 
-        self.declare_parameter("init_row_yaw_avg_count", 200)  # number of initial odom yaws to average
+        self.declare_parameter("row_yaw_init_window", 30)
 
         # Template prior (soft anchor toward template slot position)
         self.declare_parameter("template_prior.enable", True)
@@ -167,14 +172,17 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("meas_max_lag_sec", 0.5)
         self.meas_max_lag_sec = float(self.get_parameter("meas_max_lag_sec").value)
 
-        self.init_row_yaw_avg_count = max(1, int(self.get_parameter("init_row_yaw_avg_count").value))
+        self.row_yaw_init_window = int(self.get_parameter("row_yaw_init_window").value)
 
-        # Track whether row origin came from odom (NaN params) and yaw bootstrapping state
-        self._row_origin_from_odom = False
-        self._yaw_bootstrap_done = False
-        self._yaw_bootstrap_n = 0
-        self._yaw_bootstrap_cos = 0.0
-        self._yaw_bootstrap_sin = 0.0
+        self._row_yaw_samples = []
+        self._row_axis_initialized = False
+
+        # Template origin anchoring
+        self.declare_parameter("template_origin_from_first_measurement", False)
+        self.template_origin_from_first_measurement = bool(
+            self.get_parameter("template_origin_from_first_measurement").value
+        )
+        self._template_origin_anchored = False
 
         # ---------- Resolve params ----------
         self.num_particles = int(self.get_parameter("num_particles").value)
@@ -210,14 +218,11 @@ class RowFastSLAMNode(Node):
             ],
             dtype=float,
         )
-        self.row_origin_lat_offset_m = float(self.get_parameter("row_origin_lat_offset_m").value)
-        self.row_origin_fwd_offset_m = float(self.get_parameter("row_origin_fwd_offset_m").value)
 
         self.row_dir_sign = int(self.get_parameter("row_dir_sign").value)
         if self.row_dir_sign not in (-1, 1):
             self.row_dir_sign = 1
 
-        self.row_datum_pose_topic = str(self.get_parameter("row_datum_pose_topic").value)
         self.max_back_assoc = int(self.get_parameter("max_back_assoc").value)
         self.max_fwd_assoc = int(self.get_parameter("max_fwd_assoc").value)
 
@@ -251,6 +256,14 @@ class RowFastSLAMNode(Node):
         if self.semantic_side_fallback not in ("fixed", "unknown"):
             self.semantic_side_fallback = "fixed"
 
+        self.maha_gate_median = float(self.get_parameter("maha_gate_median").value)
+        self.maha_gate_min_particles = max(1, int(self.get_parameter("maha_gate_min_particles").value))
+
+        sx = float(self.get_parameter("landmark_sigma_floor_x").value)
+        sy = float(self.get_parameter("landmark_sigma_floor_y").value)
+        self._lm_sigma_floor_var_x = (sx * sx) if (sx > 0.0) else 0.0
+        self._lm_sigma_floor_var_y = (sy * sy) if (sy > 0.0) else 0.0
+
         self.proposal_enable = bool(self.get_parameter("proposal.enable").value)
         self.proposal_min_pose_std_xy = float(self.get_parameter("proposal.min_pose_std_xy").value)
         self.proposal_min_pose_std_yaw = float(self.get_parameter("proposal.min_pose_std_yaw").value)
@@ -271,14 +284,15 @@ class RowFastSLAMNode(Node):
 
         # ---------- Row basis ----------
         self.row_yaw_est: Optional[float] = None
-        self.row_yaw_alpha = 0.2
 
         self.t_hat = np.array([float(self.row_dir_sign), 0.0], dtype=float)
         self.t_hat /= (np.linalg.norm(self.t_hat) + 1e-12)
         self.n_hat = np.array([-self.t_hat[1], self.t_hat[0]], dtype=float)
 
-        self.row_axis = self.t_hat.copy()
-        self.lateral_dir = self.n_hat.copy()
+        # Association basis placeholders; will be overwritten and locked in _maybe_init_row_axis_from_odom()
+        self.t_hat_assoc = self.t_hat.copy()
+        self.n_hat_assoc = self.n_hat.copy()
+        self.assoc_axis_locked = False
 
         # ---------- State ----------
         self.particles: List[Particle] = []
@@ -287,6 +301,8 @@ class RowFastSLAMNode(Node):
         self.measurement_count = 0
         self._slot_side_votes: Dict[int, Dict[str, int]] = {}
         self._last_odom_msg: Optional[Odometry] = None
+        self._boot_odom_pose: Optional[np.ndarray] = None
+        self._pf_initialized = False
 
         # Store last motion noise (body-frame) from odom updates
         self._last_motion_std_body = np.array([0.2, 0.2, 0.1], dtype=float)
@@ -319,7 +335,6 @@ class RowFastSLAMNode(Node):
 
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, odom_qos)
         self.meas_sub = self.create_subscription(TrunkInfo, self.measurement_topic, self.measurement_callback, meas_qos)
-        self.row_datum_sub = self.create_subscription(PoseStamped, self.row_datum_pose_topic, self.row_datum_pose_callback, datum_qos)
 
         self.get_logger().info(
             "RowFastSLAMNode started.\n"
@@ -377,8 +392,6 @@ class RowFastSLAMNode(Node):
                 "maha_p95",
                 "logdet_mean",
                 "logdet_p95",
-                "rowprior_pen_mean",
-                "rowprior_pen_p95",
                 "reject_reason_counts",
             ])
             self._dbg_csv_fp.flush()
@@ -414,8 +427,8 @@ class RowFastSLAMNode(Node):
         return float(self.init_d_near) if side == "near" else float(self.init_d_far)
 
     def _sigma_world_from_row_sigmas(self) -> np.ndarray:
-        t = self.t_hat.reshape(2, 1)
-        n = self.n_hat.reshape(2, 1)
+        t = self.t_hat_assoc.reshape(2, 1)
+        n = self.n_hat_assoc.reshape(2, 1)
         return (self.prior_sigma_s ** 2) * (t @ t.T) + (self.prior_sigma_d ** 2) * (n @ n.T)
 
     def _update_semantic_side_votes(self, slot_j: int, side: str):
@@ -443,45 +456,105 @@ class RowFastSLAMNode(Node):
 
         return "near" if n_near > n_far else "far"
 
-    def _set_row_axis_from_yaw(self, th: float):
-        """Update row basis vectors from a yaw angle."""
-        th = float(th)
-        self.row_yaw_est = th
+    def _maybe_init_row_axis_from_odom(self, yaw: float) -> None:
+        if self._row_axis_initialized:
+            return
 
-        self.t_hat = np.array([np.cos(th), np.sin(th)], dtype=float) * float(self.row_dir_sign)
+        # If we are NOT using a global row yaw estimate, initialize immediately from 1 sample.
+        needed = 1 if (not self.use_global_row_yaw) else int(self.row_yaw_init_window)
+        needed = max(1, needed)
+
+        self._row_yaw_samples.append(float(yaw))
+
+        # Keep buffer bounded
+        if len(self._row_yaw_samples) > needed:
+            self._row_yaw_samples.pop(0)
+
+        # Only initialize once we have enough samples
+        if len(self._row_yaw_samples) < needed:
+            return
+
+        # Circular mean over the collected samples
+        ys = np.array(self._row_yaw_samples, dtype=float)
+        mean_yaw = float(np.arctan2(np.sin(ys).mean(), np.cos(ys).mean()))
+        mean_yaw = wrap_angle(mean_yaw)
+
+        # Set row yaw + basis (only here)
+        self.row_yaw_est = mean_yaw
+
+        self.t_hat = np.array([np.cos(mean_yaw), np.sin(mean_yaw)], dtype=float) * float(self.row_dir_sign)
         self.t_hat /= (np.linalg.norm(self.t_hat) + 1e-12)
         self.n_hat = np.array([-self.t_hat[1], self.t_hat[0]], dtype=float)
 
+        # Freeze association basis immediately
+        self.t_hat_assoc = self.t_hat.copy()
+        self.n_hat_assoc = self.n_hat.copy()
+        self.assoc_axis_locked = True
+
+        # Convenience aliases
         self.row_axis = self.t_hat.copy()
         self.lateral_dir = self.n_hat.copy()
 
-    def _bootstrap_row_yaw_from_odom(self, yaw_meas: float):
+        self._row_axis_initialized = True
+
+        self.get_logger().info(
+            f"Row axis initialized from {len(self._row_yaw_samples)} odom samples "
+            f"(needed={needed}): yaw={mean_yaw:.3f} rad, "
+            f"t_hat=[{self.t_hat[0]:.3f}, {self.t_hat[1]:.3f}]"
+        )
+
+    def _anchor_template_origin_to_first_meas(self, mu_world_first: np.ndarray) -> None:
         """
-        If the row origin is taken from odom (row_origin_x/y are NaN), set row yaw as the
-        circular mean of the first N odom yaw measurements.
+        Re-anchor row_origin_xy so that template slot 0 lands exactly at mu_world_first.
+        This is intended to run ONCE, early, before any meaningful landmark updates.
         """
-        if not self.use_global_row_yaw:
+        if self._template_origin_anchored:
             return
-        if not self._row_origin_from_odom:
-            return
-        if self._yaw_bootstrap_done:
+        if not self.use_template_map:
             return
 
-        # accumulate circular mean stats
-        y = float(yaw_meas)
-        self._yaw_bootstrap_cos += float(np.cos(y))
-        self._yaw_bootstrap_sin += float(np.sin(y))
-        self._yaw_bootstrap_n += 1
+        mu_world_first = np.asarray(mu_world_first, dtype=float).reshape(2,)
 
-        # compute current mean (even before we have all N, so it stabilizes smoothly)
-        th_mean = float(np.arctan2(self._yaw_bootstrap_sin, self._yaw_bootstrap_cos))
-        self._set_row_axis_from_yaw(th_mean)
+        # Slot-0 lateral offset from template (near/far)
+        d0 = float(self._template_d_for_slot(0))
 
-        if self._yaw_bootstrap_n >= self.init_row_yaw_avg_count:
-            self._yaw_bootstrap_done = True
-            self.get_logger().info(
-                f"Row yaw bootstrap complete using first {self._yaw_bootstrap_n} odom yaws: yaw={th_mean:.3f} rad"
-            )
+        # We want:
+        #   mu0 = row_origin_xy + row_origin_s * t_hat_assoc + d0 * n_hat_assoc = mu_world_first
+        # => row_origin_xy = mu_world_first - row_origin_s*t_hat_assoc - d0*n_hat_assoc
+        old_origin = self.row_origin_xy.copy()
+
+        self.row_origin_xy = (
+            mu_world_first
+            - float(self.row_origin_s) * self.t_hat_assoc
+            - d0 * self.n_hat_assoc
+        ).astype(float)
+
+        # Use this as the stable association origin too
+        self.assoc_origin_xy = self.row_origin_xy.copy()
+        self.assoc_origin_s = float(self.row_origin_s)
+        self.assoc_last_slot = 0
+
+        # Re-seed ALL template landmarks to match the new origin.
+        # Safe because we run this only once (early).
+        Sigma0 = self._sigma_world_from_row_sigmas()
+        for p in self.particles:
+            for j, lm in p.landmarks.items():
+                j = int(j)
+                d_j = float(self._template_d_for_slot(j))
+                s_j = float(self.row_origin_s) + float(j) * float(self.slot_spacing)
+                mu_j = self.row_origin_xy + s_j * self.t_hat_assoc + d_j * self.n_hat_assoc
+                lm.mu = mu_j.astype(float)
+                # Keep covariance reasonable for unseen landmarks
+                if lm.seen_count <= 0:
+                    lm.Sigma = Sigma0.copy()
+
+        self._template_origin_anchored = True
+
+        self.get_logger().info(
+            "Anchored template origin to first measurement: "
+            f"old_origin=[{old_origin[0]:.3f},{old_origin[1]:.3f}] -> "
+            f"new_origin=[{self.row_origin_xy[0]:.3f},{self.row_origin_xy[1]:.3f}]"
+        )
     
     def _extend_template_slots_to(self, new_max_slot: int) -> None:
         """
@@ -512,7 +585,7 @@ class RowFastSLAMNode(Node):
                     continue
                 d0 = self._template_d_for_slot(j)
                 s0 = self.row_origin_s + j * self.slot_spacing
-                mu0 = self.row_origin_xy + s0 * self.t_hat + d0 * self.n_hat
+                mu0 = self.row_origin_xy + s0 * self.t_hat_assoc + d0 * self.n_hat_assoc
                 p.landmarks[j] = LandmarkEKF(mu=mu0.copy(), Sigma=Sigma0.copy())
 
         self.num_slots = end_j + 1
@@ -528,7 +601,7 @@ class RowFastSLAMNode(Node):
         j = int(j)
         s0 = float(self.row_origin_s) + float(j) * float(self.slot_spacing)
         d0 = float(self._template_d_for_slot(j))
-        return (self.row_origin_xy + s0 * self.t_hat + d0 * self.n_hat).astype(float)
+        return (self.row_origin_xy + s0 * self.t_hat_assoc + d0 * self.n_hat_assoc).astype(float)
 
     def _template_prior_alpha(self, seen_count: int) -> float:
         """
@@ -556,8 +629,8 @@ class RowFastSLAMNode(Node):
         e = (lm.mu - mu0).astype(float)  # world error (2,)
 
         # Convert error into row coordinates (s along row, d lateral)
-        e_s = float(np.dot(e, self.t_hat))
-        e_d = float(np.dot(e, self.n_hat))
+        e_s = float(np.dot(e, self.t_hat_assoc))
+        e_d = float(np.dot(e, self.n_hat_assoc))
 
         sig_s = max(float(self.template_prior_sigma_s), 1e-6)
         sig_d = max(float(self.template_prior_sigma_d), 1e-6)
@@ -607,79 +680,25 @@ class RowFastSLAMNode(Node):
         return float(self.get_clock().now().nanoseconds) * 1e-9
 
     def _ensure_initialized_from_odom(self, cur_pose: np.ndarray) -> bool:
-        if self.last_odom_pose is not None:
+        if self._pf_initialized:
             return False
 
-        # --- Determine whether origin comes from odom (NaN params) ---
         if not np.isfinite(self.row_origin_xy).all():
             self.row_origin_xy = cur_pose[0:2].copy()
-            self._row_origin_from_odom = True
-        else:
-            self._row_origin_from_odom = False
 
-        # --- Initialize/Bootstrap row axis (yaw) ---
-        if self.row_yaw_est is None:
-            # Default: use initial odom yaw
-            yaw_init = float(cur_pose[2])
-
-            # If we used odom as origin and we want a global row yaw, start the circular-mean bootstrap
-            if self.use_global_row_yaw and self._row_origin_from_odom:
-                # initialize bootstrap accumulators on the first call
-                self._yaw_bootstrap_cos = float(np.cos(yaw_init))
-                self._yaw_bootstrap_sin = float(np.sin(yaw_init))
-                self._yaw_bootstrap_n = 1
-                self._yaw_bootstrap_done = (self._yaw_bootstrap_n >= int(self.init_row_yaw_avg_count))
-
-                th = float(np.arctan2(self._yaw_bootstrap_sin, self._yaw_bootstrap_cos))
-                self.row_yaw_est = th
-            else:
-                th = yaw_init
-                self.row_yaw_est = th
-
-            # Build row basis vectors from th
-            self.t_hat = np.array([np.cos(th), np.sin(th)], dtype=float) * float(self.row_dir_sign)
-            self.t_hat /= (np.linalg.norm(self.t_hat) + 1e-12)
-            self.n_hat = np.array([-self.t_hat[1], self.t_hat[0]], dtype=float)
-
-            self.row_axis = self.t_hat.copy()
-            self.lateral_dir = self.n_hat.copy()
-
-            if self.use_global_row_yaw and self._row_origin_from_odom:
-                self.get_logger().info(
-                    f"Initialized row axis from odom yaw bootstrap (n={self._yaw_bootstrap_n}/{int(self.init_row_yaw_avg_count)}): "
-                    f"yaw={th:.3f} rad, t_hat=[{self.t_hat[0]:.3f}, {self.t_hat[1]:.3f}]"
-                )
-            else:
-                self.get_logger().info(
-                    f"Initialized row axis from initial odom yaw: yaw={th:.3f} rad, "
-                    f"t_hat=[{self.t_hat[0]:.3f}, {self.t_hat[1]:.3f}]"
-                )
-        
-        if self._row_origin_from_odom and not getattr(self, "_row_origin_offset_applied", False):
-            df = float(getattr(self, "row_origin_fwd_offset_m", 0.0))
-            dl = float(getattr(self, "row_origin_lat_offset_m", 0.0))
-
-            if abs(df) > 1e-9 or abs(dl) > 1e-9:
-                th0 = float(self.row_yaw_est) if (self.row_yaw_est is not None) else float(cur_pose[2])
-                c0, s0 = float(np.cos(th0)), float(np.sin(th0))
-
-                # body -> world
-                dx_w = c0 * df - s0 * dl
-                dy_w = s0 * df + c0 * dl
-
-                self.row_origin_xy = self.row_origin_xy + np.array([dx_w, dy_w], dtype=float)
-
-            self._row_origin_offset_applied = True
-
-        # --- Particle initialization ---
         self.last_odom_pose = cur_pose.copy()
         self._init_particles(cur_pose)
+        self._pf_initialized = True
 
-        # --- Template association bookkeeping ---
         if self.use_template_map:
-            self.assoc_origin_xy = self.row_origin_xy.copy()
-            self.assoc_origin_s  = float(self.row_origin_s)
-            self.assoc_last_slot = 0
+            if self.template_origin_from_first_measurement:
+                self.assoc_origin_xy = None
+                self.assoc_origin_s = None
+                self.assoc_last_slot = None
+            else:
+                self.assoc_origin_xy = self.row_origin_xy.copy()
+                self.assoc_origin_s  = float(self.row_origin_s)
+                self.assoc_last_slot = 0
 
         self.get_logger().info(
             f"Initialized particles at odom pose x={cur_pose[0]:.2f}, y={cur_pose[1]:.2f}, yaw={cur_pose[2]:.2f} rad"
@@ -708,9 +727,14 @@ class RowFastSLAMNode(Node):
         cur_pose = se2_from_odom(msg)
         dt = self._dt_from_stamp(msg.header.stamp)
 
-        # keep refining the initial yaw mean for the first N odom samples (only if origin-from-odom)
-        self._bootstrap_row_yaw_from_odom(float(cur_pose[2]))
+        self._maybe_init_row_axis_from_odom(cur_pose[2])
 
+        # While bootstrapping row axis, just cache odom and do nothing else
+        if not self._row_axis_initialized:
+            self._boot_odom_pose = cur_pose.copy()
+            return
+
+        # Once row axis is ready, initialize PF once
         if self._ensure_initialized_from_odom(cur_pose):
             return
 
@@ -752,6 +776,12 @@ class RowFastSLAMNode(Node):
         self._publish_odom_from_best()
 
     def _init_particles(self, init_pose: np.ndarray):
+        # Lock association axis on first initialization so slot coordinates don't drift mid-run
+        if not getattr(self, "assoc_axis_locked", False):
+            self.t_hat_assoc = self.t_hat.copy()
+            self.n_hat_assoc = self.n_hat.copy()
+            self.assoc_axis_locked = True
+
         Sigma0 = self._sigma_world_from_row_sigmas()
         landmarks_template: Dict[int, LandmarkEKF] = {}
 
@@ -762,7 +792,7 @@ class RowFastSLAMNode(Node):
             for j in range(self.num_slots):
                 d0 = self._template_d_for_slot(j)
                 s0 = self.row_origin_s + j * self.slot_spacing
-                mu0 = self.row_origin_xy + s0 * self.t_hat + d0 * self.n_hat
+                mu0 = self.row_origin_xy + s0 * self.t_hat_assoc + d0 * self.n_hat_assoc
                 landmarks_template[j] = LandmarkEKF(mu=mu0.copy(), Sigma=Sigma0.copy())
 
         self.particles = []
@@ -933,21 +963,31 @@ class RowFastSLAMNode(Node):
                 xnew[2] = wrap_angle(float(xnew[2]))
                 p.pose = xnew
 
-        # ---- Apply weights safely (log-sum-exp style) ----
-        maxlog = float(np.max(logw))
-        w = np.exp(logw - maxlog)
+        # ---- Innovation gating (median particle) ----
+        # If the median Mahalanobis distance across particles is too large, treat this measurement as an outlier.
+        # We keep particle weights as-is and skip landmark EKF updates for this measurement.
+        skip_update = False
+        maha_f = maha_arr[np.isfinite(maha_arr)]
+        maha_median = float(np.median(maha_f)) if maha_f.size else float("nan")
+        if self.maha_gate_median > 0.0:
+            if (not np.isfinite(maha_median)) or (maha_f.size < self.maha_gate_min_particles):
+                self._dbg_reject("maha_gate_insufficient")
+                skip_update = True
+            elif maha_median > self.maha_gate_median:
+                self._dbg_reject("maha_gate")
+                skip_update = True
 
-        for i, p in enumerate(self.particles):
-            p.weight *= float(w[i])
-        self._normalize_weights()
+        if not skip_update:
+            # ---- Apply weights safely (log-sum-exp style) ----
+            maxlog = float(np.max(logw))
+            w = np.exp(logw - maxlog)
+
+            for i, p in enumerate(self.particles):
+                p.weight *= float(w[i])
+            self._normalize_weights()
 
         # ---- Debug CSV row ----
         if getattr(self, "debug_csv_enable", False) and (self._dbg_csv is not None):
-            # if getattr(self, "_last_odom_msg", None) is not None:
-            #     st = self._last_odom_msg.header.stamp
-            #     t_sec = float(st.sec) + 1e-9 * float(st.nanosec)
-            # else:
-            #     t_sec = float(self.get_clock().now().nanoseconds) * 1e-9
             t_sec = t_meas_sec
 
             neff = float(self._effective_sample_size())
@@ -991,23 +1031,24 @@ class RowFastSLAMNode(Node):
                 self._dbg_csv_rows_since_flush = 0
 
         # ---- Landmark EKF update AFTER pose proposal ----
-        for p in self.particles:
-            lm = p.landmarks.get(slot_j, None)
-            if self.use_template_map:
-                if lm is None:
-                    continue
-            else:
-                if lm is None:
-                    lm = self._init_landmark_from_measurement(p, z)
-                    p.landmarks[slot_j] = lm
+        if not skip_update:
+            for p in self.particles:
+                lm = p.landmarks.get(slot_j, None)
+                if self.use_template_map:
+                    if lm is None:
+                        continue
+                else:
+                    if lm is None:
+                        lm = self._init_landmark_from_measurement(p, z)
+                        p.landmarks[slot_j] = lm
 
-            self._ekf_update_landmark(p, lm, z, self.R)
-            lm.update_width(w_meas)
+                self._ekf_update_landmark(p, lm, z, self.R)
+                lm.update_width(w_meas)
 
         # ---- Downstream spacing anchor update (use assoc origin if you want consistency) ----
         if self.snap_downstream_spacing:
             origin_xy = self.assoc_origin_xy if getattr(self, "assoc_origin_xy", None) is not None else self.row_origin_xy
-            s_meas_best = float(np.dot(mu_world_approx - origin_xy, self.t_hat))
+            s_meas_best = float(np.dot(mu_world_approx - origin_xy, self.t_hat_assoc))
 
             # Keep row_origin_s aligned with association anchor when snapping
             self.row_origin_s = (float(self.assoc_origin_s) if getattr(self, "assoc_origin_s", None) is not None else self.row_origin_s)
@@ -1097,12 +1138,19 @@ class RowFastSLAMNode(Node):
             return None, None
 
         # ---- Row coordinate for this measurement ----
-        s_meas = float(np.dot(mu_world_approx - origin_xy, self.t_hat))
+        s_meas = float(np.dot(mu_world_approx - origin_xy, self.t_hat_assoc))
 
         if getattr(self, "assoc_origin_s", None) is None:
-            # If template map is on, assoc_origin_s should already be set at init.
+            # If template map is on, we normally expect assoc_origin_s to already be set.
+            # But if we're anchoring template origin from the first measurement, we initialize here.
+            if self.use_template_map and self.template_origin_from_first_measurement:
+                # Anchor template origin so slot 0 lands on THIS first measurement
+                self._anchor_template_origin_to_first_meas(mu_world_approx)
+                return 0, mu_world_approx
+
             if self.use_template_map:
                 return None, None
+
             self.assoc_origin_s = float(s_meas)
             self.assoc_last_slot = 0
             return 0, mu_world_approx
@@ -1231,6 +1279,13 @@ class RowFastSLAMNode(Node):
         innov = z - z_pred
         lm.mu = lm.mu + K @ innov
         lm.Sigma = (np.eye(2) - K @ H) @ lm.Sigma
+
+        # --- Covariance floor to avoid overconfident landmarks (helps prevent huge Mahalanobis spikes) ---
+        if getattr(self, "_lm_sigma_floor_var_x", 0.0) > 0.0:
+            lm.Sigma[0, 0] = max(float(lm.Sigma[0, 0]), float(self._lm_sigma_floor_var_x))
+        if getattr(self, "_lm_sigma_floor_var_y", 0.0) > 0.0:
+            lm.Sigma[1, 1] = max(float(lm.Sigma[1, 1]), float(self._lm_sigma_floor_var_y))
+
         lm.Sigma = 0.5 * (lm.Sigma + lm.Sigma.T)
         lm.seen_count += 1
 
@@ -1247,19 +1302,8 @@ class RowFastSLAMNode(Node):
                     continue
 
                 s_k = self.row_origin_s + int(k) * self.slot_spacing
-                d_k = self._template_d_for_slot(int(k)) if lm.seen_count == 0 else float(np.dot(lm.mu - self.row_origin_xy, self.n_hat))
-                lm.mu = self.row_origin_xy + s_k * self.t_hat + d_k * self.n_hat
-
-    def _resnap_unseen_template_landmarks(self):
-        if not self.use_template_map or not self.particles:
-            return
-        for p in self.particles:
-            for k, lm in p.landmarks.items():
-                if lm.seen_count > 0:
-                    continue
-                s_k = self.row_origin_s + int(k) * self.slot_spacing
-                d_k = self._template_d_for_slot(int(k))
-                lm.mu = self.row_origin_xy + s_k * self.t_hat + d_k * self.n_hat
+                d_k = self._template_d_for_slot(int(k)) if lm.seen_count == 0 else float(np.dot(lm.mu - self.row_origin_xy, self.n_hat_assoc))
+                lm.mu = self.row_origin_xy + s_k * self.t_hat_assoc + d_k * self.n_hat_assoc
 
     # =========================================================
     #  Resampling
@@ -1444,34 +1488,6 @@ class RowFastSLAMNode(Node):
                 yaw = wrap_angle(yaw + np.pi)
 
         return yaw
-
-    # =========================================================
-    #  Row yaw callback
-    # =========================================================
-
-    def row_datum_pose_callback(self, msg: PoseStamped):
-        q = msg.pose.orientation
-        yaw_meas = float(R.from_quat([q.x, q.y, q.z, q.w]).as_euler("zyx")[0])
-
-        if self.row_yaw_est is None:
-            self.row_yaw_est = yaw_meas
-        else:
-            a = float(self.row_yaw_alpha)
-            c = a * np.cos(self.row_yaw_est) + (1.0 - a) * np.cos(yaw_meas)
-            s = a * np.sin(self.row_yaw_est) + (1.0 - a) * np.sin(yaw_meas)
-            self.row_yaw_est = float(np.arctan2(s, c))
-
-        th = float(self.row_yaw_est)
-
-        self.t_hat = np.array([np.cos(th), np.sin(th)], dtype=float) * float(self.row_dir_sign)
-        self.t_hat /= (np.linalg.norm(self.t_hat) + 1e-12)
-        self.n_hat = np.array([-self.t_hat[1], self.t_hat[0]], dtype=float)
-
-        self.row_axis = self.t_hat.copy()
-        self.lateral_dir = self.n_hat.copy()
-
-        self._resnap_unseen_template_landmarks()
-        self._publish_registry_from_best()
 
 
 def main(args=None):

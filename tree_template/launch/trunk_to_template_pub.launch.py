@@ -82,12 +82,12 @@ def generate_launch_description():
             parameters=[params_file, {"use_sim_time": use_sim_time}],
         ),
 
-        Node(
-            package="tree_template",
-            executable="depth_image_to_pointcloud2",
-            output="screen",
-            parameters=[params_file, {"use_sim_time": use_sim_time}],
-        ),
+        # Node(
+        #     package="tree_template",
+        #     executable="depth_image_to_pointcloud2",
+        #     output="screen",
+        #     parameters=[params_file, {"use_sim_time": use_sim_time}],
+        # ),
 
         # Odometry reframer node
         Node(

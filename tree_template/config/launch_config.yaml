@@ -26,28 +26,26 @@ row_fast_slam:
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
 
-    slot_spacing: 1.0612
+    slot_spacing: 1.0
     row_origin_s: 0.0
     slot_s_gate: 0.5
     snap_downstream_spacing: false
     downstream_snap_mode: unseen_only
 
     use_template_map: true
+    template_origin_from_first_measurement: true
     publish_unseen_template_landmarks: false
     min_seen_count_to_publish: 1
     use_global_row_yaw: true
-    num_slots: 50
+    num_slots: 60
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_x: .nan
     row_origin_y: .nan
-    row_origin_lat_offset_m: 0.0
-    row_origin_fwd_offset_m: 0.0
     row_dir_sign: 1
-    row_datum_pose_topic: row_datum_pose
-    init_row_yaw_avg_count: 100
+    row_yaw_init_window: 150
     max_back_assoc: 1
-    max_fwd_assoc: 4
+    max_fwd_assoc: 2
 
     start_side: near
     init_d_near: 0.0
@@ -56,24 +54,32 @@ row_fast_slam:
     prior_sigma_d: 1.2
     side_mode: semantic
 
-    meas_std_y_lat: 0.3
-    meas_std_x_fwd: 0.5
+    meas_std_y_lat: 0.6
+    meas_std_x_fwd: 0.8
 
-    motion_noise.a_trans: 0.4
-    motion_noise.b_trans: 0.35
-    motion_noise.c_lat: 0.15
-    motion_noise.a_rot: 0.15
-    motion_noise.b_rot: 0.5
+    motion_noise.a_trans: 0.3
+    motion_noise.b_trans: 0.25
+    motion_noise.c_lat: 0.2
+    motion_noise.a_rot: 0.08
+    motion_noise.b_rot: 0.1
 
-    resample_interval: 5
-    neff_ratio_threshold: 0.7
+    resample_interval: 10
+    neff_ratio_threshold: 0.5
 
     semantic_side_min_votes: 3
     semantic_side_fallback: fixed
 
-    proposal.enable: false
-    proposal.min_pose_std_xy: 0.05
-    proposal.min_pose_std_yaw: 0.03
+    # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
+    maha_gate_median: 0.0
+    maha_gate_min_particles: 50
+
+    # Landmark covariance floor (std dev in meters, world frame). Set <= 0 to disable a component.
+    landmark_sigma_floor_x: 0.25
+    landmark_sigma_floor_y: 0.25
+
+    proposal.enable: true
+    proposal.min_pose_std_xy: 0.04
+    proposal.min_pose_std_yaw: 0.06
 
     debug.log_every_n_meas: 0
     debug.csv_enable: true
@@ -82,10 +88,10 @@ row_fast_slam:
 
     template_prior.enable: true
     template_prior.sigma_s: 1.0     # start loose in s
-    template_prior.sigma_d: 0.1     # tighter laterally
-    template_prior.decay_k: 1.0
+    template_prior.sigma_d: 0.15     # tighter laterally
+    template_prior.decay_k: 2.0
     template_prior.max_seen: 20
-    template_prior.w: 3.0
+    template_prior.w: 2.0
 
 odom_reframer:
   ros__parameters:
@@ -108,6 +114,8 @@ odom_reframer:
     gps_min_status: 0
     gps_require_finite_cov: false
 
+    initial_odom_samples: 30
+    initial_gps_samples: 2
 
 slam_odom_correction_tf:
   ros__parameters:
