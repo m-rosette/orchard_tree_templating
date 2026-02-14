@@ -4,7 +4,7 @@ import os
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import ExecuteProcess, SetEnvironmentVariable, DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 
 from ament_index_python.packages import get_package_share_directory
@@ -12,6 +12,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
+    replay = LaunchConfiguration("replay")
 
     default_params_file = os.path.join(
         get_package_share_directory("tree_template"),
@@ -25,6 +26,12 @@ def generate_launch_description():
             "use_sim_time",
             default_value="false",
             description="Use simulated clock",
+        ),
+
+        DeclareLaunchArgument(
+            "replay",
+            default_value="false",
+            description="Whether running in replay mode",
         ),
 
         DeclareLaunchArgument(
@@ -56,6 +63,7 @@ def generate_launch_description():
                 "/home/marcus/trunk_width_ws/trunk_width_estimation/scripts/ros2/ros_publisher_node.py",
             ],
             output="screen",
+            condition=IfCondition(PythonExpression(["'", replay, "' != 'true'"])),
         ),
 
         # ----------------------------
@@ -73,6 +81,7 @@ def generate_launch_description():
             executable="trunk_detection_relay",
             output="screen",
             parameters=[params_file, {"use_sim_time": use_sim_time}],
+            condition=IfCondition(PythonExpression(["'", replay, "' != 'true'"])),
         ),
 
         Node(

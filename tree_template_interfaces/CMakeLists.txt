@@ -12,6 +12,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/UpdateTrellisPosition.srv"
+  "srv/SaveSlamResults.srv"
   "msg/TrunkInfo.msg"
   "msg/TrunkRegistry.msg"
   DEPENDENCIES geometry_msgs # Add packages that above messages depend on, in this case geometry_msgs

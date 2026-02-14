@@ -204,6 +204,8 @@ class TrunkDetectionRelay(Node):
 
             if hasattr(msg, "header"):
                 ti.stamp = msg.header.stamp
+            elif hasattr(msg, "stamp"):
+                ti.stamp = msg.stamp
             else:
                 ti.stamp = self.get_clock().now().to_msg()
 

@@ -8,8 +8,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Type, Optional
 
-import numpy as np
-
 import rclpy
 from rclpy.node import Node
 from rclpy.serialization import deserialize_message
@@ -42,19 +40,29 @@ def _read_initials_yaml(path: Path) -> Optional[dict]:
         with open(path, "r") as f:
             return yaml.safe_load(f) or {}
 
-    # Minimal parser fallback: only handles the two lines we write.
+    # Minimal parser fallback: handles the lines we write.
     data: dict = {}
     txt = path.read_text().splitlines()
     for line in txt:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+
         if line.startswith("initial_odom_correction:"):
             rhs = line.split(":", 1)[1].strip()
             data["initial_odom_correction"] = None if rhs == "null" else eval(rhs)  # dataset-local file
+            continue
+
         if line.startswith("initial_gps_fix:"):
             rhs = line.split(":", 1)[1].strip()
             data["initial_gps_fix"] = None if rhs == "null" else eval(rhs)
+            continue
+
+        if line.startswith("final_gps_fix:"):
+            rhs = line.split(":", 1)[1].strip()
+            data["final_gps_fix"] = None if rhs == "null" else eval(rhs)
+            continue
+
     return data
 
 
@@ -65,6 +73,7 @@ class BagDataReplayer(Node):
         speed: float = 1.0,
         initial_odom_topic: str = "/initial_odom_correction",
         initial_gps_topic: str = "/initial_gps_fix",
+        final_gps_topic: str = "/fix",  # NEW
         publish_initials: bool = True,
         publish_initials_delay_s: float = 0.10,
     ):
@@ -75,6 +84,7 @@ class BagDataReplayer(Node):
 
         self.initial_odom_topic = initial_odom_topic
         self.initial_gps_topic = initial_gps_topic
+        self.final_gps_topic = final_gps_topic  # NEW
         self.publish_initials = bool(publish_initials)
         self.publish_initials_delay_s = max(float(publish_initials_delay_s), 0.0)
 
@@ -98,6 +108,7 @@ class BagDataReplayer(Node):
 
         self.init_pose_pub = self.create_publisher(Pose, self.initial_odom_topic, qos_latched)
         self.init_gps_pub = self.create_publisher(Point, self.initial_gps_topic, qos_latched)
+        self.final_gps_pub = self.create_publisher(Point, self.final_gps_topic, qos_latched)  # NEW
 
         self.initials = _read_initials_yaml(self.dataset_dir / "initials.yaml")
 
@@ -130,8 +141,11 @@ class BagDataReplayer(Node):
         if not self.initials:
             return
 
-        # initial_odom_correction: Pose with position; keep identity quaternion
         corr = self.initials.get("initial_odom_correction", None)
+        gps_i = self.initials.get("initial_gps_fix", None)
+        gps_f = self.initials.get("final_gps_fix", None)  # NEW
+
+        # initial_odom_correction: Pose with position; keep identity quaternion
         if corr is not None:
             try:
                 pose = Pose()
@@ -144,28 +158,38 @@ class BagDataReplayer(Node):
                 self.get_logger().warn(f"Failed to publish initial_odom_correction: {e}")
 
         # initial_gps_fix: Point (lat, lon, alt)
-        gps = self.initials.get("initial_gps_fix", None)
-        if gps is not None:
+        if gps_i is not None:
             try:
                 pt = Point()
-                pt.x = float(gps[0])
-                pt.y = float(gps[1])
-                pt.z = float(gps[2])
+                pt.x = float(gps_i[0])
+                pt.y = float(gps_i[1])
+                pt.z = float(gps_i[2])
                 self.init_gps_pub.publish(pt)
             except Exception as e:
                 self.get_logger().warn(f"Failed to publish initial_gps_fix: {e}")
+
+        # final_gps_fix: Point (lat, lon, alt)  (NEW)
+        if gps_f is not None:
+            try:
+                pt = Point()
+                pt.x = float(gps_f[0])
+                pt.y = float(gps_f[1])
+                pt.z = float(gps_f[2])
+                self.final_gps_pub.publish(pt)
+            except Exception as e:
+                self.get_logger().warn(f"Failed to publish final_gps_fix: {e}")
 
         if self.publish_initials_delay_s > 0.0:
             time.sleep(self.publish_initials_delay_s)
 
         self.get_logger().info(
-            f"Published initials once (latched): have_odom={corr is not None}, have_gps={gps is not None}"
+            "Published initials once (latched): "
+            f"have_odom={corr is not None}, have_init_gps={gps_i is not None}, have_final_gps={gps_f is not None}"
         )
 
     def run(self):
         if not self.rows:
             self.get_logger().warn("No rows to replay.")
-            # still publish initials if requested
             self._publish_initials_once()
             return
 
@@ -199,8 +223,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="Dataset directory (contains index.csv)")
     ap.add_argument("--speed", default="1.0", help="Replay speed (2.0 = 2x faster)")
+
     ap.add_argument("--initial_odom_topic", default="/initial_odom_correction", help="Initial odom correction topic (Pose)")
     ap.add_argument("--initial_gps_topic", default="/initial_gps_fix", help="Initial GPS fix topic (Point)")
+
+    # NEW: final gps topic (Point lat/lon/alt), published latched for downstream dump node
+    ap.add_argument("--final_gps_topic", default="/final_gps_fix", help="Final GPS fix topic (Point)")
+
     ap.add_argument("--no_initials", action="store_true", help="Do not publish initials on startup")
     ap.add_argument("--initials_delay", default="0.10", help="Delay after publishing initials (seconds)")
     args = ap.parse_args()
@@ -211,6 +240,7 @@ def main():
         speed=float(args.speed),
         initial_odom_topic=str(args.initial_odom_topic),
         initial_gps_topic=str(args.initial_gps_topic),
+        final_gps_topic=str(args.final_gps_topic),
         publish_initials=(not bool(args.no_initials)),
         publish_initials_delay_s=float(args.initials_delay),
     )
