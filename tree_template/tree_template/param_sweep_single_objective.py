@@ -217,7 +217,7 @@ def mean_latlon(position_estimates: Any) -> Tuple[Optional[float], Optional[floa
     return float(np.mean(lats)), float(np.mean(lons)), len(lats)
 
 
-def get_base_utm_from_tree(tree: dict) -> Tuple[float, float]:
+def get_base_utm_from_tree(tree: dict) -> float:
     if "position_estimates" in tree:
         lat_m, lon_m, n_used = mean_latlon(tree.get("position_estimates"))
         if lat_m is not None and lon_m is not None and n_used > 0:
@@ -344,7 +344,7 @@ def rot2(yaw_rad: float) -> np.ndarray:
     return np.array([[c, -s], [s, c]], dtype=np.float64)
 
 
-def parse_initial_gps_utm(local_data: Dict[str, Any]) -> Tuple[float, float]:
+def parse_initial_gps_utm(local_data: Dict[str, Any]) -> float:
     gps0 = local_data.get("initial_gps_fix", None)
     if not isinstance(gps0, (list, tuple)) or len(gps0) < 2:
         raise ValueError("Local YAML missing initial_gps_fix.")
@@ -405,7 +405,7 @@ def select_yaw(
     return yaw_from_gps_baseline(e0, n0, final_utm)
 
 
-def parse_initial_odom_xy(local_data: Dict[str, Any]) -> Tuple[float, float]:
+def parse_initial_odom_xy(local_data: Dict[str, Any]) -> float:
     odom0 = local_data.get("initial_odom_correction", [0.0, 0.0, 0.0])
     if not isinstance(odom0, (list, tuple)) or len(odom0) < 2:
         return 0.0, 0.0
@@ -759,31 +759,31 @@ def atomic_write_text(path: Path, text: str) -> None:
 def suggest_params(trial) -> Dict[str, Any]:  # "optuna.trial.Trial"
     params: Dict[str, Any] = {}
 
-    params["slot_spacing"] = trial.suggest_float("slot_spacing", 0.9, 1.2)
-    params["slot_s_gate"] = trial.suggest_float("slot_s_gate", 0.35, 0.55)
+    params["slot_spacing"] = trial.suggest_float("slot_spacing", 0.8, 1.25)
+    params["slot_s_gate"] = trial.suggest_float("slot_s_gate", 0.3, 0.7)
 
-    params["meas_std_x_fwd"] = trial.suggest_float("meas_std_x_fwd", 0.25, 0.70)
-    params["meas_std_y_lat"] = trial.suggest_float("meas_std_y_lat", 0.25, 0.80)
+    params["meas_std_x_fwd"] = trial.suggest_float("meas_std_x_fwd", 0.25, 0.70, log=True)
+    params["meas_std_y_lat"] = trial.suggest_float("meas_std_y_lat", 0.2, 1.2, log=True)
 
-    params["motion_noise.a_trans"] = trial.suggest_float("motion_noise.a_trans", 0.05, 0.35)
-    params["motion_noise.b_trans"] = trial.suggest_float("motion_noise.b_trans", 0.05, 0.35)
-    params["motion_noise.c_lat"] = trial.suggest_float("motion_noise.c_lat", 0.05, 0.30)
-    params["motion_noise.a_rot"] = trial.suggest_float("motion_noise.a_rot", 0.03, 0.12)
-    params["motion_noise.b_rot"] = trial.suggest_float("motion_noise.b_rot", 0.03, 0.15)
+    params["motion_noise.a_trans"] = trial.suggest_float("motion_noise.a_trans", 0.05, 0.35, log=True)
+    params["motion_noise.b_trans"] = trial.suggest_float("motion_noise.b_trans", 0.05, 0.35, log=True)
+    params["motion_noise.c_lat"] = trial.suggest_float("motion_noise.c_lat", 0.05, 0.30, log=True)
+    params["motion_noise.a_rot"] = trial.suggest_float("motion_noise.a_rot", 0.03, 0.12, log=True)
+    params["motion_noise.b_rot"] = trial.suggest_float("motion_noise.b_rot", 0.03, 0.15, log=True)
 
-    params["prior_sigma_s"] = trial.suggest_float("prior_sigma_s", 0.15, 0.90)
-    params["prior_sigma_d"] = trial.suggest_float("prior_sigma_d", 0.15, 0.90)
+    params["prior_sigma_s"] = trial.suggest_float("prior_sigma_s", 0.15, 0.90, log=True)
+    params["prior_sigma_d"] = trial.suggest_float("prior_sigma_d", 0.15, 0.90, log=True)
 
-    params["template_prior.sigma_s"] = trial.suggest_float("template_prior.sigma_s", 0.30, 0.80)
-    params["template_prior.sigma_d"] = trial.suggest_float("template_prior.sigma_d", 0.10, 0.30)
-    params["template_prior.w"] = trial.suggest_float("template_prior.w", 1.0, 5.0)
+    params["template_prior.sigma_s"] = trial.suggest_float("template_prior.sigma_s", 0.30, 0.80, log=True)
+    params["template_prior.sigma_d"] = trial.suggest_float("template_prior.sigma_d", 0.10, 0.30, log=True)
+    params["template_prior.w"] = trial.suggest_float("template_prior.w", 1.0, 5.0, log=True)
     params["template_prior.decay_k"] = trial.suggest_float("template_prior.decay_k", 0.5, 3.0)
     params["template_prior.max_seen"] = trial.suggest_int("template_prior.max_seen", 4, 16)
 
     params["max_back_assoc"] = trial.suggest_categorical("max_back_assoc", [0, 1])
     params["max_fwd_assoc"] = trial.suggest_categorical("max_fwd_assoc", [1, 2, 3])
 
-    params["maha_gate_median"] = trial.suggest_categorical("maha_gate_median", [0.0, 4.0, 6.0, 8.0])
+    params["maha_gate_median"] = trial.suggest_categorical("maha_gate_median", [0.0, 4.0, 6.0, 8.0, 10.0, 12.0])
 
     return params
 
@@ -808,7 +808,7 @@ def run_one_optuna_trial(
     v: np.ndarray,
     env: Dict[str, str],
     worker_id: int,
-) -> Tuple[float, float]:
+) -> float:
     out_root = Path(args_ns.out_dir).expanduser().resolve()
     dataset_dir = Path(args_ns.dataset).expanduser().resolve()
 
@@ -921,7 +921,7 @@ def run_one_optuna_trial(
         trial.set_user_attr("n_gt_forward", int(score["n_gt_forward"]))
         trial.set_user_attr("n_local_forward", int(score["n_local_forward"]))
 
-        return float(score["rmse_s_with_penalty_m"]), float(score["rmse_d_with_penalty_m"])
+        return float(score["rmse_sd_with_penalty_m"])
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -930,7 +930,7 @@ def run_one_optuna_trial(
         (trial_dir / "error.txt").write_text(err + "\n")
         trial.set_user_attr("failed", True)
         trial.set_user_attr("error", err)
-        return 1.0e9, 1.0e9
+        return 1.0e9
 
     finally:
         terminate_process_group(slam_p)
@@ -1137,20 +1137,26 @@ def worker_process_main(payload: Dict[str, Any]) -> None:
         gt_obj_nums, gt_pts, gt_row_nums, int(args_ns.anchor_object_number)
     )
 
-    sampler = optuna.samplers.TPESampler(seed=int(args_ns.seed), multivariate=True, constant_liar=True)
+    sampler = optuna.samplers.TPESampler(
+        seed=int(args_ns.seed),
+        multivariate=True,
+        constant_liar=True,
+        n_startup_trials=40,
+        n_ei_candidates=48,
+    )
 
     study = optuna.create_study(
         study_name=str(args_ns.study_name),
         storage=str(args_ns.optuna_storage),
         load_if_exists=True,
-        directions=["minimize", "minimize"],
+        direction="minimize",
         sampler=sampler,
     )
 
     n_local_trials = int(payload["n_trials"])
     for _ in range(n_local_trials):
         trial = study.ask()
-        rmse_s, rmse_d = run_one_optuna_trial(
+        rmse_sd = run_one_optuna_trial(
             trial=trial,
             args_ns=args_ns,
             gt_obj_nums=gt_obj_nums,
@@ -1165,7 +1171,7 @@ def worker_process_main(payload: Dict[str, Any]) -> None:
             env=env,
             worker_id=worker_id,
         )
-        study.tell(trial, (rmse_s, rmse_d))
+        study.tell(trial, rmse_sd)
 
 
 # ============================================================
@@ -1231,7 +1237,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--domain_id_base", type=int, default=30)
 
-    ap.add_argument("--study_name", default="row_fastslam_tpe_sd_moo")
+    ap.add_argument("--study_name", default="row_fastslam_tpe_sd_single")
     ap.add_argument("--optuna_storage", default=None)
 
     args = ap.parse_args()
@@ -1273,7 +1279,7 @@ def main() -> None:
         study_name=str(args.study_name),
         storage=str(args.optuna_storage),
         load_if_exists=True,
-        directions=["minimize", "minimize"],
+        direction="minimize",
         sampler=sampler,
     )
 

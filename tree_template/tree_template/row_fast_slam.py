@@ -7,6 +7,7 @@ from typing import Dict, Optional, List, Tuple
 import csv
 import os
 from collections import defaultdict, deque
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -296,6 +297,14 @@ class RowFastSLAMNode(Node):
             self.get_parameter("template_origin_from_first_measurement").value
         )
         self._template_origin_anchored = False
+        self.declare_parameter("template_origin_min_hits", 1)
+        self.template_origin_min_hits = int(self.get_parameter("template_origin_min_hits").value)
+        if self.template_origin_min_hits < 1:
+            self.template_origin_min_hits = 1
+        
+        self._template_origin_hit_count = 0
+        self._template_origin_slot = None  # which slot we’re accumulating for
+        self._template_origin_mu_sum = np.zeros(2, dtype=float)
 
         # Rolling odom history: deque of (t_sec, pose_se2=[x,y,yaw]). Used to time-align delayed measurements.
         self._odom_hist = deque()
@@ -484,7 +493,13 @@ class RowFastSLAMNode(Node):
         # Debug CSV logging (tuning)
         # -----------------------------
         self.declare_parameter("debug.csv_enable", True)
-        self.declare_parameter("debug.csv_path", "/home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv")
+
+        # Compute default path: one directory above this file, in debug_data/
+        this_file = Path(__file__).resolve()
+        default_debug_dir = this_file.parent.parent / "debug_data"
+        default_debug_path = default_debug_dir / "fastslam_debug.csv"
+
+        self.declare_parameter("debug.csv_path", str(default_debug_path))
         self.declare_parameter("debug.csv_flush_every_n", 1)
 
         self.debug_csv_enable = bool(self.get_parameter("debug.csv_enable").value)
@@ -1072,6 +1087,29 @@ class RowFastSLAMNode(Node):
             return
         slot_j = int(slot_j)
 
+        # --------------------------------------------------------
+        # Delayed template-origin anchoring using mean of first N hits
+        # --------------------------------------------------------
+        if (
+            self.use_template_map
+            and self.template_origin_from_first_measurement
+            and (not self._template_origin_anchored)
+        ):
+            # We only want to anchor based on the first tree location (slot 0)
+            if slot_j == 0:
+                self._template_origin_hit_count += 1
+                self._template_origin_mu_sum += mu_world_approx.reshape(2,)
+
+                if self._template_origin_hit_count >= self.template_origin_min_hits:
+                    mu_mean = self._template_origin_mu_sum / float(self._template_origin_hit_count)
+
+                    self.get_logger().info(
+                        f"Anchoring template origin using mean of "
+                        f"{self._template_origin_hit_count} hits (slot 0)."
+                    )
+
+                    self._anchor_template_origin_to_first_meas(mu_mean)
+
         if (not self.use_template_map) and (getattr(self, "assoc_origin_s", None) is None):
             self.assoc_origin_xy = self.row_origin_xy.copy()
 
@@ -1472,9 +1510,13 @@ class RowFastSLAMNode(Node):
         if getattr(self, "assoc_origin_s", None) is None:
             # If template map is on, we normally expect assoc_origin_s to already be set.
             # But if we're anchoring template origin from the first measurement, we initialize here.
+            # if self.use_template_map and self.template_origin_from_first_measurement:
+            #     # Anchor template origin so slot 0 lands on THIS first measurement
+            #     self._anchor_template_origin_to_first_meas(mu_world_approx)
+            #     return 0, mu_world_approx
+
             if self.use_template_map and self.template_origin_from_first_measurement:
-                # Anchor template origin so slot 0 lands on THIS first measurement
-                self._anchor_template_origin_to_first_meas(mu_world_approx)
+                # Defer anchoring until we collect N hits in measurement_callback()
                 return 0, mu_world_approx
 
             if self.use_template_map:

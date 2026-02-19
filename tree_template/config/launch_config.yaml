@@ -20,38 +20,39 @@ trunk_detection_relay:
 
 row_fast_slam:
   ros__parameters:
-    num_particles: 500
+    num_particles: 1000
     measurement_topic: /trunk_measurements_raw
     odom_topic: /odometry/filtered
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
 
     # Slot initialization (map init)
-    slot_spacing: 1.05
+    slot_spacing: 0.85
     num_slots: 60
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_s: 0.0
-    slot_s_gate: 0.45
+    slot_s_gate: 0.6
     row_origin_x: .nan
     row_origin_y: .nan
     row_dir_sign: 1
     row_yaw_init_window: 35
     min_seen_count_to_publish: 1
-    snap_downstream_spacing: true
+    snap_downstream_spacing: false
     downstream_snap_mode: unseen_only
     use_template_map: true
     template_origin_from_first_measurement: true
+    template_origin_min_hits: 5
     publish_unseen_template_landmarks: false
     use_global_row_yaw: true
 
     # Initial covariance - landmark uncertainty
-    prior_sigma_s: 0.5
-    prior_sigma_d: 0.5
+    prior_sigma_s: 2.0
+    prior_sigma_d: 1.0
 
     # Local trunk associations
-    max_back_assoc: 1
-    max_fwd_assoc: 3
+    max_back_assoc: 0
+    max_fwd_assoc: 2
 
     # Trunk row side classification
     start_side: near
@@ -62,50 +63,51 @@ row_fast_slam:
     semantic_side_fallback: fixed
 
     # Measurement distribution
-    meas_std_y_lat: 0.66
-    meas_std_x_fwd: 0.45
+    meas_std_y_lat: 2.0
+    meas_std_x_fwd: 3.0
 
     # Motion distribution
-    motion_noise.a_trans: 0.25
-    motion_noise.b_trans: 0.1
-    motion_noise.c_lat: 0.07
-    motion_noise.a_rot: 0.03
-    motion_noise.b_rot: 0.05
+    motion_noise.a_trans: 1.2
+    motion_noise.b_trans: 0.3
+    motion_noise.c_lat: 0.3
+    motion_noise.a_rot: 0.1
+    motion_noise.b_rot: 0.15
 
     # Resampling
     resample_interval: 10
     neff_ratio_threshold: 0.5
 
     # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
-    maha_gate_median: 6.0
+    maha_gate_median: 0.0
     maha_gate_min_particles: 50
 
     # Landmark covariance floor (std dev in meters, world frame). Set <= 0 to disable a component.
-    landmark_sigma_floor_x: 0.1
-    landmark_sigma_floor_y: 0.1
+    landmark_sigma_floor_x: 0.0
+    landmark_sigma_floor_y: 0.0
 
     # FASTSLAM 2.0 - measurement-informed pose proposal
-    proposal.enable: true
+    proposal.enable: false
     proposal.min_pose_std_xy: 0.02
     proposal.min_pose_std_yaw: 0.06
 
     # Template soft prior (weight updates)
     template_prior.enable: true
-    template_prior.sigma_s: 0.7
-    template_prior.sigma_d: 0.15
+    template_prior.sigma_s: 0.2
+    template_prior.sigma_d: 0.1
     template_prior.decay_k: 1.2
-    template_prior.max_seen: 12
-    template_prior.w: 2.0
+    template_prior.max_seen: 100
+    template_prior.w: 3.0
 
     # Message lag
     meas_max_lag_sec: 0.5
     odom_history_sec: 20.0
 
     # Debugging
-    debug.csv_enable: false
+    debug.csv_enable: true
     debug.log_every_n_meas: 0
-    debug.csv_path: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
+    #debug.csv_path: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
     debug.csv_flush_every_n: 1
+    debug.print_measurement_stamp: false
 
 odom_reframer:
   ros__parameters:
