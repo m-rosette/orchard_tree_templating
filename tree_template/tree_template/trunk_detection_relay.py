@@ -147,7 +147,7 @@ class TrunkDetectionRelay(Node):
                     bad_width = int(np.sum(~np.isfinite(widths) | (widths < self.min_trunk_width)))
                     parts.append(f"bad_width={bad_width} (<{self.min_trunk_width:.3f}m)")
 
-                self.get_logger().warn("Detection filtering: " + ", ".join(parts))
+                self.get_logger().debug("Detection filtering: " + ", ".join(parts))
 
         if kept == 0:
             return
