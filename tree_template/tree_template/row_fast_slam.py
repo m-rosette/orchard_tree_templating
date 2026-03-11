@@ -10,6 +10,7 @@ import math
 import time
 from collections import defaultdict, deque
 from pathlib import Path
+import threading
 
 import numpy as np
 # scipy.spatial.transform.Rotation removed — yaw extracted directly via math.atan2 (faster)
@@ -341,6 +342,7 @@ class RowFastSLAMNode(Node):
             self.get_parameter("template_origin_from_first_measurement").value
         )
         self._template_origin_anchored = False
+        self._pf_ready_to_init = False
         self.declare_parameter("template_origin_min_hits", 1)
         self.template_origin_min_hits = int(self.get_parameter("template_origin_min_hits").value)
         if self.template_origin_min_hits < 1:
@@ -533,6 +535,8 @@ class RowFastSLAMNode(Node):
 
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, odom_qos, callback_group=self.cb_odom)
         self.meas_sub = self.create_subscription(TrunkInfo, self.measurement_topic, self.measurement_callback, meas_qos, callback_group=self.cb_meas)
+
+        self._init_lock = threading.Lock()
 
         self.get_logger().info(
             "RowFastSLAMNode started.\n"
@@ -728,55 +732,76 @@ class RowFastSLAMNode(Node):
         Re-anchor row_origin_xy so that template slot 0 lands exactly at mu_world_first.
         This is intended to run ONCE, early, before any meaningful landmark updates.
         """
-        if self._template_origin_anchored:
-            return
-        if not self.use_template_map:
-            return
+        with self._init_lock:
+            if self._template_origin_anchored:
+                return
+            if not self.use_template_map:
+                return
 
-        mu_world_first = np.asarray(mu_world_first, dtype=float).reshape(2,)
+            mu_world_first = np.asarray(mu_world_first, dtype=float).reshape(2,)
 
-        # Slot-0 lateral offset from template (near/far)
-        d0 = float(self._template_d_for_slot(0))
+            # Slot-0 lateral offset from template (near/far)
+            d0 = float(self._template_d_for_slot(0))
 
-        # We want:
-        #   mu0 = row_origin_xy + row_origin_s * t_hat_assoc + d0 * n_hat_assoc = mu_world_first
-        # => row_origin_xy = mu_world_first - row_origin_s*t_hat_assoc - d0*n_hat_assoc
-        old_origin = self.row_origin_xy.copy()
+            # We want:
+            #   mu0 = row_origin_xy + row_origin_s * t_hat_assoc + d0 * n_hat_assoc = mu_world_first
+            # => row_origin_xy = mu_world_first - row_origin_s*t_hat_assoc - d0*n_hat_assoc
+            old_origin = self.row_origin_xy.copy()
 
-        self.row_origin_xy = (
-            mu_world_first
-            - float(self.row_origin_s) * self.t_hat_assoc
-            - d0 * self.n_hat_assoc
-        ).astype(float)
+            self.row_origin_xy = (
+                mu_world_first
+                - float(self.row_origin_s) * self.t_hat_assoc
+                - d0 * self.n_hat_assoc
+            ).astype(float)
 
-        # Use this as the stable association origin too
-        self.assoc_origin_xy = self.row_origin_xy.copy()
-        self.assoc_origin_s = float(self.row_origin_s)
-        self.assoc_last_slot = 0
+            # Use this as the stable association origin too
+            self.assoc_origin_xy = self.row_origin_xy.copy()
+            self.assoc_origin_s = float(self.row_origin_s)
+            self.assoc_last_slot = 0
 
-        # Re-seed ALL template landmarks to match the new origin.
-        # Safe because we run this only once (early).
-        Sigma0 = self._sigma_world_from_row_sigmas()
-        for p in self.particles:
-            for j, lm in p.landmarks.items():
-                j = int(j)
-                d_j = float(self._template_d_for_slot(j))
-                s_j = float(self.row_origin_s) + float(j) * float(self.slot_spacing)
-                mu_j = self.row_origin_xy + s_j * self.t_hat_assoc + d_j * self.n_hat_assoc
-                lm.mu = mu_j.astype(float)
-                # Keep covariance reasonable for unseen landmarks
-                if lm.seen_count <= 0:
-                    lm.Sigma = Sigma0.copy()
+            # Re-seed ALL template landmarks to match the new origin.
+            # Safe because we run this only once (early).
+            Sigma0 = self._sigma_world_from_row_sigmas()
+            for p in self.particles:
+                for j, lm in p.landmarks.items():
+                    j = int(j)
+                    d_j = float(self._template_d_for_slot(j))
+                    s_j = float(self.row_origin_s) + float(j) * float(self.slot_spacing)
+                    mu_j = self.row_origin_xy + s_j * self.t_hat_assoc + d_j * self.n_hat_assoc
+                    lm.mu = mu_j.astype(float)
+                    # Keep covariance reasonable for unseen landmarks
+                    if lm.seen_count <= 0:
+                        lm.Sigma = Sigma0.copy()
 
-        self._template_origin_anchored = True
+            self._template_origin_anchored = True
+            self._pf_ready_to_init = True
 
-        self.get_logger().info(
-            "Anchored template origin to first measurement: "
-            f"old_origin=[{old_origin[0]:.3f},{old_origin[1]:.3f}] -> "
-            f"new_origin=[{self.row_origin_xy[0]:.3f},{self.row_origin_xy[1]:.3f}]"
-        )
-        
-        self._log_row_geometry("post-anchor")
+            # Initialize particles now, using the last cached odom pose.
+            # This ensures the particle cloud is centered near the first confirmed landmark.
+            if not self._pf_initialized and self._boot_odom_pose is not None:
+                # Drop all odom history older than the boot pose time so that
+                # _lookup_odom_pose doesn't reject the first measurements as "too old".
+                if self._last_odom_time is not None:
+                    t_boot = float(self._last_odom_time)
+                    while self._odom_hist and self._odom_hist[0][0] < t_boot - 1.0:
+                        self._odom_hist.popleft()
+                self._init_particles(self._boot_odom_pose)
+                self.last_odom_pose = self._boot_odom_pose.copy()
+                self._pf_initialized = True
+                self.get_logger().info(
+                    f"Initialized particles at anchor pose x={self._boot_odom_pose[0]:.2f}, "
+                    f"y={self._boot_odom_pose[1]:.2f} (post template anchor)"
+                )
+                self._publish_registry_from_best(force=True)
+                self._publish_odom_from_best(force=True)
+
+            self.get_logger().info(
+                "Anchored template origin to first measurement: "
+                f"old_origin=[{old_origin[0]:.3f},{old_origin[1]:.3f}] -> "
+                f"new_origin=[{self.row_origin_xy[0]:.3f},{self.row_origin_xy[1]:.3f}]"
+            )
+
+            self._log_row_geometry("post-anchor")
     
     def _extend_template_slots_to(self, new_max_slot: int) -> None:
         """
@@ -960,31 +985,43 @@ class RowFastSLAMNode(Node):
         if self._pf_initialized:
             return False
 
-        if not np.isfinite(self.row_origin_xy).all():
-            self.row_origin_xy = cur_pose[0:2].copy()
+        with self._init_lock:
+            if self._pf_initialized:
+                return False
 
-        self.last_odom_pose = cur_pose.copy()
-        self._init_particles(cur_pose)
-        self._pf_initialized = True
+            # If anchoring from first measurement, defer until the measurement
+            # thread confirms the template origin. Keep _boot_odom_pose fresh
+            # so that when the anchor fires it has the best available pose.
+            if self.use_template_map and self.template_origin_from_first_measurement:
+                if not self._pf_ready_to_init:
+                    self._boot_odom_pose = cur_pose.copy()
+                    return False
 
-        if self.use_template_map:
-            if self.template_origin_from_first_measurement:
-                self.assoc_origin_xy = None
-                self.assoc_origin_s = None
-                self.assoc_last_slot = None
-            else:
-                self.assoc_origin_xy = self.row_origin_xy.copy()
-                self.assoc_origin_s  = float(self.row_origin_s)
-                self.assoc_last_slot = 0
+            if not np.isfinite(self.row_origin_xy).all():
+                self.row_origin_xy = cur_pose[0:2].copy()
 
-        self.get_logger().info(
-            f"Initialized particles at odom pose x={cur_pose[0]:.2f}, y={cur_pose[1]:.2f}, yaw={cur_pose[2]:.2f} rad"
-        )
+            self.last_odom_pose = cur_pose.copy()
+            self._init_particles(cur_pose)
+            self._pf_initialized = True
 
-        if self.use_template_map:
-            self._publish_registry_from_best(force=True)
-        self._publish_odom_from_best(force=True)
-        return True
+            if self.use_template_map:
+                if self.template_origin_from_first_measurement:
+                    self.assoc_origin_xy = None
+                    self.assoc_origin_s  = None
+                    self.assoc_last_slot = None
+                else:
+                    self.assoc_origin_xy = self.row_origin_xy.copy()
+                    self.assoc_origin_s  = float(self.row_origin_s)
+                    self.assoc_last_slot = 0
+
+            self.get_logger().info(
+                f"Initialized particles at odom pose x={cur_pose[0]:.2f}, y={cur_pose[1]:.2f}, yaw={cur_pose[2]:.2f} rad"
+            )
+
+            if self.use_template_map:
+                self._publish_registry_from_best(force=True)
+            self._publish_odom_from_best(force=True)
+            return True
 
     def _motion_noise_std(self, v: float, omega: float, dt: float) -> np.ndarray:
         dx_expected = abs(v) * dt
@@ -1013,10 +1050,18 @@ class RowFastSLAMNode(Node):
             self._boot_odom_pose = cur_pose.copy()
             return
 
-        # Once row axis is ready, initialize PF once
+        # Once row axis is ready, attempt PF initialization (may defer if waiting
+        # for template anchor from first measurement)
         if self._ensure_initialized_from_odom(cur_pose):
             return
 
+        # PF is not yet initialized (deferred pending template anchor) — keep
+        # boot pose fresh and skip the motion update entirely until ready.
+        if not self._pf_initialized:
+            self._boot_odom_pose = cur_pose.copy()
+            return
+
+        # --- Motion update ---
         prev_odom = self.last_odom_pose.copy()
         dx_w = float(cur_pose[0] - prev_odom[0])
         dy_w = float(cur_pose[1] - prev_odom[1])
@@ -1161,19 +1206,12 @@ class RowFastSLAMNode(Node):
         if getattr(self, "debug_print_measurement_stamp", False):
             self.get_logger().info(f"Measurement stamp: {t_meas_sec:.6f}")
 
-        if not self.particles or self.last_odom_pose is None:
+        # We need at least a row axis and a boot pose to do anything useful.
+        # Note: we do NOT require self.particles here — if template_origin_from_first_measurement
+        # is on, particles don't exist yet and we still need to accumulate slot-0 hits.
+        if not self._row_axis_initialized or self._boot_odom_pose is None:
             self._dbg_reject("uninitialized")
             return
-
-        # ---- Time alignment: compute deltas but do NOT write-back rewind/fast-forward ----
-        pose_odom_meas = self._lookup_odom_pose(t_meas_sec)
-        if pose_odom_meas is None:
-            self._dbg_reject("meas_too_old")
-            return
-
-        pose_odom_now = self.last_odom_pose.copy()
-        d_meas_to_now = se2_between(pose_odom_meas, pose_odom_now)
-        d_now_to_meas = se2_inverse(d_meas_to_now)
 
         # ---- Parse measurement (robot frame) ----
         x_fwd = float(msg.pose.position.x)
@@ -1189,9 +1227,46 @@ class RowFastSLAMNode(Node):
             self._dbg_reject("range_gate")
             return
 
+        # ---- Pre-init anchor accumulation (runs before particles exist) ----
+        if (
+            self.use_template_map
+            and self.template_origin_from_first_measurement
+            and not self._template_origin_anchored
+        ):
+            # Use boot pose directly — no particles yet, no odom history alignment needed
+            mu_world_approx = self._world_from_robot(self._boot_odom_pose, z)
+            self._template_origin_hit_count += 1
+            self._template_origin_mu_sum += mu_world_approx.reshape(2,)
+
+            if self._template_origin_hit_count >= self.template_origin_min_hits:
+                mu_mean = self._template_origin_mu_sum / float(self._template_origin_hit_count)
+                self.get_logger().info(
+                    f"Anchoring template origin using mean of "
+                    f"{self._template_origin_hit_count} hits (boot pose)."
+                )
+                self._anchor_template_origin_to_first_meas(mu_mean)
+
+            # Either way, we can't do a FastSLAM update yet — particles don't exist.
+            return
+
+        # ---- Full FastSLAM update (particles must exist) ----
+        if not self.particles or self.last_odom_pose is None:
+            self._dbg_reject("uninitialized")
+            return
+
+        # ---- Time alignment ----
+        pose_odom_meas = self._lookup_odom_pose(t_meas_sec)
+        if pose_odom_meas is None:
+            self._dbg_reject("meas_too_old")
+            return
+
+        pose_odom_now = self.last_odom_pose.copy()
+        d_meas_to_now = se2_between(pose_odom_meas, pose_odom_now)
+        d_now_to_meas = se2_inverse(d_meas_to_now)
+
         w_meas = float(msg.width) if np.isfinite(msg.width) else None
 
-        # ---- Slot association at MEASUREMENT time (pass d_now_to_meas) ----
+        # ---- Slot association ----
         slot_j, mu_world_approx = self._data_association_slot(z, d_now_to_meas=d_now_to_meas)
         if slot_j is None or mu_world_approx is None:
             self._dbg_reject("assoc_failed")
