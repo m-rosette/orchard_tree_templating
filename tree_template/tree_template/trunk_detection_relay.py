@@ -175,7 +175,7 @@ class TrunkDetectionRelay(Node):
         # Build point in camera OPTICAL frame for TF:
         # Optical: X=RIGHT, Y=DOWN, Z=FORWARD(depth)
         pos_cam = np.empty((n, 3), dtype=np.float64)
-        pos_cam[:, 0] = -x         # optical X (RIGHT)
+        pos_cam[:, 0] = x         # optical X (RIGHT)
         pos_cam[:, 1] = 0.0       # optical Y (DOWN)
         pos_cam[:, 2] = z_depth   # optical Z (FORWARD / depth)
 
@@ -197,7 +197,7 @@ class TrunkDetectionRelay(Node):
 
         for i in range(n):
             bx = float(p_base[i, 0])  # base X
-            by = float(p_base[i, 1])  # base Y
+            by = -float(p_base[i, 1])  # base Y
 
             ti = TrunkInfo()
             ti.pose = Pose()

@@ -236,6 +236,11 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("row_dir_sign", 1)            # (+1 => +X, -1 => -X)
         self.declare_parameter("max_back_assoc", 2)
         self.declare_parameter("max_fwd_assoc", 3)
+
+        # Row-relative particle initialisation spread
+        self.declare_parameter("init_sigma_s",   1.5)
+        self.declare_parameter("init_sigma_d",   0.25)
+        self.declare_parameter("init_sigma_yaw", 0.03)
         
         self.declare_parameter("start_side", "near")       # slot 0 side (for template parity)
         self.declare_parameter("init_d_near", 0.0)
@@ -254,10 +259,20 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("motion_noise.c_lat", 0.12)
         self.declare_parameter("motion_noise.a_rot", 0.05)
         self.declare_parameter("motion_noise.b_rot", 0.08)
+        self.declare_parameter("motion_noise.x_floor", 1e-4)
+        self.declare_parameter("motion_noise.y_floor", 1e-4)
+        self.declare_parameter("motion_noise.yaw_floor", 1e-4)
 
         # Resampling
         self.declare_parameter("resample_interval", 75) # 0 disables
         self.declare_parameter("neff_ratio_threshold", 0.5)
+        self.declare_parameter("resample_burn_in", 15)
+
+        self.declare_parameter("spacing_propagation.enable",     True)
+        self.declare_parameter("spacing_propagation.min_seen",   8)
+        self.declare_parameter("spacing_propagation.max_unseen", 10)
+        self.declare_parameter("spacing_propagation.alpha",      0.2)
+        self.declare_parameter("spacing_propagation.n_hops",     2)
 
         # Semantic side memory
         self.declare_parameter("semantic_side_min_votes", 3)
@@ -304,7 +319,6 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("odom_history_sec", 20.0)
 
         # ---------- Publish throttle ----------
-        # Minimum wall-clock seconds between successive publishes of each topic.
         self.declare_parameter("publish.registry_min_interval", 0.1)   # 10 Hz default
         self.declare_parameter("publish.odom_min_interval",     0.05)   # 20 Hz default
 
@@ -313,7 +327,6 @@ class RowFastSLAMNode(Node):
 
         self._registry_min_interval = float(self.get_parameter("publish.registry_min_interval").value)
         self._odom_min_interval     = float(self.get_parameter("publish.odom_min_interval").value)
-        # Wall-clock timestamps of last successful publish (seconds, monotonic via time.monotonic)
         self._last_registry_pub_t: float = 0.0
         self._last_odom_pub_t:     float = 0.0
 
@@ -366,7 +379,6 @@ class RowFastSLAMNode(Node):
         if self.max_extra_slots < 0:
             self.max_extra_slots = 0
 
-
         self.row_origin_xy = np.array(
             [
                 float(self.get_parameter("row_origin_x").value),
@@ -381,6 +393,10 @@ class RowFastSLAMNode(Node):
 
         self.max_back_assoc = int(self.get_parameter("max_back_assoc").value)
         self.max_fwd_assoc = int(self.get_parameter("max_fwd_assoc").value)
+
+        self.init_sigma_s   = float(self.get_parameter("init_sigma_s").value)
+        self.init_sigma_d   = float(self.get_parameter("init_sigma_d").value)
+        self.init_sigma_yaw = float(self.get_parameter("init_sigma_yaw").value)
 
         self.start_side = str(self.get_parameter("start_side").value).strip().lower()
         self.init_d_near = float(self.get_parameter("init_d_near").value)
@@ -405,9 +421,19 @@ class RowFastSLAMNode(Node):
         self.c_lat = float(self.get_parameter("motion_noise.c_lat").value)
         self.a_rot = float(self.get_parameter("motion_noise.a_rot").value)
         self.b_rot = float(self.get_parameter("motion_noise.b_rot").value)
+        self.x_floor = float(self.get_parameter("motion_noise.x_floor").value)
+        self.y_floor = float(self.get_parameter("motion_noise.y_floor").value)
+        self.yaw_floor = float(self.get_parameter("motion_noise.yaw_floor").value)
 
         self.resample_interval = int(self.get_parameter("resample_interval").value)
         self.neff_ratio_threshold = float(self.get_parameter("neff_ratio_threshold").value)
+        self.resample_burn_in = int(self.get_parameter("resample_burn_in").value)
+
+        self._spacing_prop_enable    = bool(self.get_parameter("spacing_propagation.enable").value)
+        self._spacing_prop_min_seen  = int(self.get_parameter("spacing_propagation.min_seen").value)
+        self._spacing_prop_max_unseen = int(self.get_parameter("spacing_propagation.max_unseen").value)
+        self._spacing_prop_alpha     = float(self.get_parameter("spacing_propagation.alpha").value)
+        self._spacing_prop_n_hops    = int(self.get_parameter("spacing_propagation.n_hops").value)
 
         self.semantic_side_min_votes = int(self.get_parameter("semantic_side_min_votes").value)
         self.semantic_side_fallback = str(self.get_parameter("semantic_side_fallback").value).strip().lower()
@@ -588,6 +614,18 @@ class RowFastSLAMNode(Node):
             self._dbg_csv_fp = None
             self._dbg_csv = None
 
+    def _log_row_geometry(self, label: str = "") -> None:
+        """Diagnostic: log row coordinate system geometry."""
+        label_str = f" ({label})" if label else ""
+        self.get_logger().info(
+            f"Row geometry{label_str}: "
+            f"origin=[{self.row_origin_xy[0]:.3f}, {self.row_origin_xy[1]:.3f}], "
+            f"t_hat=[{self.t_hat_assoc[0]:.4f}, {self.t_hat_assoc[1]:.4f}], "
+            f"n_hat=[{self.n_hat_assoc[0]:.4f}, {self.n_hat_assoc[1]:.4f}], "
+            f"slot_spacing={self.slot_spacing:.3f}, "
+            f"origin_s={self.row_origin_s:.3f}"
+        )
+
     def _best_particle(self) -> Optional[Particle]:
         if not self.particles:
             return None
@@ -737,6 +775,8 @@ class RowFastSLAMNode(Node):
             f"old_origin=[{old_origin[0]:.3f},{old_origin[1]:.3f}] -> "
             f"new_origin=[{self.row_origin_xy[0]:.3f},{self.row_origin_xy[1]:.3f}]"
         )
+        
+        self._log_row_geometry("post-anchor")
     
     def _extend_template_slots_to(self, new_max_slot: int) -> None:
         """
@@ -950,13 +990,9 @@ class RowFastSLAMNode(Node):
         dx_expected = abs(v) * dt
         dtheta_expected = abs(omega) * dt
 
-        x_floor = 1e-4
-        y_floor = 1e-4
-        theta_floor = 1e-4
-
-        sigma_fwd = (self.a_trans * dx_expected) + (self.b_trans * dtheta_expected) + x_floor
-        sigma_lat = (self.c_lat * dx_expected) + y_floor
-        sigma_theta = (self.a_rot * dtheta_expected) + (self.b_rot * dx_expected) + theta_floor
+        sigma_fwd = (self.a_trans * dx_expected) + (self.b_trans * dtheta_expected) + self.x_floor
+        sigma_lat = (self.c_lat * dx_expected) + self.y_floor
+        sigma_theta = (self.a_rot * dtheta_expected) + (self.b_rot * dx_expected) + self.yaw_floor
         return np.array([sigma_fwd, sigma_lat, sigma_theta], dtype=float)
 
     @profile
@@ -969,8 +1005,6 @@ class RowFastSLAMNode(Node):
         t_odom = self._stamp_to_sec(msg.header.stamp)
         self._odom_hist.append((t_odom, cur_pose.copy()))
         self._prune_odom_hist(t_odom)
-
-        # self.get_logger().warn(f"Odom stamp: {msg.header.stamp}")
 
         self._maybe_init_row_axis_from_odom(cur_pose[2])
 
@@ -1064,13 +1098,47 @@ class RowFastSLAMNode(Node):
                 landmarks_template[j] = LandmarkEKF(mu=mu0.copy(), Sigma=Sigma0.copy())
 
         # Shared pose/weight arrays (fast vectorized propagation + resampling)
-        self._poses = np.zeros((self.num_particles, 3), dtype=np.float64)
+        self._poses   = np.zeros((self.num_particles, 3), dtype=np.float64)
         self._weights = np.full((self.num_particles,), 1.0 / float(self.num_particles), dtype=np.float64)
 
-        # Initialize poses with small jitter — use fast _rng
-        self._poses[:] = init_pose.reshape(1, 3)
-        self._poses[:, 0:2] += self._rng.standard_normal((self.num_particles, 2)) * 0.01
-        self._poses[:, 2] = (self._poses[:, 2] + self._rng.standard_normal(self.num_particles) * 0.005 + np.pi) % (2.0 * np.pi) - np.pi
+        N = self.num_particles
+
+        # ------------------------------------------------------------------
+        # Row-relative particle initialisation
+        # ------------------------------------------------------------------
+        s_offsets   = self._rng.standard_normal(N) * self.init_sigma_s
+        d_offsets   = self._rng.standard_normal(N) * self.init_sigma_d
+        yaw_offsets = self._rng.standard_normal(N) * self.init_sigma_yaw
+
+        # Rotate (s, d) offsets from row frame into world-frame displacement
+        world_dx = s_offsets * self.t_hat_assoc[0] + d_offsets * self.n_hat_assoc[0]
+        world_dy = s_offsets * self.t_hat_assoc[1] + d_offsets * self.n_hat_assoc[1]
+
+        self._poses[:, 0] = float(init_pose[0]) + world_dx
+        self._poses[:, 1] = float(init_pose[1]) + world_dy
+        self._poses[:, 2] = (float(init_pose[2]) + yaw_offsets + np.pi) % (2.0 * np.pi) - np.pi
+
+        # ------------------------------------------------------------------
+        # Temporarily widen the slot association window so that particles
+        # spread across multiple slots can each find a valid association.
+        # Covers 3-sigma of the s distribution; restores after the filter
+        # has had time to converge.
+        # ------------------------------------------------------------------
+        self._init_max_back_assoc_saved = self.max_back_assoc
+        self._init_max_fwd_assoc_saved  = self.max_fwd_assoc
+        self._init_assoc_restore_at     = max(3, self.num_slots // 3)
+
+        s_slots = math.ceil(3.0 * self.init_sigma_s / max(float(self.slot_spacing), 1e-3))
+        self.max_back_assoc = max(self.max_back_assoc, s_slots)
+        self.max_fwd_assoc  = max(self.max_fwd_assoc,  s_slots)
+
+        self.get_logger().info(
+            f"Row-relative particle init: "
+            f"sigma_s={self.init_sigma_s:.2f}m  sigma_d={self.init_sigma_d:.2f}m  "
+            f"sigma_yaw={self.init_sigma_yaw:.4f}rad | "
+            f"assoc window widened to ±{s_slots} slots, "
+            f"restores after {self._init_assoc_restore_at} measurements"
+        )
 
         self.particles = []
         for i in range(self.num_particles):
@@ -1106,8 +1174,6 @@ class RowFastSLAMNode(Node):
         pose_odom_now = self.last_odom_pose.copy()
         d_meas_to_now = se2_between(pose_odom_meas, pose_odom_now)
         d_now_to_meas = se2_inverse(d_meas_to_now)
-
-        # No pose mutation here anymore.
 
         # ---- Parse measurement (robot frame) ----
         x_fwd = float(msg.pose.position.x)
@@ -1238,7 +1304,6 @@ class RowFastSLAMNode(Node):
             if (not self.proposal_enable) or (lm.seen_count <= 0):
                 classic_mask[i] = True
 
-        # OPT: Vectorized template-prior logw — replaces N calls to _apply_template_prior_logw
         if _tp_idx and self.use_template_map and self.template_prior_enable:
             tp_idx = np.array(_tp_idx, dtype=np.intp)
             tp_mu = np.column_stack([_tp_mu0, _tp_mu1])   # (M,2)
@@ -1570,6 +1635,9 @@ class RowFastSLAMNode(Node):
                     lm_k.seen_count  += 1
                     lm_k.update_width(w_meas)
 
+            if self._spacing_prop_enable:
+                self._propagate_spacing_prior(slot_j)
+
         # ---- Downstream spacing anchor update ----
         if self.snap_downstream_spacing:
             origin_xy = self.assoc_origin_xy if getattr(self, "assoc_origin_xy", None) is not None else self.row_origin_xy
@@ -1586,9 +1654,22 @@ class RowFastSLAMNode(Node):
                 self.row_origin_s = (1.0 - alpha) * float(self.row_origin_s) + alpha * float(target)
                 self._apply_downstream_spacing(anchor_j=slot_j)
 
+        # ---- Restore association window after init convergence period ----
+        restore_at = getattr(self, "_init_assoc_restore_at", None)
+        if restore_at is not None and self.measurement_count >= restore_at:
+            self.max_back_assoc = self._init_max_back_assoc_saved
+            self.max_fwd_assoc  = self._init_max_fwd_assoc_saved
+            self._init_assoc_restore_at = None  # don't check again
+            self.get_logger().info(
+                f"Association window restored to "
+                f"back={self.max_back_assoc}, fwd={self.max_fwd_assoc} "
+                f"after {self.measurement_count} measurements"
+            )
+
         # ---- Resampling ----
         self.measurement_count += 1
-        if self.resample_interval > 0 and (self.measurement_count % self.resample_interval) == 0:
+        past_burn_in = (self.measurement_count > self.resample_burn_in)
+        if past_burn_in and self.resample_interval > 0 and (self.measurement_count % self.resample_interval) == 0:
             self._maybe_resample()
 
         # ---- Publish ----
@@ -1803,6 +1884,72 @@ class RowFastSLAMNode(Node):
         mu_init = self._world_from_robot(pose, z)
         Sigma_init = np.diag([0.5 ** 2, 0.5 ** 2])
         return LandmarkEKF(mu=mu_init, Sigma=Sigma_init)
+
+    def _propagate_spacing_prior(self, anchor_j: int) -> None:
+        """Propagate updated landmark positions to unseen neighbours via spacing prior.
+
+        After slot anchor_j is updated by a measurement, each particle's estimate
+        of that slot's position is the most accurate it will be until the next
+        observation.  We use it as an anchor to nudge neighbouring slots that
+        haven't been seen much yet, encoding the prior that tree spacing is regular:
+
+            mu_{j±k} ≈ mu_{anchor} ± k * slot_spacing * t_hat
+
+        This is a soft Bayesian nudge — not a hard assignment — controlled by alpha.
+        Only propagates FROM anchor slots with >= min_seen observations (avoids
+        spreading noise from uncertain first-hit estimates) and only TO slots with
+        < max_unseen observations (stops overwriting well-observed landmarks).
+
+        The nudge is applied per-particle so each particle's landmark map stays
+        internally consistent with its own anchor estimate.
+
+        Parameters controlled by spacing_propagation.* ROS params.
+        """
+        if not self.particles:
+            return
+
+        min_seen  = self._spacing_prop_min_seen
+        max_unseen = self._spacing_prop_max_unseen
+        alpha     = self._spacing_prop_alpha
+        n_hops    = self._spacing_prop_n_hops
+        spacing   = float(self.slot_spacing)
+        t0        = float(self.t_hat_assoc[0])
+        t1        = float(self.t_hat_assoc[1])
+
+        for p in self.particles:
+            lm_anchor = p.landmarks.get(anchor_j)
+            if lm_anchor is None or lm_anchor.seen_count < min_seen:
+                continue
+
+            ax = float(lm_anchor.mu[0])
+            ay = float(lm_anchor.mu[1])
+
+            # Propagate to both forward (+) and backward (-) neighbours
+            for direction in (+1, -1):
+                for hop in range(1, n_hops + 1):
+                    nb_j = anchor_j + direction * hop
+                    if nb_j < 0:
+                        continue
+                    lm_nb = p.landmarks.get(nb_j)
+                    if lm_nb is None or lm_nb.seen_count >= max_unseen:
+                        continue
+
+                    # Predicted position of neighbour from anchor + spacing chain
+                    pred_x = ax + direction * hop * spacing * t0
+                    pred_y = ay + direction * hop * spacing * t1
+
+                    # Confidence in the prediction decays with hop distance and
+                    # grows with anchor certainty.  Hops further away get a
+                    # weaker nudge since each step compounds spacing uncertainty.
+                    # Unseen slots (seen_count=0) get the full alpha; slots with
+                    # a few observations get a proportionally smaller nudge so we
+                    # don't undo real measurements.
+                    hop_alpha = alpha / float(hop)
+                    obs_scale = 1.0 - float(lm_nb.seen_count) / float(max_unseen)
+                    effective_alpha = hop_alpha * obs_scale
+
+                    lm_nb.mu[0] = (1.0 - effective_alpha) * float(lm_nb.mu[0]) + effective_alpha * pred_x
+                    lm_nb.mu[1] = (1.0 - effective_alpha) * float(lm_nb.mu[1]) + effective_alpha * pred_y
 
     def _ekf_update_landmark(self, p: Particle, lm: LandmarkEKF, z: np.ndarray, R_meas: np.ndarray):
         """OPT: inlined scalar version — delegates to at-pose variant using particle's current pose."""

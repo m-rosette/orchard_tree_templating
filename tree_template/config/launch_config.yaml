@@ -20,39 +20,45 @@ trunk_detection_relay:
 
 row_fast_slam:
   ros__parameters:
-    num_particles: 1000
+    num_particles: 3000
     measurement_topic: /trunk_measurements_raw
     odom_topic: /odometry/filtered
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
 
     # Slot initialization (map init)
-    slot_spacing: 0.85
+    slot_spacing: 1.2
     num_slots: 60
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_s: 0.0
-    slot_s_gate: 0.6
+    slot_s_gate: 1.0
+
     row_origin_x: .nan
     row_origin_y: .nan
     row_dir_sign: 1
-    row_yaw_init_window: 35
-    min_seen_count_to_publish: 1
+    row_yaw_init_window: 10
+    min_seen_count_to_publish: 5
     snap_downstream_spacing: false
     downstream_snap_mode: unseen_only
     use_template_map: true
     template_origin_from_first_measurement: true
-    template_origin_min_hits: 5
+    template_origin_min_hits: 8
     publish_unseen_template_landmarks: false
     use_global_row_yaw: true
 
-    # Initial covariance - landmark uncertainty
-    prior_sigma_s: 2.0
-    prior_sigma_d: 1.0
+    # Initial covariance - landmark uncertainty (meters, row frame)
+    prior_sigma_s: 0.5
+    prior_sigma_d: 0.3
+
+    # Row-relative particle initialization
+    init_sigma_s: 0.5
+    init_sigma_d: 0.3
+    init_sigma_yaw: 0.03
 
     # Local trunk associations
-    max_back_assoc: 0
-    max_fwd_assoc: 2
+    max_back_assoc: 2
+    max_fwd_assoc: 3
 
     # Trunk row side classification
     start_side: near
@@ -62,44 +68,64 @@ row_fast_slam:
     semantic_side_min_votes: 3
     semantic_side_fallback: fixed
 
-    # Measurement distribution
-    meas_std_y_lat: 2.0
-    meas_std_x_fwd: 3.0
+    # Measurement distribution (meters, robot frame)
+    meas_std_y_lat: 0.3
+    meas_std_x_fwd: 0.35
 
-    # Motion distribution
-    motion_noise.a_trans: 1.2
-    motion_noise.b_trans: 0.3
-    motion_noise.c_lat: 0.3
-    motion_noise.a_rot: 0.1
-    motion_noise.b_rot: 0.15
+    # Motion distribution (robot frame)
+    motion_noise.a_trans: 0.1   # meters of std per meter traveled
+    motion_noise.b_trans: 0.02   # meters of std per radian of rotation
+    motion_noise.c_lat: 0.1     # meters of std for lateral motion (e.g. slip)
+    motion_noise.a_rot: 0.02    # radians of std per radian of rotation
+    motion_noise.b_rot: 0.05     # radians of std per meter traveled
+    motion_noise.x_floor: 1e-4 # minimum motion noise in x to prevent particle deprivation
+    motion_noise.y_floor: 1e-4 # minimum motion noise in y to prevent particle deprivation
+    motion_noise.yaw_floor: 1e-4 # minimum motion noise in yaw to prevent particle deprivation
 
     # Resampling
-    resample_interval: 10
+    resample_interval: 25
     neff_ratio_threshold: 0.5
+    resample_burn_in: 30
 
     # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
     maha_gate_median: 0.0
     maha_gate_min_particles: 50
 
     # Landmark covariance floor (std dev in meters, world frame). Set <= 0 to disable a component.
-    landmark_sigma_floor_x: 0.0
-    landmark_sigma_floor_y: 0.0
+    landmark_sigma_floor_x: 0.3
+    landmark_sigma_floor_y: 0.3
+
+    # Merge neighboring associations
+    publish_merge_duplicates.enable: true
+    publish_merge_duplicates.dist_m: 0.15
+    publish_merge_duplicates.only_adjacent: true
 
     # FASTSLAM 2.0 - measurement-informed pose proposal
     proposal.enable: false
-    proposal.min_pose_std_xy: 0.02
-    proposal.min_pose_std_yaw: 0.06
+    proposal.min_pose_std_xy: 0.08
+    proposal.min_pose_std_yaw: 0.12
 
-    # Template soft prior (weight updates)
-    template_prior.enable: true
-    template_prior.sigma_s: 0.2
-    template_prior.sigma_d: 0.1
-    template_prior.decay_k: 1.2
-    template_prior.max_seen: 100
-    template_prior.w: 3.0
+    # Template soft prior (weight update per landmark)
+    template_prior.enable: false
+    template_prior.sigma_s: 0.75
+    template_prior.sigma_d: 0.75
+    template_prior.decay_k: 1.5
+    template_prior.max_seen: 30
+    template_prior.w: 0.2
+
+    # Inter-landmark spacing propagation
+    spacing_propagation.enable: false
+    spacing_propagation.min_seen: 8     # detections before propagating FROM this slot
+    spacing_propagation.max_unseen: 8  # detections before stop nudging TO this slot
+    spacing_propagation.alpha: 0.1      # nudge strength per hop [0,1]
+    spacing_propagation.n_hops: 1       # how many neighbours each direction
+
+    # Publish throttle
+    publish.registry_min_interval: 0.1   # s  (10 Hz)
+    publish.odom_min_interval: 0.05      # s  (20 Hz)
 
     # Message lag
-    meas_max_lag_sec: 0.5
+    meas_max_lag_sec: 0.0
     odom_history_sec: 20.0
 
     # Debugging
@@ -159,7 +185,7 @@ tree_scene_node:
 
     trellis_angle: -18.435
     branch_spacing: 0.5
-    trellis_frame: map
+    trellis_frame: odom
     trellis_prefix: v_trellis_tree_
 
     registry_topic: fastslam_registry
