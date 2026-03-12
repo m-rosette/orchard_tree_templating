@@ -537,6 +537,7 @@ class RowFastSLAMNode(Node):
         self.meas_sub = self.create_subscription(TrunkInfo, self.measurement_topic, self.measurement_callback, meas_qos, callback_group=self.cb_meas)
 
         self._init_lock = threading.Lock()
+        self._pf_lock = threading.RLock()
 
         self.get_logger().info(
             "RowFastSLAMNode started.\n"
@@ -604,6 +605,36 @@ class RowFastSLAMNode(Node):
             ])
             self._dbg_csv_fp.flush()
 
+        # After the existing debug CSV setup in __init__:
+        self.declare_parameter("debug.landmark_csv_enable", True)
+        self.debug_landmark_csv_enable = bool(self.get_parameter("debug.landmark_csv_enable").value)
+
+        self._dbg_lm_csv_fp = None
+        self._dbg_lm_csv = None
+
+        if self.debug_landmark_csv_enable and self.debug_csv_enable:
+            lm_csv_path = self.debug_csv_path.replace(".csv", "_landmarks.csv")
+            self._dbg_lm_csv_fp = open(lm_csv_path, "w", newline="")
+            self._dbg_lm_csv = csv.writer(self._dbg_lm_csv_fp)
+            self._dbg_lm_csv.writerow([
+                "t_sec",
+                "meas_idx",
+                "slot_j",           # which slot triggered this write
+                "lm_slot",          # landmark slot index
+                "seen_count",
+                # Best-particle landmark mean in row frame
+                "mu_s",
+                "mu_d",
+                # Best-particle landmark mean in world frame (for cross-checking)
+                "mu_x",
+                "mu_y",
+                # Row-frame covariance (projected from world-frame Sigma)
+                "sigma_ss",         # variance along row
+                "sigma_dd",         # variance lateral
+                "sigma_sd",         # covariance (asymmetry)
+            ])
+            self._dbg_lm_csv_fp.flush()
+
     def _dbg_reject(self, key: str) -> None:
         if getattr(self, "debug_csv_enable", False):
             self._dbg_reject_counts[key] += 1
@@ -617,6 +648,82 @@ class RowFastSLAMNode(Node):
                 pass
             self._dbg_csv_fp = None
             self._dbg_csv = None
+
+    def _dbg_write_landmarks(self, t_sec: float, meas_idx: int, slot_j: int) -> None:
+        if not self.debug_landmark_csv_enable or self._dbg_lm_csv is None:
+            return
+
+        p_best = self._best_particle()
+        if p_best is None:
+            return
+
+        # Option 1: Only write the landmark that was just measured
+        lm = p_best.landmarks.get(slot_j)
+        if lm is None or lm.seen_count < 1:
+            return  # skip if landmark doesn't exist or hasn't been observed
+
+        mu_s, mu_d, sigma_ss, sigma_dd, sigma_sd = self._landmark_to_row_frame(lm)
+
+        row = [
+            f"{t_sec:.6f}",
+            meas_idx,
+            slot_j,
+            slot_j,  # lm_slot is the same as slot_j since we're only writing the measured one
+            lm.seen_count,
+            f"{mu_s:.4f}",
+            f"{mu_d:.4f}",
+            f"{float(lm.mu[0]):.4f}",
+            f"{float(lm.mu[1]):.4f}",
+            f"{sigma_ss:.6f}",
+            f"{sigma_dd:.6f}",
+            f"{sigma_sd:.6f}",
+        ]
+
+        self._dbg_lm_csv.writerow(row)
+
+        # Flush on the same cadence as the main CSV
+        self._dbg_csv_rows_since_flush += 1
+        if self._dbg_csv_rows_since_flush >= self.debug_csv_flush_every_n:
+            if self._dbg_lm_csv_fp:
+                self._dbg_lm_csv_fp.flush()
+
+    def _dbg_close(self) -> None:
+        for fp_attr in ("_dbg_csv_fp", "_dbg_lm_csv_fp"):
+            fp = getattr(self, fp_attr, None)
+            if fp is not None:
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+                setattr(self, fp_attr, None)
+        self._dbg_csv = None
+        self._dbg_lm_csv = None
+
+    def _landmark_to_row_frame(self, lm: LandmarkEKF) -> Tuple[float, float, float, float, float]:
+        """
+        Project landmark EKF mean and covariance into row coordinates.
+        Returns (mu_s, mu_d, sigma_ss, sigma_dd, sigma_sd).
+        
+        Row frame: s = along t_hat_assoc, d = along n_hat_assoc.
+        The projection is J @ Sigma @ J.T where J = [t_hat; n_hat] (2x2 rotation).
+        """
+        t = self.t_hat_assoc  # (2,)
+        n = self.n_hat_assoc  # (2,)
+
+        # Mean in row frame (relative to assoc origin)
+        origin = self.assoc_origin_xy if getattr(self, "assoc_origin_xy", None) is not None \
+                else self.row_origin_xy
+        delta = lm.mu - origin  # (2,)
+        mu_s = float(np.dot(delta, t))
+        mu_d = float(np.dot(delta, n))
+
+        # Covariance projection: J Sigma J^T, J = [[t0,t1],[n0,n1]]
+        S = lm.Sigma  # (2,2)
+        sigma_ss = float(t @ S @ t)
+        sigma_dd = float(n @ S @ n)
+        sigma_sd = float(t @ S @ n)
+
+        return mu_s, mu_d, sigma_ss, sigma_dd, sigma_sd
 
     def _log_row_geometry(self, label: str = "") -> None:
         """Diagnostic: log row coordinate system geometry."""
@@ -1034,94 +1141,95 @@ class RowFastSLAMNode(Node):
 
     @profile
     def odom_callback(self, msg: Odometry):
-        self._last_odom_msg = msg
-        cur_pose = se2_from_odom(msg)
-        dt = self._dt_from_stamp(msg.header.stamp)
+        with self._pf_lock:
+            self._last_odom_msg = msg
+            cur_pose = se2_from_odom(msg)
+            dt = self._dt_from_stamp(msg.header.stamp)
 
-        # Cache odom for delayed measurement alignment
-        t_odom = self._stamp_to_sec(msg.header.stamp)
-        self._odom_hist.append((t_odom, cur_pose.copy()))
-        self._prune_odom_hist(t_odom)
+            # Cache odom for delayed measurement alignment
+            t_odom = self._stamp_to_sec(msg.header.stamp)
+            self._odom_hist.append((t_odom, cur_pose.copy()))
+            self._prune_odom_hist(t_odom)
 
-        self._maybe_init_row_axis_from_odom(cur_pose[2])
+            self._maybe_init_row_axis_from_odom(cur_pose[2])
 
-        # While bootstrapping row axis, just cache odom and do nothing else
-        if not self._row_axis_initialized:
-            self._boot_odom_pose = cur_pose.copy()
-            return
+            # While bootstrapping row axis, just cache odom and do nothing else
+            if not self._row_axis_initialized:
+                self._boot_odom_pose = cur_pose.copy()
+                return
 
-        # Once row axis is ready, attempt PF initialization (may defer if waiting
-        # for template anchor from first measurement)
-        if self._ensure_initialized_from_odom(cur_pose):
-            return
+            # Once row axis is ready, attempt PF initialization (may defer if waiting
+            # for template anchor from first measurement)
+            if self._ensure_initialized_from_odom(cur_pose):
+                return
 
-        # PF is not yet initialized (deferred pending template anchor) — keep
-        # boot pose fresh and skip the motion update entirely until ready.
-        if not self._pf_initialized:
-            self._boot_odom_pose = cur_pose.copy()
-            return
+            # PF is not yet initialized (deferred pending template anchor) — keep
+            # boot pose fresh and skip the motion update entirely until ready.
+            if not self._pf_initialized:
+                self._boot_odom_pose = cur_pose.copy()
+                return
 
-        # --- Motion update ---
-        prev_odom = self.last_odom_pose.copy()
-        dx_w = float(cur_pose[0] - prev_odom[0])
-        dy_w = float(cur_pose[1] - prev_odom[1])
-        dyaw = wrap_angle(float(cur_pose[2] - prev_odom[2]))
+            # --- Motion update ---
+            prev_odom = self.last_odom_pose.copy()
+            dx_w = float(cur_pose[0] - prev_odom[0])
+            dy_w = float(cur_pose[1] - prev_odom[1])
+            dyaw = wrap_angle(float(cur_pose[2] - prev_odom[2]))
 
-        c0 = float(np.cos(prev_odom[2]))
-        s0 = float(np.sin(prev_odom[2]))
-        d_fwd = c0 * dx_w + s0 * dy_w
-        d_lat = -s0 * dx_w + c0 * dy_w
+            c0 = float(np.cos(prev_odom[2]))
+            s0 = float(np.sin(prev_odom[2]))
+            d_fwd = c0 * dx_w + s0 * dy_w
+            d_lat = -s0 * dx_w + c0 * dy_w
 
-        self.last_odom_pose = cur_pose.copy()
+            self.last_odom_pose = cur_pose.copy()
 
-        if not self.particles:
-            self._init_particles(cur_pose)
-            self._publish_odom_from_best(force=True)
-            return
+            if not self.particles:
+                self._init_particles(cur_pose)
+                self._publish_odom_from_best(force=True)
+                return
 
-        v = float(msg.twist.twist.linear.x)
-        omega = float(msg.twist.twist.angular.z)
-        noise_std = self._motion_noise_std(v, omega, dt)  # [fwd, lat, yaw]
-        self._last_motion_std_body = noise_std.copy()
+            v = float(msg.twist.twist.linear.x)
+            omega = float(msg.twist.twist.angular.z)
+            noise_std = self._motion_noise_std(v, omega, dt)  # [fwd, lat, yaw]
+            self._last_motion_std_body = noise_std.copy()
 
-        # Vectorized motion update across all particles (poses live in shared array)
-        poses = getattr(self, "_poses", None)
-        if poses is None:
-            # Backward safety: fall back to per-particle update if poses not initialized
-            for p in self.particles:
-                eps = noise_std * np.random.randn(3)
-                df = float(d_fwd + eps[0])
-                dl = float(d_lat + eps[1])
-                dth = float(dyaw + eps[2])
+            # Vectorized motion update across all particles (poses live in shared array)
+            poses = getattr(self, "_poses", None)
+            if poses is None:
+                # Backward safety: fall back to per-particle update if poses not initialized
+                for p in self.particles:
+                    eps = noise_std * np.random.randn(3)
+                    df = float(d_fwd + eps[0])
+                    dl = float(d_lat + eps[1])
+                    dth = float(dyaw + eps[2])
 
-                cy = float(np.cos(p.pose[2]))
-                sy = float(np.sin(p.pose[2]))
+                    cy = float(np.cos(p.pose[2]))
+                    sy = float(np.sin(p.pose[2]))
 
-                p.pose[0] += cy * df - sy * dl
-                p.pose[1] += sy * df + cy * dl
-                p.pose[2] = wrap_angle(float(p.pose[2] + dth))
-        else:
-            N = poses.shape[0]
+                    p.pose[0] += cy * df - sy * dl
+                    p.pose[1] += sy * df + cy * dl
+                    p.pose[2] = wrap_angle(float(p.pose[2] + dth))
+            else:
+                N = poses.shape[0]
 
-            eps = self._rng.standard_normal((N, 3))
-            eps *= noise_std  # in-place broadcast
-            df = d_fwd + eps[:, 0]
-            dl = d_lat + eps[:, 1]
-            dth = dyaw + eps[:, 2]
+                eps = self._rng.standard_normal((N, 3))
+                eps *= noise_std  # in-place broadcast
+                df = d_fwd + eps[:, 0]
+                dl = d_lat + eps[:, 1]
+                dth = dyaw + eps[:, 2]
 
-            th = poses[:, 2]
-            self._ensure_work_buffers(N)
-            c = self._work_cos[:N]
-            s = self._work_sin[:N]
-            np.cos(th, out=c)
-            np.sin(th, out=s)
+                th = poses[:, 2]
+                self._ensure_work_buffers(N)
+                c = self._work_cos[:N]
+                s = self._work_sin[:N]
+                np.cos(th, out=c)
+                np.sin(th, out=s)
 
-            poses[:, 0] += c * df - s * dl
-            poses[:, 1] += s * df + c * dl
-            poses[:, 2] = (th + dth + np.pi) % (2.0 * np.pi) - np.pi
+                poses[:, 0] += c * df - s * dl
+                poses[:, 1] += s * df + c * dl
+                poses[:, 2] = (th + dth + np.pi) % (2.0 * np.pi) - np.pi
 
-        self._publish_odom_from_best()
-    
+            self._publish_odom_from_best()
+        
     def _init_particles(self, init_pose: np.ndarray):
         # Lock association axis on first initialization so slot coordinates don't drift mid-run
         if not getattr(self, "assoc_axis_locked", False):
@@ -1145,6 +1253,9 @@ class RowFastSLAMNode(Node):
         # Shared pose/weight arrays (fast vectorized propagation + resampling)
         self._poses   = np.zeros((self.num_particles, 3), dtype=np.float64)
         self._weights = np.full((self.num_particles,), 1.0 / float(self.num_particles), dtype=np.float64)
+
+        # Force work buffers to be reallocated on next use
+        self._work_N = 0
 
         N = self.num_particles
 
@@ -1202,554 +1313,552 @@ class RowFastSLAMNode(Node):
     # =========================================================
     @profile
     def measurement_callback(self, msg: TrunkInfo):
-        t_meas_sec = self._meas_time_sec(msg)
-        if getattr(self, "debug_print_measurement_stamp", False):
-            self.get_logger().info(f"Measurement stamp: {t_meas_sec:.6f}")
+        with self._pf_lock:
+            t_meas_sec = self._meas_time_sec(msg)
+            if getattr(self, "debug_print_measurement_stamp", False):
+                self.get_logger().info(f"Measurement stamp: {t_meas_sec:.6f}")
 
-        # We need at least a row axis and a boot pose to do anything useful.
-        # Note: we do NOT require self.particles here — if template_origin_from_first_measurement
-        # is on, particles don't exist yet and we still need to accumulate slot-0 hits.
-        if not self._row_axis_initialized or self._boot_odom_pose is None:
-            self._dbg_reject("uninitialized")
-            return
+            if not self._row_axis_initialized or self._boot_odom_pose is None:
+                self._dbg_reject("uninitialized")
+                return
 
-        # ---- Parse measurement (robot frame) ----
-        x_fwd = float(msg.pose.position.x)
-        y_lat = float(msg.pose.position.y)
+            # ---- Parse measurement (robot frame) ----
+            x_fwd = float(msg.pose.position.x)
+            y_lat = float(msg.pose.position.y)
 
-        if not np.isfinite(y_lat) or not np.isfinite(x_fwd):
-            self._dbg_reject("nan_measurement")
-            return
+            if not np.isfinite(y_lat) or not np.isfinite(x_fwd):
+                self._dbg_reject("nan_measurement")
+                return
 
-        z = np.array([x_fwd, y_lat], dtype=float)
-        r = float(np.linalg.norm(z))
-        if r < 1e-3 or r > 15.0:
-            self._dbg_reject("range_gate")
-            return
+            z = np.array([x_fwd, y_lat], dtype=float)
+            r = float(np.linalg.norm(z))
+            if r < 1e-3 or r > 15.0:
+                self._dbg_reject("range_gate")
+                return
 
-        # ---- Pre-init anchor accumulation (runs before particles exist) ----
-        if (
-            self.use_template_map
-            and self.template_origin_from_first_measurement
-            and not self._template_origin_anchored
-        ):
-            # Use boot pose directly — no particles yet, no odom history alignment needed
-            mu_world_approx = self._world_from_robot(self._boot_odom_pose, z)
-            self._template_origin_hit_count += 1
-            self._template_origin_mu_sum += mu_world_approx.reshape(2,)
-
-            if self._template_origin_hit_count >= self.template_origin_min_hits:
-                mu_mean = self._template_origin_mu_sum / float(self._template_origin_hit_count)
-                self.get_logger().info(
-                    f"Anchoring template origin using mean of "
-                    f"{self._template_origin_hit_count} hits (boot pose)."
-                )
-                self._anchor_template_origin_to_first_meas(mu_mean)
-
-            # Either way, we can't do a FastSLAM update yet — particles don't exist.
-            return
-
-        # ---- Full FastSLAM update (particles must exist) ----
-        if not self.particles or self.last_odom_pose is None:
-            self._dbg_reject("uninitialized")
-            return
-
-        # ---- Time alignment ----
-        pose_odom_meas = self._lookup_odom_pose(t_meas_sec)
-        if pose_odom_meas is None:
-            self._dbg_reject("meas_too_old")
-            return
-
-        pose_odom_now = self.last_odom_pose.copy()
-        d_meas_to_now = se2_between(pose_odom_meas, pose_odom_now)
-        d_now_to_meas = se2_inverse(d_meas_to_now)
-
-        w_meas = float(msg.width) if np.isfinite(msg.width) else None
-
-        # ---- Slot association ----
-        slot_j, mu_world_approx = self._data_association_slot(z, d_now_to_meas=d_now_to_meas)
-        if slot_j is None or mu_world_approx is None:
-            self._dbg_reject("assoc_failed")
-            return
-        slot_j = int(slot_j)
-
-        # --------------------------------------------------------
-        # Delayed template-origin anchoring using mean of first N hits
-        # --------------------------------------------------------
-        if (
-            self.use_template_map
-            and self.template_origin_from_first_measurement
-            and (not self._template_origin_anchored)
-        ):
-            # We only want to anchor based on the first tree location (slot 0)
-            if slot_j == 0:
+            # ---- Pre-init anchor accumulation (runs before particles exist) ----
+            if (
+                self.use_template_map
+                and self.template_origin_from_first_measurement
+                and not self._template_origin_anchored
+            ):
+                # Use boot pose directly — no particles yet, no odom history alignment needed
+                mu_world_approx = self._world_from_robot(self._boot_odom_pose, z)
                 self._template_origin_hit_count += 1
                 self._template_origin_mu_sum += mu_world_approx.reshape(2,)
 
                 if self._template_origin_hit_count >= self.template_origin_min_hits:
                     mu_mean = self._template_origin_mu_sum / float(self._template_origin_hit_count)
-
                     self.get_logger().info(
                         f"Anchoring template origin using mean of "
-                        f"{self._template_origin_hit_count} hits (slot 0)."
+                        f"{self._template_origin_hit_count} hits (boot pose)."
                     )
-
                     self._anchor_template_origin_to_first_meas(mu_mean)
 
-        if (not self.use_template_map) and (getattr(self, "assoc_origin_s", None) is None):
-            self.assoc_origin_xy = self.row_origin_xy.copy()
+                return
 
-            # Lock origin_s so that THIS measurement lands at slot 0
-            s_meas0 = float(np.dot(mu_world_approx - self.assoc_origin_xy, self.t_hat))
-            self.assoc_origin_s = float(s_meas0)
+            # ---- Full FastSLAM update (particles must exist) ----
+            if not self.particles or self.last_odom_pose is None:
+                self._dbg_reject("uninitialized")
+                return
 
-            # Initialize hysteresis state
-            self.assoc_last_slot = 0
-            slot_j = 0
+            # ---- Time alignment ----
+            pose_odom_meas = self._lookup_odom_pose(t_meas_sec)
+            if pose_odom_meas is None:
+                self._dbg_reject("meas_too_old")
+                return
 
-        # Template-map bounds check (should only happen if max_extra_slots cap hit)
-        if self.use_template_map and slot_j >= self.num_slots:
-            self._dbg_reject("assoc_oob_template")
-            return
+            pose_odom_now = self.last_odom_pose.copy()
+            d_meas_to_now = se2_between(pose_odom_meas, pose_odom_now)
+            d_now_to_meas = se2_inverse(d_meas_to_now)
 
-        self._update_semantic_side_votes(slot_j, msg.side)
+            w_meas = float(msg.width) if np.isfinite(msg.width) else None
 
-        # ---- FastSLAM update: weights + (optional) measurement-informed proposal ----
-        n_particles = len(self.particles)
-        self._ensure_work_buffers(n_particles)
+            # ---- Slot association ----
+            slot_j, mu_world_approx = self._data_association_slot(z, d_now_to_meas=d_now_to_meas)
+            if slot_j is None or mu_world_approx is None:
+                self._dbg_reject("assoc_failed")
+                return
+            slot_j = int(slot_j)
 
-        particles = self.particles  # local alias
+            # --------------------------------------------------------
+            # Delayed template-origin anchoring using mean of first N hits
+            # --------------------------------------------------------
+            if (
+                self.use_template_map
+                and self.template_origin_from_first_measurement
+                and (not self._template_origin_anchored)
+            ):
+                # We only want to anchor based on the first tree location (slot 0)
+                if slot_j == 0:
+                    self._template_origin_hit_count += 1
+                    self._template_origin_mu_sum += mu_world_approx.reshape(2,)
 
-        # Work arrays (reused each callback)
-        logw = self._work_logw
-        logw[:n_particles].fill(0.0)
+                    if self._template_origin_hit_count >= self.template_origin_min_hits:
+                        mu_mean = self._template_origin_mu_sum / float(self._template_origin_hit_count)
 
-        maha_arr = self._work_maha
-        maha_arr[:n_particles].fill(np.nan)
+                        self.get_logger().info(
+                            f"Anchoring template origin using mean of "
+                            f"{self._template_origin_hit_count} hits (slot 0)."
+                        )
 
-        logdet_arr = self._work_logdet
-        logdet_arr[:n_particles].fill(np.nan)
+                        self._anchor_template_origin_to_first_meas(mu_mean)
 
-        poses_now = self._work_poses
-        poses_now[:n_particles] = self._poses[:n_particles]
+            if (not self.use_template_map) and (getattr(self, "assoc_origin_s", None) is None):
+                self.assoc_origin_xy = self.row_origin_xy.copy()
 
-        poses_meas = self._work_poses_meas
-        se2_compose_many(poses_now[:n_particles], d_now_to_meas, out=poses_meas[:n_particles])
+                # Lock origin_s so that THIS measurement lands at slot 0
+                s_meas0 = float(np.dot(mu_world_approx - self.assoc_origin_xy, self.t_hat))
+                self.assoc_origin_s = float(s_meas0)
 
-        ths = poses_meas[:n_particles, 2]
-        np.cos(ths, out=self._work_cos[:n_particles])
-        np.sin(ths, out=self._work_sin[:n_particles])
+                # Initialize hysteresis state
+                self.assoc_last_slot = 0
+                slot_j = 0
 
-        # ------------------------------------------------------------
-        # Build per-particle landmark refs and decide classic vs proposal
-        # ------------------------------------------------------------
-        classic_mask = self._work_classic_mask
-        classic_mask[:n_particles].fill(False)
+            # Template-map bounds check (should only happen if max_extra_slots cap hit)
+            if self.use_template_map and slot_j >= self.num_slots:
+                self._dbg_reject("assoc_oob_template")
+                return
 
-        lm_list: List[Optional[LandmarkEKF]] = [None] * n_particles
+            self._update_semantic_side_votes(slot_j, msg.side)
 
-        # Accumulators for vectorized template-prior (filled below if needed)
-        _tp_idx: List[int] = []          # particle indices that need prior
-        _tp_mu0: List[float] = []        # lm.mu[0]
-        _tp_mu1: List[float] = []        # lm.mu[1]
-        _tp_seen: List[int] = []         # lm.seen_count
+            # ---- FastSLAM update: weights + (optional) measurement-informed proposal ----
+            n_particles = len(self.particles)
+            self._ensure_work_buffers(n_particles)
 
-        for i, p in enumerate(particles):
-            lm = p.landmarks.get(slot_j, None)
+            particles = self.particles  # local alias
 
-            if self.use_template_map:
-                if lm is None:
-                    lm_list[i] = None
-                    continue
-            else:
-                if lm is None:
-                    lm = self._init_landmark_from_measurement_at_pose(poses_meas[i], z)
-                    p.landmarks[slot_j] = lm
+            # Work arrays (reused each callback)
+            logw = self._work_logw
+            logw[:n_particles].fill(0.0)
 
-            # Collect for vectorized template prior below (avoid per-particle method call)
-            if self.use_template_map and self.template_prior_enable:
-                _tp_idx.append(i)
-                _tp_mu0.append(float(lm.mu[0]))
-                _tp_mu1.append(float(lm.mu[1]))
-                _tp_seen.append(int(lm.seen_count))
+            maha_arr = self._work_maha
+            maha_arr[:n_particles].fill(np.nan)
 
-            lm_list[i] = lm
+            logdet_arr = self._work_logdet
+            logdet_arr[:n_particles].fill(np.nan)
 
-            # Classic likelihood if proposal disabled OR landmark not yet reliable
-            if (not self.proposal_enable) or (lm.seen_count <= 0):
-                classic_mask[i] = True
+            poses_now = self._work_poses
+            poses_now[:n_particles] = self._poses[:n_particles]
 
-        if _tp_idx and self.use_template_map and self.template_prior_enable:
-            tp_idx = np.array(_tp_idx, dtype=np.intp)
-            tp_mu = np.column_stack([_tp_mu0, _tp_mu1])   # (M,2)
-            tp_seen = np.array(_tp_seen, dtype=np.float64)
+            poses_meas = self._work_poses_meas
+            se2_compose_many(poses_now[:n_particles], d_now_to_meas, out=poses_meas[:n_particles])
 
-            # alpha = exp(-k / decay_k), clamped to 0 when seen >= max_seen
-            alpha = np.exp(-tp_seen / float(self.template_prior_decay_k))
-            if self.template_prior_max_seen > 0:
-                alpha[tp_seen >= float(self.template_prior_max_seen)] = 0.0
+            ths = poses_meas[:n_particles, 2]
+            np.cos(ths, out=self._work_cos[:n_particles])
+            np.sin(ths, out=self._work_sin[:n_particles])
 
-            if np.any(alpha > 0.0):
-                mu0_vec = self._template_mu0_for_slot(slot_j)   # (2,) — same for all particles
-                e = tp_mu - mu0_vec.reshape(1, 2)               # (M,2) world error
-                e_s = e @ self.t_hat_assoc                       # (M,) along-row component
-                e_d = e @ self.n_hat_assoc                       # (M,) lateral component
+            # ------------------------------------------------------------
+            # Build per-particle landmark refs and decide classic vs proposal
+            # ------------------------------------------------------------
+            classic_mask = self._work_classic_mask
+            classic_mask[:n_particles].fill(False)
 
-                sig_s = max(float(self.template_prior_sigma_s), 1e-6)
-                sig_d = max(float(self.template_prior_sigma_d), 1e-6)
-                pen = 0.5 * ((e_s / sig_s) ** 2 + (e_d / sig_d) ** 2)
-                logw[tp_idx] += -float(self.template_prior_w) * alpha * pen
+            lm_list: List[Optional[LandmarkEKF]] = [None] * n_particles
 
-        # ------------------------------------------------------------
-        # Vectorized classic scoring across particles (at measurement-time poses)
-        # ------------------------------------------------------------
-        idx = np.nonzero(classic_mask[:n_particles])[0]
-        if idx.size > 0:
-            lms_idx = [lm_list[i] for i in idx]
-            mu0 = np.array([lm.mu[0] for lm in lms_idx], dtype=np.float64)
-            mu1 = np.array([lm.mu[1] for lm in lms_idx], dtype=np.float64)
-            sxx = np.array([lm.Sigma[0, 0] for lm in lms_idx], dtype=np.float64)
-            sxy = np.array([lm.Sigma[0, 1] for lm in lms_idx], dtype=np.float64)
-            syy = np.array([lm.Sigma[1, 1] for lm in lms_idx], dtype=np.float64)
+            # Accumulators for vectorized template-prior (filled below if needed)
+            _tp_idx: List[int] = []          # particle indices that need prior
+            _tp_mu0: List[float] = []        # lm.mu[0]
+            _tp_mu1: List[float] = []        # lm.mu[1]
+            _tp_seen: List[int] = []         # lm.seen_count
 
-            px = poses_meas[idx, 0]
-            py = poses_meas[idx, 1]
-            c = self._work_cos[idx]
-            s = self._work_sin[idx]
-
-            dx = mu0 - px
-            dy = mu1 - py
-
-            xpred = c * dx + s * dy
-            ypred = -s * dx + c * dy
-
-            e0 = float(z[0]) - xpred
-            e1 = float(z[1]) - ypred
-
-            # S = H*Sigma*H^T + R, H = [[c,s],[-s,c]]
-            q00 = c * c * sxx + 2.0 * c * s * sxy + s * s * syy
-            q01 = -c * s * sxx + (c * c - s * s) * sxy + c * s * syy
-            q11 = s * s * sxx - 2.0 * c * s * sxy + c * c * syy
-
-            S00 = q00 + self.R00
-            S01 = q01
-            S11 = q11 + self.R11
-
-            det = S00 * S11 - S01 * S01
-            ok = det > 0.0
-
-            inv_det = np.zeros_like(det)
-            inv_det[ok] = 1.0 / det[ok]
-
-            i00 = np.zeros_like(det)
-            i11 = np.zeros_like(det)
-            i01 = np.zeros_like(det)
-
-            i00[ok] =  S11[ok] * inv_det[ok]
-            i11[ok] =  S00[ok] * inv_det[ok]
-            i01[ok] = -S01[ok] * inv_det[ok]
-
-            maha = np.full_like(det, np.nan)
-            maha[ok] = (e0[ok] * (i00[ok] * e0[ok] + i01[ok] * e1[ok]) +
-                        e1[ok] * (i01[ok] * e0[ok] + i11[ok] * e1[ok]))
-
-            logdet = np.full_like(det, np.nan)
-            logdet[ok] = np.log(det[ok])
-
-            maha_arr[idx] = maha
-            logdet_arr[idx] = logdet
-            logw[idx] += -0.5 * (maha + logdet)
-
-            if not np.all(ok):
-                self._dbg_reject("S_nonposdef")
-
-        # ------------------------------------------------------------
-        # Proposal scoring (per-particle; done at measurement-time pose)
-        # After proposal, we store p.pose back at "now" via ⊕ d_meas_to_now.
-        # ------------------------------------------------------------
-        if self.proposal_enable:
             for i, p in enumerate(particles):
-                if classic_mask[i]:
-                    continue
-                lm = lm_list[i]
-                if lm is None:
-                    continue
-                if lm.seen_count <= 0:
-                    continue
-
-                pose_meas_i = poses_meas[i].copy()
-
-                # measurement-informed proposal over pose (FastSLAM 2.0)
-                z_pred, H_lm, J_x = self._predict_z_Hland_Jpose(pose_meas_i, lm.mu)
-
-                Qeff = H_lm @ lm.Sigma @ H_lm.T + self.R
-                Pbar = self._pose_prior_cov_world(float(pose_meas_i[2]))
-                S = J_x @ Pbar @ J_x.T + Qeff
-
-                innov = z - z_pred
-
-                # Fast 2x2 inverse/logdet for S
-                S00 = float(S[0, 0]); S01 = float(S[0, 1])
-                S10 = float(S[1, 0]); S11 = float(S[1, 1])
-                ok, i00, i01, i10, i11, logdet = inv_and_logdet_2x2(S00, S01, S10, S11)
-                if not ok:
-                    self._dbg_reject("S_nonposdef")
-                    continue
-
-                e0 = float(innov[0]); e1 = float(innov[1])
-                maha = e0 * (i00 * e0 + i01 * e1) + e1 * (i10 * e0 + i11 * e1)
-
-                maha_arr[i] = maha
-                logdet_arr[i] = logdet
-                logw[i] += -0.5 * (maha + logdet)
-
-                Sinv = np.array([[i00, i01], [i10, i11]], dtype=float)
-                K = Pbar @ J_x.T @ Sinv
-
-                dx = (K @ innov)
-                dx[2] = wrap_angle(float(dx[2]))
-
-                # Clamp proposal correction magnitude
-                dx[0] = float(np.clip(dx[0], -0.25, 0.25))
-                dx[1] = float(np.clip(dx[1], -0.25, 0.25))
-                dx[2] = float(np.clip(dx[2], -0.20, 0.20))
-
-                xhat = pose_meas_i + dx
-                xhat[2] = wrap_angle(float(xhat[2]))
-
-                Phat = (np.eye(3) - K @ J_x) @ Pbar
-                Phat = 0.5 * (Phat + Phat.T)
-
-                try:
-                    xnew_meas = np.random.multivariate_normal(mean=xhat, cov=Phat)
-                except Exception:
-                    xnew_meas = xhat
-
-                xnew_meas[2] = wrap_angle(float(xnew_meas[2]))
-
-                # Store particle pose back in "now" coordinates
-                p.pose[:] = se2_compose_single(np.asarray(xnew_meas, dtype=float), d_meas_to_now)
-
-        # ---- Innovation gating (median particle) ----
-        skip_update = False
-        maha_f = maha_arr[np.isfinite(maha_arr)]
-        maha_median = float(np.median(maha_f)) if maha_f.size else float("nan")
-        if self.maha_gate_median > 0.0:
-            if (not np.isfinite(maha_median)) or (maha_f.size < self.maha_gate_min_particles):
-                self._dbg_reject("maha_gate_insufficient")
-                skip_update = True
-            elif maha_median > self.maha_gate_median:
-                self._dbg_reject("maha_gate")
-                skip_update = True
-
-        if not skip_update:
-            # ---- Apply weights safely ----
-            maxlog = float(np.max(logw))
-            w = np.exp(logw - maxlog)
-            self._weights[:n_particles] *= w[:n_particles]
-            self._normalize_weights()
-
-        # ---- Debug CSV row ----
-        if getattr(self, "debug_csv_enable", False) and (self._dbg_csv is not None):
-            neff = float(self._effective_sample_size())
-            wts = np.array([p.weight for p in self.particles], dtype=float)
-
-            def _p95(a: np.ndarray) -> float:
-                a2 = a[np.isfinite(a)]
-                return float(np.percentile(a2, 95)) if a2.size else float("nan")
-
-            finite_logw = logw[np.isfinite(logw)]
-            reject_snapshot = ";".join([f"{k}:{v}" for k, v in sorted(self._dbg_reject_counts.items())])
-
-            self._dbg_csv.writerow([
-                float(t_meas_sec),
-                int(self.measurement_count),
-                int(slot_j),
-                float(z[0]),  # z_x_fwd
-                float(z[1]),  # z_y_lat
-                float(r),
-                int(self.proposal_enable),
-                neff,
-                float(np.max(wts)),
-                float(np.min(wts)),
-                float(np.std(wts)),
-                float(np.max(logw)),
-                float(np.mean(finite_logw)) if finite_logw.size else float("nan"),
-                float(np.std(finite_logw)) if finite_logw.size else float("nan"),
-                safe_nanmean(maha_arr),
-                _p95(maha_arr),
-                safe_nanmean(logdet_arr),
-                _p95(logdet_arr),
-                reject_snapshot,
-            ])
-
-            self._dbg_csv_rows_since_flush += 1
-            if self._dbg_csv_rows_since_flush >= max(int(self.debug_csv_flush_every_n), 1):
-                try:
-                    self._dbg_csv_fp.flush()
-                except Exception:
-                    pass
-                self._dbg_csv_rows_since_flush = 0
-
-        # ---- Landmark EKF update AFTER pose proposal ----
-        if not skip_update:
-            # --- gather indices of valid particles for this slot ---
-            valid_idx = []
-            for i, p in enumerate(self.particles):
                 lm = p.landmarks.get(slot_j, None)
+
                 if self.use_template_map:
                     if lm is None:
+                        lm_list[i] = None
                         continue
                 else:
                     if lm is None:
                         lm = self._init_landmark_from_measurement_at_pose(poses_meas[i], z)
                         p.landmarks[slot_j] = lm
-                valid_idx.append(i)
 
-            if valid_idx:
-                M = len(valid_idx)
-                # Gather landmark state: mu (M,2), Sigma (M,2,2)
-                lms_v = [self.particles[i].landmarks[slot_j] for i in valid_idx]
-                mus   = np.array([lm.mu    for lm in lms_v], dtype=np.float64)  # (M,2)
-                sigs  = np.array([lm.Sigma for lm in lms_v], dtype=np.float64)  # (M,2,2)
+                # Collect for vectorized template prior below (avoid per-particle method call)
+                if self.use_template_map and self.template_prior_enable:
+                    _tp_idx.append(i)
+                    _tp_mu0.append(float(lm.mu[0]))
+                    _tp_mu1.append(float(lm.mu[1]))
+                    _tp_seen.append(int(lm.seen_count))
 
-                # Gather per-particle measurement-time poses
-                if self.proposal_enable:
-                    pm = np.empty((M, 3), dtype=np.float64)
-                    for k, i in enumerate(valid_idx):
-                        lm_i = lms_v[k]
-                        if (not classic_mask[i]) and (lm_i is not None) and (lm_i.seen_count > 0):
-                            pm[k] = se2_compose_single(self.particles[i].pose, d_now_to_meas)
-                        else:
-                            pm[k] = poses_meas[i]
-                else:
-                    pm = poses_meas[np.array(valid_idx)]  # (M,3) view/copy
+                lm_list[i] = lm
 
-                # H = [[c, s], [-s, c]] per particle  — H is orthogonal so H^T Sigma H = Sigma
-                # (rotation of the 2x2 matrix keeps trace/det; we compute H Sigma H^T explicitly)
-                th_v = pm[:, 2]                        # (M,)
-                cv   = np.cos(th_v)                    # (M,)
-                sv   = np.sin(th_v)                    # (M,)
+                # Classic likelihood if proposal disabled OR landmark not yet reliable
+                if (not self.proposal_enable) or (lm.seen_count <= 0):
+                    classic_mask[i] = True
 
-                # Predicted measurement z_pred = H (mu - pos)
-                dx_v = mus[:, 0] - pm[:, 0]           # (M,)
-                dy_v = mus[:, 1] - pm[:, 1]            # (M,)
-                xp   =  cv * dx_v + sv * dy_v          # (M,) x_fwd
-                yp   = -sv * dx_v + cv * dy_v          # (M,) y_lat
-                e0_v = float(z[0]) - xp               # (M,)
-                e1_v = float(z[1]) - yp               # (M,)
+            if _tp_idx and self.use_template_map and self.template_prior_enable:
+                tp_idx = np.array(_tp_idx, dtype=np.intp)
+                tp_mu = np.column_stack([_tp_mu0, _tp_mu1])   # (M,2)
+                tp_seen = np.array(_tp_seen, dtype=np.float64)
 
-                # H Sigma H^T  (2x2 per particle, stored as components)
-                sxx_v = sigs[:, 0, 0]; sxy_v = sigs[:, 0, 1]; syy_v = sigs[:, 1, 1]
-                hs00 =  cv*cv*sxx_v + 2*cv*sv*sxy_v + sv*sv*syy_v
-                hs01 = -cv*sv*sxx_v + (cv*cv - sv*sv)*sxy_v + cv*sv*syy_v
-                hs11 =  sv*sv*sxx_v - 2*cv*sv*sxy_v + cv*cv*syy_v
+                # alpha = exp(-k / decay_k), clamped to 0 when seen >= max_seen
+                alpha = np.exp(-tp_seen / float(self.template_prior_decay_k))
+                if self.template_prior_max_seen > 0:
+                    alpha[tp_seen >= float(self.template_prior_max_seen)] = 0.0
 
-                # S = H Sigma H^T + R
-                S00 = hs00 + self.R00;  S01 = hs01;  S11 = hs11 + self.R11
+                if np.any(alpha > 0.0):
+                    mu0_vec = self._template_mu0_for_slot(slot_j)   # (2,) — same for all particles
+                    e = tp_mu - mu0_vec.reshape(1, 2)               # (M,2) world error
+                    e_s = e @ self.t_hat_assoc                       # (M,) along-row component
+                    e_d = e @ self.n_hat_assoc                       # (M,) lateral component
+
+                    sig_s = max(float(self.template_prior_sigma_s), 1e-6)
+                    sig_d = max(float(self.template_prior_sigma_d), 1e-6)
+                    pen = 0.5 * ((e_s / sig_s) ** 2 + (e_d / sig_d) ** 2)
+                    logw[tp_idx] += -float(self.template_prior_w) * alpha * pen
+
+            # ------------------------------------------------------------
+            # Vectorized classic scoring across particles (at measurement-time poses)
+            # ------------------------------------------------------------
+            idx = np.nonzero(classic_mask[:n_particles])[0]
+            if idx.size > 0:
+                lms_idx = [lm_list[i] for i in idx]
+                mu0 = np.array([lm.mu[0] for lm in lms_idx], dtype=np.float64)
+                mu1 = np.array([lm.mu[1] for lm in lms_idx], dtype=np.float64)
+                sxx = np.array([lm.Sigma[0, 0] for lm in lms_idx], dtype=np.float64)
+                sxy = np.array([lm.Sigma[0, 1] for lm in lms_idx], dtype=np.float64)
+                syy = np.array([lm.Sigma[1, 1] for lm in lms_idx], dtype=np.float64)
+
+                px = poses_meas[idx, 0]
+                py = poses_meas[idx, 1]
+                c = self._work_cos[idx]
+                s = self._work_sin[idx]
+
+                dx = mu0 - px
+                dy = mu1 - py
+
+                xpred = c * dx + s * dy
+                ypred = -s * dx + c * dy
+
+                e0 = float(z[0]) - xpred
+                e1 = float(z[1]) - ypred
+
+                # S = H*Sigma*H^T + R, H = [[c,s],[-s,c]]
+                q00 = c * c * sxx + 2.0 * c * s * sxy + s * s * syy
+                q01 = -c * s * sxx + (c * c - s * s) * sxy + c * s * syy
+                q11 = s * s * sxx - 2.0 * c * s * sxy + c * c * syy
+
+                S00 = q00 + self.R00
+                S01 = q01
+                S11 = q11 + self.R11
+
                 det = S00 * S11 - S01 * S01
-                ok  = det > 0.0
+                ok = det > 0.0
+
+                inv_det = np.zeros_like(det)
+                inv_det[ok] = 1.0 / det[ok]
+
+                i00 = np.zeros_like(det)
+                i11 = np.zeros_like(det)
+                i01 = np.zeros_like(det)
+
+                i00[ok] =  S11[ok] * inv_det[ok]
+                i11[ok] =  S00[ok] * inv_det[ok]
+                i01[ok] = -S01[ok] * inv_det[ok]
+
+                maha = np.full_like(det, np.nan)
+                maha[ok] = (e0[ok] * (i00[ok] * e0[ok] + i01[ok] * e1[ok]) +
+                            e1[ok] * (i01[ok] * e0[ok] + i11[ok] * e1[ok]))
+
+                logdet = np.full_like(det, np.nan)
+                logdet[ok] = np.log(det[ok])
+
+                maha_arr[idx] = maha
+                logdet_arr[idx] = logdet
+                logw[idx] += -0.5 * (maha + logdet)
+
                 if not np.all(ok):
-                    self._dbg_reject("S_nonposdef_ekf")
+                    self._dbg_reject("S_nonposdef")
 
-                inv_det = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
-                i00 =  S11 * inv_det;  i11 =  S00 * inv_det;  i01 = -S01 * inv_det
-
-                # K = Sigma H^T S^{-1}
-                # H^T = [[c,-s],[s,c]]  =>  Sigma H^T:
-                #   col0: [sxx*c + sxy*s,  sxy*c + syy*s]
-                #   col1: [-sxx*s + sxy*c, -sxy*s + syy*c]
-                # Then K = (Sigma H^T) S^{-1}  (2x2 @ 2x2 per particle)
-                shT00 =  sxx_v*cv + sxy_v*sv;  shT01 = -sxx_v*sv + sxy_v*cv
-                shT10 =  sxy_v*cv + syy_v*sv;  shT11 = -sxy_v*sv + syy_v*cv
-
-                K00 = shT00*i00 + shT01*i01;  K01 = shT00*i01 + shT01*i11
-                K10 = shT10*i00 + shT11*i01;  K11 = shT10*i01 + shT11*i11
-
-                # Innovation: (e0_v, e1_v)
-                # mu += K @ innov
-                d_mu0 = K00*e0_v + K01*e1_v
-                d_mu1 = K10*e0_v + K11*e1_v
-
-                # Sigma -= K H Sigma  = (I - K H) Sigma
-                # K H: (M,2,2) — K is (M,2,2), H per-particle:
-                # KH00 = K00*c - K01*s, KH01 = K00*s + K01*c
-                # KH10 = K10*c - K11*s, KH11 = K10*s + K11*c
-                KH00 = K00*cv - K01*sv;  KH01 = K00*sv + K01*cv
-                KH10 = K10*cv - K11*sv;  KH11 = K10*sv + K11*cv
-
-                # (I - KH) Sigma  (2x2 x 2x2 per particle)
-                IKH00 = 1.0-KH00;  IKH01 = -KH01
-                IKH10 = -KH10;     IKH11 = 1.0-KH11
-
-                new_s00 = IKH00*sxx_v + IKH01*sxy_v
-                new_s01 = IKH00*sxy_v + IKH01*syy_v
-                new_s10 = IKH10*sxx_v + IKH11*sxy_v
-                new_s11 = IKH10*sxy_v + IKH11*syy_v
-
-                # Symmetrize: s01 = s10 = (s01+s10)/2
-                sym01 = 0.5 * (new_s01 + new_s10)
-
-                # Covariance floor
-                if self._lm_sigma_floor_var_x > 0.0:
-                    new_s00 = np.maximum(new_s00, self._lm_sigma_floor_var_x)
-                if self._lm_sigma_floor_var_y > 0.0:
-                    new_s11 = np.maximum(new_s11, self._lm_sigma_floor_var_y)
-
-                # Scatter results back to landmark objects (only valid particles)
-                for k, i in enumerate(valid_idx):
-                    if not ok[k]:
+            # ------------------------------------------------------------
+            # Proposal scoring (per-particle; done at measurement-time pose)
+            # After proposal, we store p.pose back at "now" via ⊕ d_meas_to_now.
+            # ------------------------------------------------------------
+            if self.proposal_enable:
+                for i, p in enumerate(particles):
+                    if classic_mask[i]:
                         continue
-                    lm_k = lms_v[k]
-                    lm_k.mu[0]       += d_mu0[k]
-                    lm_k.mu[1]       += d_mu1[k]
-                    lm_k.Sigma[0, 0]  = float(new_s00[k])
-                    lm_k.Sigma[0, 1]  = float(sym01[k])
-                    lm_k.Sigma[1, 0]  = float(sym01[k])
-                    lm_k.Sigma[1, 1]  = float(new_s11[k])
-                    lm_k.seen_count  += 1
-                    lm_k.update_width(w_meas)
+                    lm = lm_list[i]
+                    if lm is None:
+                        continue
+                    if lm.seen_count <= 0:
+                        continue
 
-            if self._spacing_prop_enable:
-                self._propagate_spacing_prior(slot_j)
+                    pose_meas_i = poses_meas[i].copy()
 
-        # ---- Downstream spacing anchor update ----
-        if self.snap_downstream_spacing:
-            origin_xy = self.assoc_origin_xy if getattr(self, "assoc_origin_xy", None) is not None else self.row_origin_xy
-            s_meas_best = float(np.dot(mu_world_approx - origin_xy, self.t_hat_assoc))
+                    # measurement-informed proposal over pose (FastSLAM 2.0)
+                    z_pred, H_lm, J_x = self._predict_z_Hland_Jpose(pose_meas_i, lm.mu)
 
-            self.row_origin_s = (float(self.assoc_origin_s) if getattr(self, "assoc_origin_s", None) is not None else self.row_origin_s)
+                    Qeff = H_lm @ lm.Sigma @ H_lm.T + self.R
+                    Pbar = self._pose_prior_cov_world(float(pose_meas_i[2]))
+                    S = J_x @ Pbar @ J_x.T + Qeff
 
-            lm_best = self._best_particle().landmarks.get(slot_j) if self._best_particle() else None
-            seen = int(lm_best.seen_count) if lm_best is not None else 0
+                    innov = z - z_pred
 
-            if seen < 2:
-                alpha = 0.15
-                target = s_meas_best - slot_j * self.slot_spacing
-                self.row_origin_s = (1.0 - alpha) * float(self.row_origin_s) + alpha * float(target)
-                self._apply_downstream_spacing(anchor_j=slot_j)
+                    # Fast 2x2 inverse/logdet for S
+                    S00 = float(S[0, 0]); S01 = float(S[0, 1])
+                    S10 = float(S[1, 0]); S11 = float(S[1, 1])
+                    ok, i00, i01, i10, i11, logdet = inv_and_logdet_2x2(S00, S01, S10, S11)
+                    if not ok:
+                        self._dbg_reject("S_nonposdef")
+                        continue
 
-        # ---- Restore association window after init convergence period ----
-        restore_at = getattr(self, "_init_assoc_restore_at", None)
-        if restore_at is not None and self.measurement_count >= restore_at:
-            self.max_back_assoc = self._init_max_back_assoc_saved
-            self.max_fwd_assoc  = self._init_max_fwd_assoc_saved
-            self._init_assoc_restore_at = None  # don't check again
-            self.get_logger().info(
-                f"Association window restored to "
-                f"back={self.max_back_assoc}, fwd={self.max_fwd_assoc} "
-                f"after {self.measurement_count} measurements"
-            )
+                    e0 = float(innov[0]); e1 = float(innov[1])
+                    maha = e0 * (i00 * e0 + i01 * e1) + e1 * (i10 * e0 + i11 * e1)
 
-        # ---- Resampling ----
-        self.measurement_count += 1
-        past_burn_in = (self.measurement_count > self.resample_burn_in)
-        if past_burn_in and self.resample_interval > 0 and (self.measurement_count % self.resample_interval) == 0:
-            self._maybe_resample()
+                    maha_arr[i] = maha
+                    logdet_arr[i] = logdet
+                    logw[i] += -0.5 * (maha + logdet)
 
-        # ---- Publish ----
-        self._publish_registry_from_best()
-        self._publish_odom_from_best()
+                    Sinv = np.array([[i00, i01], [i10, i11]], dtype=float)
+                    K = Pbar @ J_x.T @ Sinv
+
+                    dx = (K @ innov)
+                    dx[2] = wrap_angle(float(dx[2]))
+
+                    # Clamp proposal correction magnitude
+                    dx[0] = float(np.clip(dx[0], -0.25, 0.25))
+                    dx[1] = float(np.clip(dx[1], -0.25, 0.25))
+                    dx[2] = float(np.clip(dx[2], -0.20, 0.20))
+
+                    xhat = pose_meas_i + dx
+                    xhat[2] = wrap_angle(float(xhat[2]))
+
+                    Phat = (np.eye(3) - K @ J_x) @ Pbar
+                    Phat = 0.5 * (Phat + Phat.T)
+
+                    try:
+                        xnew_meas = np.random.multivariate_normal(mean=xhat, cov=Phat)
+                    except Exception:
+                        xnew_meas = xhat
+
+                    xnew_meas[2] = wrap_angle(float(xnew_meas[2]))
+
+                    # Store particle pose back in "now" coordinates
+                    p.pose[:] = se2_compose_single(np.asarray(xnew_meas, dtype=float), d_meas_to_now)
+
+            # ---- Innovation gating (median particle) ----
+            skip_update = False
+            maha_f = maha_arr[np.isfinite(maha_arr)]
+            maha_median = float(np.median(maha_f)) if maha_f.size else float("nan")
+            if self.maha_gate_median > 0.0:
+                if (not np.isfinite(maha_median)) or (maha_f.size < self.maha_gate_min_particles):
+                    self._dbg_reject("maha_gate_insufficient")
+                    skip_update = True
+                elif maha_median > self.maha_gate_median:
+                    self._dbg_reject("maha_gate")
+                    skip_update = True
+
+            if not skip_update:
+                # ---- Apply weights safely ----
+                maxlog = float(np.max(logw))
+                w = np.exp(logw - maxlog)
+                self._weights[:n_particles] *= w[:n_particles]
+                self._normalize_weights()
+
+            # ---- Debug CSV row ----
+            if getattr(self, "debug_csv_enable", False) and (self._dbg_csv is not None):
+                neff = float(self._effective_sample_size())
+                wts = np.array([p.weight for p in self.particles], dtype=float)
+
+                def _p95(a: np.ndarray) -> float:
+                    a2 = a[np.isfinite(a)]
+                    return float(np.percentile(a2, 95)) if a2.size else float("nan")
+
+                finite_logw = logw[np.isfinite(logw)]
+                reject_snapshot = ";".join([f"{k}:{v}" for k, v in sorted(self._dbg_reject_counts.items())])
+
+                self._dbg_csv.writerow([
+                    float(t_meas_sec),
+                    int(self.measurement_count),
+                    int(slot_j),
+                    float(z[0]),  # z_x_fwd
+                    float(z[1]),  # z_y_lat
+                    float(r),
+                    int(self.proposal_enable),
+                    neff,
+                    float(np.max(wts)),
+                    float(np.min(wts)),
+                    float(np.std(wts)),
+                    float(np.max(logw)),
+                    float(np.mean(finite_logw)) if finite_logw.size else float("nan"),
+                    float(np.std(finite_logw)) if finite_logw.size else float("nan"),
+                    safe_nanmean(maha_arr),
+                    _p95(maha_arr),
+                    safe_nanmean(logdet_arr),
+                    _p95(logdet_arr),
+                    reject_snapshot,
+                ])
+
+                self._dbg_csv_rows_since_flush += 1
+                if self._dbg_csv_rows_since_flush >= max(int(self.debug_csv_flush_every_n), 1):
+                    try:
+                        self._dbg_csv_fp.flush()
+                    except Exception:
+                        pass
+                    self._dbg_csv_rows_since_flush = 0
+
+            # ---- Landmark EKF update AFTER pose proposal ----
+            if not skip_update:
+                # --- gather indices of valid particles for this slot ---
+                valid_idx = []
+                for i, p in enumerate(self.particles):
+                    lm = p.landmarks.get(slot_j, None)
+                    if self.use_template_map:
+                        if lm is None:
+                            continue
+                    else:
+                        if lm is None:
+                            lm = self._init_landmark_from_measurement_at_pose(poses_meas[i], z)
+                            p.landmarks[slot_j] = lm
+                    valid_idx.append(i)
+
+                if valid_idx:
+                    M = len(valid_idx)
+                    # Gather landmark state: mu (M,2), Sigma (M,2,2)
+                    lms_v = [self.particles[i].landmarks[slot_j] for i in valid_idx]
+                    mus   = np.array([lm.mu    for lm in lms_v], dtype=np.float64)  # (M,2)
+                    sigs  = np.array([lm.Sigma for lm in lms_v], dtype=np.float64)  # (M,2,2)
+
+                    # Gather per-particle measurement-time poses
+                    if self.proposal_enable:
+                        pm = np.empty((M, 3), dtype=np.float64)
+                        for k, i in enumerate(valid_idx):
+                            lm_i = lms_v[k]
+                            if (not classic_mask[i]) and (lm_i is not None) and (lm_i.seen_count > 0):
+                                pm[k] = se2_compose_single(self.particles[i].pose, d_now_to_meas)
+                            else:
+                                pm[k] = poses_meas[i]
+                    else:
+                        pm = poses_meas[np.array(valid_idx)]  # (M,3) view/copy
+
+                    # H = [[c, s], [-s, c]] per particle  — H is orthogonal so H^T Sigma H = Sigma
+                    # (rotation of the 2x2 matrix keeps trace/det; we compute H Sigma H^T explicitly)
+                    th_v = pm[:, 2]                        # (M,)
+                    cv   = np.cos(th_v)                    # (M,)
+                    sv   = np.sin(th_v)                    # (M,)
+
+                    # Predicted measurement z_pred = H (mu - pos)
+                    dx_v = mus[:, 0] - pm[:, 0]           # (M,)
+                    dy_v = mus[:, 1] - pm[:, 1]            # (M,)
+                    xp   =  cv * dx_v + sv * dy_v          # (M,) x_fwd
+                    yp   = -sv * dx_v + cv * dy_v          # (M,) y_lat
+                    e0_v = float(z[0]) - xp               # (M,)
+                    e1_v = float(z[1]) - yp               # (M,)
+
+                    # H Sigma H^T  (2x2 per particle, stored as components)
+                    sxx_v = sigs[:, 0, 0]; sxy_v = sigs[:, 0, 1]; syy_v = sigs[:, 1, 1]
+                    hs00 =  cv*cv*sxx_v + 2*cv*sv*sxy_v + sv*sv*syy_v
+                    hs01 = -cv*sv*sxx_v + (cv*cv - sv*sv)*sxy_v + cv*sv*syy_v
+                    hs11 =  sv*sv*sxx_v - 2*cv*sv*sxy_v + cv*cv*syy_v
+
+                    # S = H Sigma H^T + R
+                    S00 = hs00 + self.R00;  S01 = hs01;  S11 = hs11 + self.R11
+                    det = S00 * S11 - S01 * S01
+                    ok  = det > 0.0
+                    if not np.all(ok):
+                        self._dbg_reject("S_nonposdef_ekf")
+
+                    inv_det = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+                    i00 =  S11 * inv_det;  i11 =  S00 * inv_det;  i01 = -S01 * inv_det
+
+                    # K = Sigma H^T S^{-1}
+                    # H^T = [[c,-s],[s,c]]  =>  Sigma H^T:
+                    #   col0: [sxx*c + sxy*s,  sxy*c + syy*s]
+                    #   col1: [-sxx*s + sxy*c, -sxy*s + syy*c]
+                    # Then K = (Sigma H^T) S^{-1}  (2x2 @ 2x2 per particle)
+                    shT00 =  sxx_v*cv + sxy_v*sv;  shT01 = -sxx_v*sv + sxy_v*cv
+                    shT10 =  sxy_v*cv + syy_v*sv;  shT11 = -sxy_v*sv + syy_v*cv
+
+                    K00 = shT00*i00 + shT01*i01;  K01 = shT00*i01 + shT01*i11
+                    K10 = shT10*i00 + shT11*i01;  K11 = shT10*i01 + shT11*i11
+
+                    # Innovation: (e0_v, e1_v)
+                    # mu += K @ innov
+                    d_mu0 = K00*e0_v + K01*e1_v
+                    d_mu1 = K10*e0_v + K11*e1_v
+
+                    # Sigma -= K H Sigma  = (I - K H) Sigma
+                    # K H: (M,2,2) — K is (M,2,2), H per-particle:
+                    # KH00 = K00*c - K01*s, KH01 = K00*s + K01*c
+                    # KH10 = K10*c - K11*s, KH11 = K10*s + K11*c
+                    KH00 = K00*cv - K01*sv;  KH01 = K00*sv + K01*cv
+                    KH10 = K10*cv - K11*sv;  KH11 = K10*sv + K11*cv
+
+                    # (I - KH) Sigma  (2x2 x 2x2 per particle)
+                    IKH00 = 1.0-KH00;  IKH01 = -KH01
+                    IKH10 = -KH10;     IKH11 = 1.0-KH11
+
+                    new_s00 = IKH00*sxx_v + IKH01*sxy_v
+                    new_s01 = IKH00*sxy_v + IKH01*syy_v
+                    new_s10 = IKH10*sxx_v + IKH11*sxy_v
+                    new_s11 = IKH10*sxy_v + IKH11*syy_v
+
+                    # Symmetrize: s01 = s10 = (s01+s10)/2
+                    sym01 = 0.5 * (new_s01 + new_s10)
+
+                    # Covariance floor
+                    if self._lm_sigma_floor_var_x > 0.0:
+                        new_s00 = np.maximum(new_s00, self._lm_sigma_floor_var_x)
+                    if self._lm_sigma_floor_var_y > 0.0:
+                        new_s11 = np.maximum(new_s11, self._lm_sigma_floor_var_y)
+
+                    # Scatter results back to landmark objects (only valid particles)
+                    for k, i in enumerate(valid_idx):
+                        if not ok[k]:
+                            continue
+                        lm_k = lms_v[k]
+                        lm_k.mu[0]       += d_mu0[k]
+                        lm_k.mu[1]       += d_mu1[k]
+                        lm_k.Sigma[0, 0]  = float(new_s00[k])
+                        lm_k.Sigma[0, 1]  = float(sym01[k])
+                        lm_k.Sigma[1, 0]  = float(sym01[k])
+                        lm_k.Sigma[1, 1]  = float(new_s11[k])
+                        lm_k.seen_count  += 1
+                        lm_k.update_width(w_meas)
+
+                if self._spacing_prop_enable:
+                    self._propagate_spacing_prior(slot_j)
+
+            # ---- Downstream spacing anchor update ----
+            if self.snap_downstream_spacing:
+                origin_xy = self.assoc_origin_xy if getattr(self, "assoc_origin_xy", None) is not None else self.row_origin_xy
+                s_meas_best = float(np.dot(mu_world_approx - origin_xy, self.t_hat_assoc))
+
+                self.row_origin_s = (float(self.assoc_origin_s) if getattr(self, "assoc_origin_s", None) is not None else self.row_origin_s)
+
+                lm_best = self._best_particle().landmarks.get(slot_j) if self._best_particle() else None
+                seen = int(lm_best.seen_count) if lm_best is not None else 0
+
+                if seen < 2:
+                    alpha = 0.15
+                    target = s_meas_best - slot_j * self.slot_spacing
+                    self.row_origin_s = (1.0 - alpha) * float(self.row_origin_s) + alpha * float(target)
+                    self._apply_downstream_spacing(anchor_j=slot_j)
+
+            # ---- Restore association window after init convergence period ----
+            restore_at = getattr(self, "_init_assoc_restore_at", None)
+            if restore_at is not None and self.measurement_count >= restore_at:
+                self.max_back_assoc = self._init_max_back_assoc_saved
+                self.max_fwd_assoc  = self._init_max_fwd_assoc_saved
+                self._init_assoc_restore_at = None  # don't check again
+                self.get_logger().info(
+                    f"Association window restored to "
+                    f"back={self.max_back_assoc}, fwd={self.max_fwd_assoc} "
+                    f"after {self.measurement_count} measurements"
+                )
+
+            # ---- Resampling ----
+            self.measurement_count += 1
+            past_burn_in = (self.measurement_count > self.resample_burn_in)
+            if past_burn_in and self.resample_interval > 0 and (self.measurement_count % self.resample_interval) == 0:
+                self._maybe_resample()
+
+            # ---- Publish ----
+            self._dbg_write_landmarks(t_meas_sec, self.measurement_count, slot_j)
+            self._publish_registry_from_best()
+            self._publish_odom_from_best()
 
     def _world_from_robot(self, pose: np.ndarray, z_robot: np.ndarray) -> np.ndarray:
         rx, ry, th = float(pose[0]), float(pose[1]), float(pose[2])
