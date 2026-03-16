@@ -55,19 +55,6 @@ def inv_and_logdet_2x2(a: float, b: float, c: float, d: float) -> Tuple[bool, fl
     inv11 =  a * inv_det
     return (True, inv00, inv01, inv10, inv11, float(np.log(det)))
 
-def predict_parts(pose: np.ndarray, mu_lm: np.ndarray) -> Tuple[float, float, float, float]:
-    """
-    Return (c, s, x_fwd_pred, y_lat_pred) for landmark mu_lm observed from pose.
-    Uses the same measurement model as _predict_z_Hland_Jpose, but avoids array allocations.
-    """
-    x, y, th = float(pose[0]), float(pose[1]), float(pose[2])
-    c = float(np.cos(th)); s = float(np.sin(th))
-    dx = float(mu_lm[0] - x)
-    dy = float(mu_lm[1] - y)
-    x_fwd = c * dx + s * dy
-    y_lat = -s * dx + c * dy
-    return c, s, x_fwd, y_lat
-
 def se2_compose(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Compose SE(2) poses/deltas: a ⊕ b (apply body-frame delta b to pose a)."""
     ax, ay, ath = float(a[0]), float(a[1]), float(a[2])
@@ -134,10 +121,6 @@ def se2_compose_many(poses: np.ndarray, delta: np.ndarray, out: Optional[np.ndar
     out[:, 2] = (poses[:, 2] + dth + np.pi) % (2.0 * np.pi) - np.pi
     return out
 
-def se2_compose_single(pose: np.ndarray, delta: np.ndarray) -> np.ndarray:
-    """Small helper: pose ⊕ delta, returns new array (no in-place)."""
-    return se2_compose(pose, delta)
-
 def quat_xyzw_from_yaw(yaw: float) -> np.ndarray:
     """Return quaternion [x, y, z, w] from yaw."""
     half = float(yaw) * 0.5
@@ -180,6 +163,7 @@ class Particle:
     """
     idx: int
     landmarks: Dict[int, LandmarkEKF]     # slot index -> landmark EKF
+    last_slot: Optional[int]               # per-particle hysteresis anchor
 
     _poses: np.ndarray                    # (N,3) shared [x,y,yaw]
     _weights: np.ndarray                  # (N,) shared weights
@@ -196,7 +180,6 @@ class Particle:
     @weight.setter
     def weight(self, v: float) -> None:
         self._weights[self.idx] = float(v)
-
 
 
 class RowFastSLAMNode(Node):
@@ -221,8 +204,6 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("slot_spacing", 1.0)          # [m]
         self.declare_parameter("row_origin_s", 0.0)          # [m] s coordinate of slot 0
         self.declare_parameter("slot_s_gate", 0.65)           # [m] max |s_meas - s_slot| to accept
-        self.declare_parameter("snap_downstream_spacing", False)
-        self.declare_parameter("downstream_snap_mode", "unseen_only")  # "unseen_only" or "all_downstream"
 
         # Template-map initialization
         self.declare_parameter("use_template_map", True)
@@ -253,6 +234,14 @@ class RowFastSLAMNode(Node):
         # Measurement noise (std dev) in robot frame
         self.declare_parameter("meas_std_y_lat", 0.3)        # left/right
         self.declare_parameter("meas_std_x_fwd", 0.3)        # forward/back - heading
+
+        self.declare_parameter("meas_fwd_gate", 0.90)   # m — above this, suppress s-update
+
+        # Data association mode:
+        #   False (default) — single shared weighted-mean pose used for all particles (original behaviour)
+        #   True            — each particle computes s_meas from its own pose; particles may be assigned
+        #                     different slots and only update their individually-assigned landmark
+        self.declare_parameter("assoc.per_particle", False)
 
         # Motion noise parameters (interpreted in body frame)
         self.declare_parameter("motion_noise.a_trans", 0.03)
@@ -288,6 +277,8 @@ class RowFastSLAMNode(Node):
         # Set <= 0.0 to disable a component.
         self.declare_parameter("landmark_sigma_floor_x", 0.2)  # meters (world X)
         self.declare_parameter("landmark_sigma_floor_y", 0.2)  # meters (world Y)
+        self.declare_parameter("landmark_sigma_floor_s", 0.18)   # m along-row (row frame)
+        self.declare_parameter("landmark_sigma_floor_d", 0.12)   # m lateral (row frame)
 
         # Publish-time de-duplication: merge nearby slots so we don't publish
         # two trunks at (almost) the same location.
@@ -299,6 +290,17 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("proposal.enable", False)
         self.declare_parameter("proposal.min_pose_std_xy", 0.08)     # m
         self.declare_parameter("proposal.min_pose_std_yaw", 0.06)    # rad
+
+        # Landmark initialisation covariance.
+        #
+        # The fixed diag(0.5², 0.5²) initialisation ignores two sources of information:
+        #   1. Measurement noise (R): the lidar is tighter laterally than along-heading.
+        #      Sigma_meas = G_z @ R @ G_z^T  where G_z = R(θ)  (always applied).
+        #   2. Pose uncertainty: the particle's pose is known exactly in FastSLAM, but
+        #      when the cloud is still spread out (early run) the *empirical* cloud spread
+        #      is a useful proxy for how uncertain the landmark position really is.
+        #      Set include_pose_uncertainty=True to add  G_x_xy @ P_cloud_xy @ G_x_xy^T.
+        self.declare_parameter("landmark_init.include_pose_uncertainty", False)
 
         # Debug
         self.declare_parameter("debug.log_every_n_meas", 0)          # 0 disables
@@ -313,6 +315,13 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("template_prior.decay_k", 1.5)     # hits; larger = prior lasts longer
         self.declare_parameter("template_prior.max_seen", 30)      # stop applying after this many hits
         self.declare_parameter("template_prior.w", 5.0)           # weight multiplier
+
+        # assoc_origin_s recalibration — periodically re-estimates the s origin
+        # from well-observed best-particle landmarks to correct slow along-row drift.
+        self.declare_parameter("origin_recal.enable",    True)
+        self.declare_parameter("origin_recal.min_seen",  5)    # landmark must have >= N hits
+        self.declare_parameter("origin_recal.alpha",     0.02)  # blend rate (0=frozen, 1=instant)
+        self.declare_parameter("origin_recal.interval",  5)     # run every N measurements
 
         self.declare_parameter("meas_max_lag_sec", 0.1)
 
@@ -366,9 +375,6 @@ class RowFastSLAMNode(Node):
         self.row_origin_s = float(self.get_parameter("row_origin_s").value)
         self.slot_s_gate = float(self.get_parameter("slot_s_gate").value)
 
-        self.snap_downstream_spacing = bool(self.get_parameter("snap_downstream_spacing").value)
-        self.downstream_snap_mode = str(self.get_parameter("downstream_snap_mode").value)
-
         self.use_template_map = bool(self.get_parameter("use_template_map").value)
         self.publish_unseen_template_landmarks = bool(self.get_parameter("publish_unseen_template_landmarks").value)
         self.min_seen_count_to_publish = int(self.get_parameter("min_seen_count_to_publish").value)
@@ -418,6 +424,9 @@ class RowFastSLAMNode(Node):
         self.R00 = float(self.R[0, 0])
         self.R11 = float(self.R[1, 1])
 
+        self._meas_fwd_gate = float(self.get_parameter("meas_fwd_gate").value)
+        self._assoc_per_particle = bool(self.get_parameter("assoc.per_particle").value)
+
         self.a_trans = float(self.get_parameter("motion_noise.a_trans").value)
         self.b_trans = float(self.get_parameter("motion_noise.b_trans").value)
         self.c_lat = float(self.get_parameter("motion_noise.c_lat").value)
@@ -450,6 +459,11 @@ class RowFastSLAMNode(Node):
         self._lm_sigma_floor_var_x = (sx * sx) if (sx > 0.0) else 0.0
         self._lm_sigma_floor_var_y = (sy * sy) if (sy > 0.0) else 0.0
 
+        sf_s = float(self.get_parameter("landmark_sigma_floor_s").value)
+        sf_d = float(self.get_parameter("landmark_sigma_floor_d").value)
+        self._lm_sigma_floor_var_s = (sf_s * sf_s) if sf_s > 0.0 else 0.0
+        self._lm_sigma_floor_var_d = (sf_d * sf_d) if sf_d > 0.0 else 0.0
+
         self.publish_merge_duplicates_enable = bool(self.get_parameter("publish_merge_duplicates.enable").value)
         self.publish_merge_duplicates_dist_m = float(self.get_parameter("publish_merge_duplicates.dist_m").value)
         self.publish_merge_duplicates_only_adjacent = bool(self.get_parameter("publish_merge_duplicates.only_adjacent").value)
@@ -459,6 +473,10 @@ class RowFastSLAMNode(Node):
         self.proposal_enable = bool(self.get_parameter("proposal.enable").value)
         self.proposal_min_pose_std_xy = float(self.get_parameter("proposal.min_pose_std_xy").value)
         self.proposal_min_pose_std_yaw = float(self.get_parameter("proposal.min_pose_std_yaw").value)
+
+        self._lm_init_include_pose_uncertainty = bool(
+            self.get_parameter("landmark_init.include_pose_uncertainty").value
+        )
 
         self.debug_log_every_n_meas = int(self.get_parameter("debug.log_every_n_meas").value)
         self.debug_print_measurement_stamp = bool(self.get_parameter("debug.print_measurement_stamp").value)
@@ -474,6 +492,11 @@ class RowFastSLAMNode(Node):
             self.template_prior_decay_k = 1e-6
         if self.template_prior_max_seen < 0:
             self.template_prior_max_seen = 0
+
+        self.origin_recal_enable   = bool(self.get_parameter("origin_recal.enable").value)
+        self.origin_recal_min_seen = int(self.get_parameter("origin_recal.min_seen").value)
+        self.origin_recal_alpha    = float(self.get_parameter("origin_recal.alpha").value)
+        self.origin_recal_interval = max(1, int(self.get_parameter("origin_recal.interval").value))
 
         # ---------- Row basis ----------
         self.row_yaw_est: Optional[float] = None
@@ -507,6 +530,7 @@ class RowFastSLAMNode(Node):
         self._last_odom_msg: Optional[Odometry] = None
         self._boot_odom_pose: Optional[np.ndarray] = None
         self._pf_initialized = False
+        self.assoc_last_slot = None
 
         # Store last motion noise (body-frame) from odom updates
         self._last_motion_std_body = np.array([0.2, 0.2, 0.1], dtype=float)
@@ -638,16 +662,6 @@ class RowFastSLAMNode(Node):
     def _dbg_reject(self, key: str) -> None:
         if getattr(self, "debug_csv_enable", False):
             self._dbg_reject_counts[key] += 1
-
-    def _dbg_close(self) -> None:
-        fp = getattr(self, "_dbg_csv_fp", None)
-        if fp is not None:
-            try:
-                fp.close()
-            except Exception:
-                pass
-            self._dbg_csv_fp = None
-            self._dbg_csv = None
 
     def _dbg_write_landmarks(self, t_sec: float, meas_idx: int, slot_j: int) -> None:
         if not self.debug_landmark_csv_enable or self._dbg_lm_csv is None:
@@ -909,6 +923,72 @@ class RowFastSLAMNode(Node):
             )
 
             self._log_row_geometry("post-anchor")
+
+    def _recalibrate_origin_s(self) -> None:
+        """
+        Re-estimate assoc_origin_s from well-observed landmarks on the best particle.
+
+        For each landmark j with seen_count >= min_seen, the implied origin is:
+            implied_origin_s = mu_s_j - j * slot_spacing
+        where mu_s_j is the landmark's current s coordinate in the row frame.
+
+        We take the weighted median of all such implied origins (median is more
+        robust than mean to one or two badly-placed landmarks) and blend it into
+        assoc_origin_s with a small alpha so the correction is gradual.
+        """
+        if not self.origin_recal_enable:
+            return
+        if getattr(self, "assoc_origin_s", None) is None:
+            return
+        if getattr(self, "assoc_origin_xy", None) is None:
+            return
+
+        p_best = self._best_particle()
+        if p_best is None:
+            return
+
+        origin_xy = self.assoc_origin_xy
+        t = self.t_hat_assoc
+
+        implied = []
+        weights = []
+        for j, lm in p_best.landmarks.items():
+            if lm.seen_count < self.origin_recal_min_seen:
+                continue
+            mu_s = float(np.dot(lm.mu - origin_xy, t))
+            implied_s0 = mu_s - int(j) * float(self.slot_spacing)
+            implied.append(implied_s0)
+            # Weight by seen_count so landmarks with more observations
+            # contribute more to the estimate
+            weights.append(float(lm.seen_count))
+
+        if len(implied) < 2:
+            return
+
+        # Weighted median: sort by implied value, find weight-cumulative midpoint
+        order = sorted(range(len(implied)), key=lambda i: implied[i])
+        sorted_vals = [implied[i] for i in order]
+        sorted_wts  = [weights[i]  for i in order]
+        total_w = sum(sorted_wts)
+        cumulative = 0.0
+        median_est = sorted_vals[0]
+        for v, w in zip(sorted_vals, sorted_wts):
+            cumulative += w
+            if cumulative >= total_w * 0.5:
+                median_est = v
+                break
+
+        # Soft blend into current value
+        old = float(self.assoc_origin_s)
+        new = (1.0 - self.origin_recal_alpha) * old + self.origin_recal_alpha * median_est
+        self.assoc_origin_s = new
+
+        delta = new - old
+        if abs(delta) > 1e-4:
+            self.get_logger().debug(
+                f"origin_s recal: {old:.4f} → {new:.4f}  (Δ={delta:+.4f}m, "
+                f"anchors={len(implied)}, median_est={median_est:.4f})"
+            )
     
     def _extend_template_slots_to(self, new_max_slot: int) -> None:
         """
@@ -937,9 +1017,7 @@ class RowFastSLAMNode(Node):
             for j in range(start_j, end_j + 1):
                 if j in p.landmarks:
                     continue
-                d0 = self._template_d_for_slot(j)
-                s0 = self.row_origin_s + j * self.slot_spacing
-                mu0 = self.row_origin_xy + s0 * self.t_hat_assoc + d0 * self.n_hat_assoc
+                mu0 = self._template_mu0_for_slot(j)
                 p.landmarks[j] = LandmarkEKF(mu=mu0.copy(), Sigma=Sigma0.copy())
 
         self.num_slots = end_j + 1
@@ -950,12 +1028,29 @@ class RowFastSLAMNode(Node):
 
     def _template_mu0_for_slot(self, j: int) -> np.ndarray:
         """
-        Expected (template) world position for slot j, based on current row_origin_xy, row_origin_s, and row basis.
+        Expected (template) world position for slot j.
+
+        Uses the live assoc_origin (xy + s) when available so the prior
+        stays in sync with _recalibrate_origin_s().  Falls back to the
+        static row_origin values before the first measurement.
         """
         j = int(j)
-        s0 = float(self.row_origin_s) + float(j) * float(self.slot_spacing)
+        # Prefer the recalibrated association origin so the prior doesn't
+        # fight the corrected slot coordinates after origin_recal fires.
+        if (
+            getattr(self, "assoc_origin_xy", None) is not None
+            and np.isfinite(self.assoc_origin_xy).all()
+            and getattr(self, "assoc_origin_s", None) is not None
+        ):
+            origin_xy = self.assoc_origin_xy
+            origin_s  = float(self.assoc_origin_s)
+        else:
+            origin_xy = self.row_origin_xy
+            origin_s  = float(self.row_origin_s)
+
+        s0 = origin_s + float(j) * float(self.slot_spacing)
         d0 = float(self._template_d_for_slot(j))
-        return (self.row_origin_xy + s0 * self.t_hat_assoc + d0 * self.n_hat_assoc).astype(float)
+        return (origin_xy + s0 * self.t_hat_assoc + d0 * self.n_hat_assoc).astype(float)
 
     def _template_prior_alpha(self, seen_count: int) -> float:
         """
@@ -1135,7 +1230,7 @@ class RowFastSLAMNode(Node):
         dtheta_expected = abs(omega) * dt
 
         sigma_fwd = (self.a_trans * dx_expected) + (self.b_trans * dtheta_expected) + self.x_floor
-        sigma_lat = (self.c_lat * dx_expected) + self.y_floor
+        sigma_lat = (self.c_lat) + self.y_floor
         sigma_theta = (self.a_rot * dtheta_expected) + (self.b_rot * dx_expected) + self.yaw_floor
         return np.array([sigma_fwd, sigma_lat, sigma_theta], dtype=float)
 
@@ -1191,6 +1286,7 @@ class RowFastSLAMNode(Node):
             omega = float(msg.twist.twist.angular.z)
             noise_std = self._motion_noise_std(v, omega, dt)  # [fwd, lat, yaw]
             self._last_motion_std_body = noise_std.copy()
+            self._odom_steps_since_meas = getattr(self, '_odom_steps_since_meas', 0) + 1 
 
             # Vectorized motion update across all particles (poses live in shared array)
             poses = getattr(self, "_poses", None)
@@ -1256,7 +1352,6 @@ class RowFastSLAMNode(Node):
 
         # Force work buffers to be reallocated on next use
         self._work_N = 0
-
         N = self.num_particles
 
         # ------------------------------------------------------------------
@@ -1304,7 +1399,9 @@ class RowFastSLAMNode(Node):
                             width_sum=lm.width_sum, width_count=lm.width_count)
                 for j, lm in landmarks_template.items()
             }
-            self.particles.append(Particle(idx=i, landmarks=lm_dict, _poses=self._poses, _weights=self._weights))
+            self.particles.append(Particle(idx=i, landmarks=lm_dict,
+                                           last_slot=self.assoc_last_slot,
+                                           _poses=self._poses, _weights=self._weights))
 
         self._normalize_weights()
 
@@ -1375,11 +1472,51 @@ class RowFastSLAMNode(Node):
             w_meas = float(msg.width) if np.isfinite(msg.width) else None
 
             # ---- Slot association ----
-            slot_j, mu_world_approx = self._data_association_slot(z, d_now_to_meas=d_now_to_meas)
-            if slot_j is None or mu_world_approx is None:
-                self._dbg_reject("assoc_failed")
-                return
-            slot_j = int(slot_j)
+            # shared-pose mode  → one slot_j for all particles (original behaviour)
+            # per-particle mode → each particle gets its own slot assignment;
+            #                     consensus_slot_j (best particle's assignment) is used
+            #                     for global bookkeeping that needs a single value.
+            if self._assoc_per_particle:
+                # poses_meas is not yet computed here; build it now so the
+                # per-particle associator can use it.  The weight/EKF update
+                # loop will reuse the same array (it is computed again there
+                # but se2_compose_many is cheap and idempotent).
+                n_particles_pre = len(self.particles)
+                self._ensure_work_buffers(n_particles_pre)
+                _pm_pre = self._work_poses_meas
+                se2_compose_many(self._poses[:n_particles_pre], d_now_to_meas,
+                                 out=_pm_pre[:n_particles_pre])
+
+                slot_j_arr, mu_world_arr_pp = self._data_association_slot_per_particle(
+                    z, _pm_pre[:n_particles_pre], d_now_to_meas=d_now_to_meas
+                )
+
+                # Consensus: use best particle's slot for bookkeeping.
+                best_idx = int(np.argmax(self._weights[:n_particles_pre]))
+                consensus_slot_j = int(slot_j_arr[best_idx])
+
+                # If the best particle was rejected, fall back to plurality winner
+                if consensus_slot_j < 0:
+                    valid_mask = slot_j_arr >= 0
+                    if not valid_mask.any():
+                        self._dbg_reject("assoc_failed")
+                        return
+                    w_valid = np.where(valid_mask, self._weights[:n_particles_pre], 0.0)
+                    consensus_slot_j = int(slot_j_arr[int(np.argmax(w_valid))])
+
+                # mu_world_approx for bookkeeping: use best particle's value
+                mu_world_approx = mu_world_arr_pp[best_idx].copy()
+                if not np.isfinite(mu_world_approx).all():
+                    mu_world_approx = mu_world_arr_pp[slot_j_arr >= 0][0].copy()
+
+                slot_j = consensus_slot_j  # alias for legacy bookkeeping calls below
+            else:
+                slot_j_arr = None   # sentinel: shared-pose mode
+                slot_j, mu_world_approx = self._data_association_slot(z, d_now_to_meas=d_now_to_meas)
+                if slot_j is None or mu_world_approx is None:
+                    self._dbg_reject("assoc_failed")
+                    return
+                slot_j = int(slot_j)
 
             # --------------------------------------------------------
             # Delayed template-origin anchoring using mean of first N hits
@@ -1463,7 +1600,14 @@ class RowFastSLAMNode(Node):
             _tp_seen: List[int] = []         # lm.seen_count
 
             for i, p in enumerate(particles):
-                lm = p.landmarks.get(slot_j, None)
+                # In per-particle mode each particle has its own slot assignment.
+                # A slot of -1 means this particle's measurement was rejected; skip it.
+                p_slot_j = int(slot_j_arr[i]) if (slot_j_arr is not None) else slot_j
+                if p_slot_j < 0:
+                    lm_list[i] = None
+                    continue
+
+                lm = p.landmarks.get(p_slot_j, None)
 
                 if self.use_template_map:
                     if lm is None:
@@ -1472,7 +1616,7 @@ class RowFastSLAMNode(Node):
                 else:
                     if lm is None:
                         lm = self._init_landmark_from_measurement_at_pose(poses_meas[i], z)
-                        p.landmarks[slot_j] = lm
+                        p.landmarks[p_slot_j] = lm
 
                 # Collect for vectorized template prior below (avoid per-particle method call)
                 if self.use_template_map and self.template_prior_enable:
@@ -1484,7 +1628,7 @@ class RowFastSLAMNode(Node):
                 lm_list[i] = lm
 
                 # Classic likelihood if proposal disabled OR landmark not yet reliable
-                if (not self.proposal_enable) or (lm.seen_count <= 0):
+                if (not self.proposal_enable) or (lm.seen_count < 3):
                     classic_mask[i] = True
 
             if _tp_idx and self.use_template_map and self.template_prior_enable:
@@ -1498,6 +1642,7 @@ class RowFastSLAMNode(Node):
                     alpha[tp_seen >= float(self.template_prior_max_seen)] = 0.0
 
                 if np.any(alpha > 0.0):
+                    # Template prior uses consensus slot for the reference position.
                     mu0_vec = self._template_mu0_for_slot(slot_j)   # (2,) — same for all particles
                     e = tp_mu - mu0_vec.reshape(1, 2)               # (M,2) world error
                     e_s = e @ self.t_hat_assoc                       # (M,) along-row component
@@ -1636,9 +1781,10 @@ class RowFastSLAMNode(Node):
                     xnew_meas[2] = wrap_angle(float(xnew_meas[2]))
 
                     # Store particle pose back in "now" coordinates
-                    p.pose[:] = se2_compose_single(np.asarray(xnew_meas, dtype=float), d_meas_to_now)
+                    p.pose[:] = se2_compose(np.asarray(xnew_meas, dtype=float), d_meas_to_now)
 
             # ---- Innovation gating (median particle) ----
+            slot_committed = False  # set True only after the EKF scatter loop completes
             skip_update = False
             maha_f = maha_arr[np.isfinite(maha_arr)]
             maha_median = float(np.median(maha_f)) if maha_f.size else float("nan")
@@ -1656,6 +1802,8 @@ class RowFastSLAMNode(Node):
                 w = np.exp(logw - maxlog)
                 self._weights[:n_particles] *= w[:n_particles]
                 self._normalize_weights()
+
+            self._odom_steps_since_meas = 0
 
             # ---- Debug CSV row ----
             if getattr(self, "debug_csv_enable", False) and (self._dbg_csv is not None):
@@ -1702,22 +1850,29 @@ class RowFastSLAMNode(Node):
             # ---- Landmark EKF update AFTER pose proposal ----
             if not skip_update:
                 # --- gather indices of valid particles for this slot ---
+                # In per-particle mode each particle may have a different slot;
+                # valid_slots records the slot for each entry in valid_idx.
                 valid_idx = []
+                valid_slots = []  # parallel to valid_idx
                 for i, p in enumerate(self.particles):
-                    lm = p.landmarks.get(slot_j, None)
+                    p_slot_j = int(slot_j_arr[i]) if (slot_j_arr is not None) else slot_j
+                    if p_slot_j < 0:
+                        continue
+                    lm = p.landmarks.get(p_slot_j, None)
                     if self.use_template_map:
                         if lm is None:
                             continue
                     else:
                         if lm is None:
                             lm = self._init_landmark_from_measurement_at_pose(poses_meas[i], z)
-                            p.landmarks[slot_j] = lm
+                            p.landmarks[p_slot_j] = lm
                     valid_idx.append(i)
+                    valid_slots.append(p_slot_j)
 
                 if valid_idx:
                     M = len(valid_idx)
                     # Gather landmark state: mu (M,2), Sigma (M,2,2)
-                    lms_v = [self.particles[i].landmarks[slot_j] for i in valid_idx]
+                    lms_v = [self.particles[i].landmarks[valid_slots[k]] for k, i in enumerate(valid_idx)]
                     mus   = np.array([lm.mu    for lm in lms_v], dtype=np.float64)  # (M,2)
                     sigs  = np.array([lm.Sigma for lm in lms_v], dtype=np.float64)  # (M,2,2)
 
@@ -1727,7 +1882,7 @@ class RowFastSLAMNode(Node):
                         for k, i in enumerate(valid_idx):
                             lm_i = lms_v[k]
                             if (not classic_mask[i]) and (lm_i is not None) and (lm_i.seen_count > 0):
-                                pm[k] = se2_compose_single(self.particles[i].pose, d_now_to_meas)
+                                pm[k] = se2_compose(self.particles[i].pose, d_now_to_meas)
                             else:
                                 pm[k] = poses_meas[i]
                     else:
@@ -1746,6 +1901,11 @@ class RowFastSLAMNode(Node):
                     yp   = -sv * dx_v + cv * dy_v          # (M,) y_lat
                     e0_v = float(z[0]) - xp               # (M,)
                     e1_v = float(z[1]) - yp               # (M,)
+
+                    # Forward gate: if robot has passed the tree, suppress the
+                    # along-row innovation to avoid forward-bias drift in mu_s
+                    if self._meas_fwd_gate > 0.0 and float(z[0]) > self._meas_fwd_gate:
+                        e0_v = np.zeros_like(e0_v)
 
                     # H Sigma H^T  (2x2 per particle, stored as components)
                     sxx_v = sigs[:, 0, 0]; sxy_v = sigs[:, 0, 1]; syy_v = sigs[:, 1, 1]
@@ -1798,15 +1958,28 @@ class RowFastSLAMNode(Node):
                     # Symmetrize: s01 = s10 = (s01+s10)/2
                     sym01 = 0.5 * (new_s01 + new_s10)
 
-                    # Covariance floor
+                    # Covariance floor (world frame)
                     if self._lm_sigma_floor_var_x > 0.0:
                         new_s00 = np.maximum(new_s00, self._lm_sigma_floor_var_x)
                     if self._lm_sigma_floor_var_y > 0.0:
                         new_s11 = np.maximum(new_s11, self._lm_sigma_floor_var_y)
+                    # Covariance floor (row frame) — applied after world-frame floor
+                    if self._lm_sigma_floor_var_s > 0.0 or self._lm_sigma_floor_var_d > 0.0:
+                        t0, t1 = float(self.t_hat_assoc[0]), float(self.t_hat_assoc[1])
+                        n0, n1 = -t1, t0  # n_hat = rotate t_hat by 90 deg
+                        cur_ss = new_s00*t0**2 + 2*sym01*t0*t1 + new_s11*t1**2
+                        cur_dd = new_s00*n0**2 + 2*sym01*n0*n1 + new_s11*n1**2
+                        add_ss = np.maximum(0.0, self._lm_sigma_floor_var_s - cur_ss)
+                        add_dd = np.maximum(0.0, self._lm_sigma_floor_var_d - cur_dd)
+                        new_s00 = new_s00 + add_ss*t0**2 + add_dd*n0**2
+                        new_s11 = new_s11 + add_ss*t1**2 + add_dd*n1**2
+                        sym01   = sym01   + add_ss*t0*t1 + add_dd*n0*n1
 
                     # Scatter results back to landmark objects (only valid particles)
                     for k, i in enumerate(valid_idx):
                         if not ok[k]:
+                            continue
+                        if self.particles[i].landmarks.get(valid_slots[k]) is not lms_v[k]:
                             continue
                         lm_k = lms_v[k]
                         lm_k.mu[0]       += d_mu0[k]
@@ -1818,24 +1991,18 @@ class RowFastSLAMNode(Node):
                         lm_k.seen_count  += 1
                         lm_k.update_width(w_meas)
 
+                    # Mark slot as fully committed: mu, Sigma, seen_count, and
+                    # width have all been written for every valid particle.
+                    slot_committed = True
+
                 if self._spacing_prop_enable:
                     self._propagate_spacing_prior(slot_j)
 
-            # ---- Downstream spacing anchor update ----
-            if self.snap_downstream_spacing:
-                origin_xy = self.assoc_origin_xy if getattr(self, "assoc_origin_xy", None) is not None else self.row_origin_xy
-                s_meas_best = float(np.dot(mu_world_approx - origin_xy, self.t_hat_assoc))
-
-                self.row_origin_s = (float(self.assoc_origin_s) if getattr(self, "assoc_origin_s", None) is not None else self.row_origin_s)
-
-                lm_best = self._best_particle().landmarks.get(slot_j) if self._best_particle() else None
-                seen = int(lm_best.seen_count) if lm_best is not None else 0
-
-                if seen < 2:
-                    alpha = 0.15
-                    target = s_meas_best - slot_j * self.slot_spacing
-                    self.row_origin_s = (1.0 - alpha) * float(self.row_origin_s) + alpha * float(target)
-                    self._apply_downstream_spacing(anchor_j=slot_j)
+            # ---- Periodic assoc_origin_s recalibration ----
+            if (self.origin_recal_enable
+                    and self.measurement_count > 0
+                    and (self.measurement_count % self.origin_recal_interval) == 0):
+                self._recalibrate_origin_s()
 
             # ---- Restore association window after init convergence period ----
             restore_at = getattr(self, "_init_assoc_restore_at", None)
@@ -1852,7 +2019,14 @@ class RowFastSLAMNode(Node):
             # ---- Resampling ----
             self.measurement_count += 1
             past_burn_in = (self.measurement_count > self.resample_burn_in)
-            if past_burn_in and self.resample_interval > 0 and (self.measurement_count % self.resample_interval) == 0:
+            # Only resample when the slot EKF update fully committed (mu, Sigma,
+            # seen_count all written) AND weights were updated this step.
+            # Suppressing on skip_update prevents resampling from a weight
+            # distribution that doesn't reflect the current measurement.
+            if (slot_committed
+                    and past_burn_in
+                    and self.resample_interval > 0
+                    and (self.measurement_count % self.resample_interval) == 0):
                 self._maybe_resample()
 
             # ---- Publish ----
@@ -1912,8 +2086,10 @@ class RowFastSLAMNode(Node):
 
         # If we're doing delayed measurement alignment, evaluate association at measurement time.
         if d_now_to_meas is not None:
-            pose_ref = se2_compose_single(pose_ref, d_now_to_meas)
+            pose_ref = se2_compose(pose_ref, d_now_to_meas)
 
+        # mu_world_approx from the raw measurement — returned to callers for bookkeeping
+        # (template-origin accumulation, snap_downstream_spacing, debug CSV).
         mu_world_approx = self._world_from_robot(pose_ref, z_robot)  # (2,)
 
         # ---- Stable association origin (xy anchor) ----
@@ -1931,16 +2107,21 @@ class RowFastSLAMNode(Node):
             return None, None
 
         # ---- Row coordinate for this measurement ----
-        s_meas = float(np.dot(mu_world_approx - origin_xy, self.t_hat_assoc))
+        # Apply the forward gate before projecting to s_meas so that association
+        # and the EKF s-update are consistent.  Without this, a detection at
+        # z[0] > meas_fwd_gate maps to a biased s_meas that can pull j_raw one
+        # slot too far forward, even though the EKF later zeroes e0 for the same
+        # measurement.  mu_world_approx above is kept un-clamped for callers.
+        if self._meas_fwd_gate > 0.0 and float(z_robot[0]) > self._meas_fwd_gate:
+            z_assoc = z_robot.copy()
+            z_assoc[0] = self._meas_fwd_gate
+            mu_assoc = self._world_from_robot(pose_ref, z_assoc)
+        else:
+            mu_assoc = mu_world_approx
+
+        s_meas = float(np.dot(mu_assoc - origin_xy, self.t_hat_assoc))
 
         if getattr(self, "assoc_origin_s", None) is None:
-            # If template map is on, we normally expect assoc_origin_s to already be set.
-            # But if we're anchoring template origin from the first measurement, we initialize here.
-            # if self.use_template_map and self.template_origin_from_first_measurement:
-            #     # Anchor template origin so slot 0 lands on THIS first measurement
-            #     self._anchor_template_origin_to_first_meas(mu_world_approx)
-            #     return 0, mu_world_approx
-
             if self.use_template_map and self.template_origin_from_first_measurement:
                 # Defer anchoring until we collect N hits in measurement_callback()
                 return 0, mu_world_approx
@@ -1954,44 +2135,224 @@ class RowFastSLAMNode(Node):
 
         origin_s = float(self.assoc_origin_s)
 
-        # ---- Candidate slot index (avoid round() boundary flips) ----
+        # ---- Per-particle hysteresis: tally j_cand votes ----
         u = (s_meas - origin_s) / float(self.slot_spacing)
-        j_cand = int(np.floor(u + 0.5))  # "round" but via floor to keep consistent with hysteresis
+        j_raw = int(np.floor(u + 0.5))
 
-        # ---- Hysteresis / monotonic-ish clamp (debug-friendly) ----
-        last = getattr(self, "assoc_last_slot", None)
-        if last is None:
-            j_idx = j_cand
-        else:
-            # allow small backward correction, avoid large back-jumps
-            j_idx = j_cand
-            if j_idx < last - self.max_back_assoc:
-                j_idx = last - self.max_back_assoc
-            if j_idx > last + self.max_fwd_assoc:
-                j_idx = last + self.max_fwd_assoc
+        votes: Dict[int, float] = {}
+        for p in self.particles:
+            last = p.last_slot
+            if last is None:
+                j_p = j_raw
+            else:
+                j_p = j_raw
+                if j_p < last - self.max_back_assoc:
+                    j_p = last - self.max_back_assoc
+                if j_p > last + self.max_fwd_assoc:
+                    j_p = last + self.max_fwd_assoc
+            votes[j_p] = votes.get(j_p, 0.0) + float(self._weights[p.idx])
+
+        # Plurality winner (weight-based)
+        j_idx = max(votes, key=lambda k: votes[k])
 
         # ---- Gate in s ----
         s_slot = origin_s + float(j_idx) * float(self.slot_spacing)
-
         if abs(s_meas - s_slot) > float(self.slot_s_gate):
             return None, None
 
-        # ---- Template bounds (optionally extend) ----
+        # ---- Template bounds ----
         if self.use_template_map:
             if j_idx < 0:
                 return None, None
-
             if j_idx >= self.num_slots:
                 if self.exceed_slot_num:
                     self._extend_template_slots_to(j_idx)
-                    # If we hit the cap, extension may not reach j_idx
                     if j_idx >= self.num_slots:
                         return None, None
                 else:
                     return None, None
 
-        self.assoc_last_slot = int(j_idx)
+        # ---- Commit: only update last_slot for particles that agreed on j_idx ----
+        # Particles that were clamped to a different candidate keep their current
+        # last_slot so their individual hysteresis windows stay anchored to their
+        # own pose history rather than being dragged by the plurality winner.
+        for p in self.particles:
+            last = p.last_slot
+            if last is None:
+                j_p = j_raw
+            else:
+                j_p = j_raw
+                if j_p < last - self.max_back_assoc:
+                    j_p = last - self.max_back_assoc
+                if j_p > last + self.max_fwd_assoc:
+                    j_p = last + self.max_fwd_assoc
+            if j_p == j_idx:
+                p.last_slot = int(j_idx)
+        self.assoc_last_slot = int(j_idx)   # keep in sync for pre-init paths
         return int(j_idx), mu_world_approx
+
+    @profile
+    def _data_association_slot_per_particle(
+        self,
+        z_robot: np.ndarray,
+        poses_meas: np.ndarray,          # (N, 3) measurement-time poses, already computed
+        d_now_to_meas: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Per-particle data association.
+
+        Each particle computes its own s_meas from its own measurement-time pose and
+        gets assigned its own slot index.  This preserves the full pose diversity of
+        the particle cloud during association, rather than collapsing to a single
+        shared pose before looking up the slot.
+
+        Returns
+        -------
+        slot_j_arr : np.ndarray, shape (N,), dtype int32
+            Slot index for each particle.  -1 means the measurement was rejected for
+            that particle (out of gate, origin not set, etc.).
+        mu_world_arr : np.ndarray, shape (N, 2), dtype float64
+            Approximate world position of the measurement for each particle.
+            Rows corresponding to rejected particles are set to NaN.
+
+        Global side-effects
+        -------------------
+        * assoc_origin_xy / assoc_origin_s are initialised on the first call (same
+          logic as the shared-pose path).
+        * p.last_slot is updated for particles whose per-particle j matches the
+          plurality winner (same selective-commit rule as the shared-pose path).
+        * assoc_last_slot is set to the plurality winner (for pre-init paths).
+        * _extend_template_slots_to() is called if any particle maps to a slot
+          beyond num_slots.
+        """
+        N = len(self.particles)
+        slot_j_arr = np.full(N, -1, dtype=np.int32)
+        mu_world_arr = np.full((N, 2), np.nan, dtype=np.float64)
+
+        if not self.particles or self.last_odom_pose is None:
+            return slot_j_arr, mu_world_arr
+
+        # ---- Ensure association origin is set ----
+        if getattr(self, "assoc_origin_xy", None) is None:
+            if hasattr(self, "row_origin_xy") and np.isfinite(self.row_origin_xy).all():
+                self.assoc_origin_xy = self.row_origin_xy.copy()
+            else:
+                w = self._weights[:N].copy()
+                sw = float(w.sum())
+                w /= sw if sw > 1e-12 else 1.0
+                poses_ref = self._poses[:N]
+                xy_ref = (poses_ref[:, 0:2] * w[:, None]).sum(axis=0)
+                if d_now_to_meas is not None:
+                    pose_mean = np.array([xy_ref[0], xy_ref[1], 0.0])
+                    pose_mean = se2_compose(pose_mean, d_now_to_meas)
+                    xy_ref = pose_mean[:2]
+                self.assoc_origin_xy = xy_ref.copy()
+
+        origin_xy = self.assoc_origin_xy
+
+        # ---- Per-particle mu_world and s_meas ----
+        px = poses_meas[:N, 0]
+        py = poses_meas[:N, 1]
+        th = poses_meas[:N, 2]
+        cth = np.cos(th)
+        sth = np.sin(th)
+
+        z0 = float(z_robot[0])
+        z1 = float(z_robot[1])
+
+        # Apply forward gate clamp to association projection (mirrors EKF gate)
+        z0_assoc = min(z0, self._meas_fwd_gate) if (self._meas_fwd_gate > 0.0 and z0 > self._meas_fwd_gate) else z0
+
+        # World position of measurement from each particle's pose (raw z for return value)
+        mu_world_arr[:N, 0] = px + cth * z0 - sth * z1
+        mu_world_arr[:N, 1] = py + sth * z0 + cth * z1
+
+        # Gated world position for s_meas projection
+        mu_assoc_0 = px + cth * z0_assoc - sth * z1
+        mu_assoc_1 = py + sth * z0_assoc + cth * z1
+
+        # s coordinate in row frame for each particle
+        t0 = float(self.t_hat_assoc[0])
+        t1 = float(self.t_hat_assoc[1])
+        ox = float(origin_xy[0])
+        oy = float(origin_xy[1])
+        s_meas_arr = (mu_assoc_0 - ox) * t0 + (mu_assoc_1 - oy) * t1   # (N,)
+
+        # ---- Handle first-measurement origin_s init (no-template path) ----
+        if getattr(self, "assoc_origin_s", None) is None:
+            if self.use_template_map and self.template_origin_from_first_measurement:
+                slot_j_arr[:N] = 0
+                return slot_j_arr, mu_world_arr
+
+            if self.use_template_map:
+                return slot_j_arr, mu_world_arr
+
+            w = self._weights[:N].copy()
+            sw = float(w.sum())
+            w /= sw if sw > 1e-12 else 1.0
+            s0 = float(np.dot(s_meas_arr, w))
+            self.assoc_origin_s = s0
+            self.assoc_last_slot = 0
+            slot_j_arr[:N] = 0
+            return slot_j_arr, mu_world_arr
+
+        origin_s = float(self.assoc_origin_s)
+        spacing = float(self.slot_spacing)
+
+        # ---- Per-particle slot candidate ----
+        u_arr = (s_meas_arr - origin_s) / spacing
+        j_raw_arr = np.floor(u_arr + 0.5).astype(np.int32)
+
+        # Apply per-particle hysteresis window
+        j_cand_arr = j_raw_arr.copy()
+        for k, p in enumerate(self.particles):
+            last = p.last_slot
+            if last is not None:
+                lo = last - self.max_back_assoc
+                hi = last + self.max_fwd_assoc
+                if j_cand_arr[k] < lo:
+                    j_cand_arr[k] = lo
+                if j_cand_arr[k] > hi:
+                    j_cand_arr[k] = hi
+
+        # ---- Gate: reject particles whose s_meas is too far from their candidate slot ----
+        s_slot_arr = origin_s + j_cand_arr.astype(float) * spacing
+        in_gate = np.abs(s_meas_arr - s_slot_arr) <= float(self.slot_s_gate)
+
+        # ---- Template bounds ----
+        if self.use_template_map:
+            in_gate &= j_cand_arr >= 0
+            max_j_needed = int(j_cand_arr[in_gate].max()) if in_gate.any() else -1
+            if max_j_needed >= self.num_slots:
+                if self.exceed_slot_num:
+                    self._extend_template_slots_to(max_j_needed)
+            in_gate &= j_cand_arr < self.num_slots
+        else:
+            in_gate &= j_cand_arr >= 0
+
+        slot_j_arr[in_gate] = j_cand_arr[in_gate]
+
+        # ---- Plurality winner (for last_slot commit and global bookkeeping) ----
+        votes: Dict[int, float] = {}
+        w_arr = self._weights[:N]
+        for k in range(N):
+            if not in_gate[k]:
+                continue
+            j_p = int(j_cand_arr[k])
+            votes[j_p] = votes.get(j_p, 0.0) + float(w_arr[k])
+
+        if not votes:
+            return slot_j_arr, mu_world_arr
+
+        j_plurality = int(max(votes, key=lambda k: votes[k]))
+
+        # ---- Commit last_slot: only for particles that agree with plurality winner ----
+        for k, p in enumerate(self.particles):
+            if in_gate[k] and int(j_cand_arr[k]) == j_plurality:
+                p.last_slot = j_plurality
+        self.assoc_last_slot = j_plurality
+
+        return slot_j_arr, mu_world_arr
 
     # ------------- Landmark EKF update + proposal helpers -------------
 
@@ -2037,7 +2398,8 @@ class RowFastSLAMNode(Node):
         return z_pred, H_lm, J_x
 
     def _pose_prior_cov_world(self, yaw: float) -> np.ndarray:
-        std = np.array(self._last_motion_std_body, dtype=float).copy()
+        n_steps = max(int(getattr(self, '_odom_steps_since_meas', 1)), 1)
+        std = np.array(self._last_motion_std_body, dtype=float) * np.sqrt(n_steps)
 
         std_xy_floor = float(self.proposal_min_pose_std_xy)
         std_yaw_floor = float(self.proposal_min_pose_std_yaw)
@@ -2059,15 +2421,89 @@ class RowFastSLAMNode(Node):
         P[2, 2] = Pth
         return P
 
-    def _init_landmark_from_measurement(self, p: Particle, z: np.ndarray) -> LandmarkEKF:
-        mu_init = self._world_from_robot(p.pose, z)
-        Sigma_init = np.diag([0.5 ** 2, 0.5 ** 2])
-        return LandmarkEKF(mu=mu_init, Sigma=Sigma_init)
-    
+    def _landmark_init_sigma(
+        self,
+        pose: np.ndarray,
+        z: np.ndarray,
+        P_pose_xy: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Compute the initial landmark covariance for a new EKF slot.
+
+        The measurement model inverse is:
+            lm_x = px + cos(θ) * x_fwd - sin(θ) * y_lat
+            lm_y = py + sin(θ) * x_fwd + cos(θ) * y_lat
+
+        Two uncertainty sources contribute:
+
+        1. Measurement noise (always applied):
+               Sigma_meas = G_z @ R @ G_z^T
+           where G_z = R(θ) (the 2×2 rotation matrix), so
+               Sigma_meas = R(θ) @ R_noise @ R(θ)^T
+           This correctly rotates the sensor's axis-aligned noise into world frame:
+           lateral noise stays tight, along-heading noise stays large.
+
+        2. Pose uncertainty (only when landmark_init.include_pose_uncertainty=True):
+               Sigma_pose = G_x_xy @ P_pose_xy @ G_x_xy^T
+           where G_x_xy = I (identity — lm_xy shifts 1:1 with robot xy),
+           so Sigma_pose = P_pose_xy (the robot xy covariance in world frame).
+
+        Parameters
+        ----------
+        pose       : (3,) particle pose [x, y, θ] at measurement time
+        z          : (2,) measurement [x_fwd, y_lat] in robot frame
+        P_pose_xy  : (2,2) world-frame xy covariance of the robot pose, or None.
+        """
+        th = float(pose[2])
+        c = float(np.cos(th))
+        s = float(np.sin(th))
+
+        # G_z = R(θ) — rotates measurement noise into world frame
+        G_z = np.array([[c, -s],
+                        [s,  c]], dtype=np.float64)
+
+        Sigma = G_z @ self.R @ G_z.T     # (2,2)
+
+        if P_pose_xy is not None:
+            # d(lm_xy)/d(robot_xy) = I  →  pose xy contribution = P_pose_xy directly
+            Sigma = Sigma + P_pose_xy
+
+        return Sigma
+
     def _init_landmark_from_measurement_at_pose(self, pose: np.ndarray, z: np.ndarray) -> LandmarkEKF:
+        """Initialise a new landmark EKF from an explicit pose and measurement z."""
         mu_init = self._world_from_robot(pose, z)
-        Sigma_init = np.diag([0.5 ** 2, 0.5 ** 2])
+        P_pose_xy = self._cloud_pose_xy_cov() if self._lm_init_include_pose_uncertainty else None
+        Sigma_init = self._landmark_init_sigma(pose, z, P_pose_xy)
         return LandmarkEKF(mu=mu_init, Sigma=Sigma_init)
+
+    def _cloud_pose_xy_cov(self) -> np.ndarray:
+        """
+        Empirical weighted xy covariance of the particle cloud in world frame.
+
+        Used as a proxy for pose uncertainty when initialising new landmark slots.
+        """
+        N = len(self.particles)
+        if N < 2:
+            return np.eye(2, dtype=np.float64) * 0.01
+
+        w = self._weights[:N].copy()
+        sw = float(w.sum())
+        if sw <= 1e-12:
+            w[:] = 1.0 / float(N)
+        else:
+            w /= sw
+
+        poses = self._poses[:N]
+        xy = poses[:, 0:2]
+
+        mean_xy = (xy * w[:, None]).sum(axis=0)
+        diff = xy - mean_xy
+        cov = (diff * w[:, None]).T @ diff
+
+        cov[0, 0] = max(float(cov[0, 0]), 1e-6)
+        cov[1, 1] = max(float(cov[1, 1]), 1e-6)
+        return cov
 
     def _propagate_spacing_prior(self, anchor_j: int) -> None:
         """Propagate updated landmark positions to unseen neighbours via spacing prior.
@@ -2152,6 +2588,10 @@ class RowFastSLAMNode(Node):
         e0 = float(z[0]) - xp
         e1 = float(z[1]) - yp
 
+        # Forward gate: suppress along-row innovation when robot has passed the tree
+        if self._meas_fwd_gate > 0.0 and float(z[0]) > self._meas_fwd_gate:
+            e0 = 0.0
+
         # S = H Sigma H^T + R   (H = [[c,s],[-s,c]])
         sxx = float(lm.Sigma[0, 0]); sxy = float(lm.Sigma[0, 1]); syy = float(lm.Sigma[1, 1])
         hs00 =  c*c*sxx + 2*c*s*sxy + s*s*syy
@@ -2192,33 +2632,28 @@ class RowFastSLAMNode(Node):
 
         sym01 = 0.5 * (new_s01 + new_s10)
 
-        # Covariance floor
+        # Covariance floor (world frame)
         if self._lm_sigma_floor_var_x > 0.0:
             new_s00 = max(new_s00, self._lm_sigma_floor_var_x)
         if self._lm_sigma_floor_var_y > 0.0:
             new_s11 = max(new_s11, self._lm_sigma_floor_var_y)
+        # Covariance floor (row frame)
+        if self._lm_sigma_floor_var_s > 0.0 or self._lm_sigma_floor_var_d > 0.0:
+            t0, t1 = float(self.t_hat_assoc[0]), float(self.t_hat_assoc[1])
+            n0, n1 = -t1, t0
+            cur_ss = new_s00*t0**2 + 2*sym01*t0*t1 + new_s11*t1**2
+            cur_dd = new_s00*n0**2 + 2*sym01*n0*n1 + new_s11*n1**2
+            add_ss = max(0.0, self._lm_sigma_floor_var_s - cur_ss)
+            add_dd = max(0.0, self._lm_sigma_floor_var_d - cur_dd)
+            new_s00 += add_ss*t0**2 + add_dd*n0**2
+            new_s11 += add_ss*t1**2 + add_dd*n1**2
+            sym01   += add_ss*t0*t1 + add_dd*n0*n1
 
         lm.Sigma[0, 0] = new_s00
         lm.Sigma[0, 1] = sym01
         lm.Sigma[1, 0] = sym01
         lm.Sigma[1, 1] = new_s11
         lm.seen_count += 1
-
-    # =========================================================
-    #  Snapping logic
-    # =========================================================
-
-    def _apply_downstream_spacing(self, anchor_j: int):
-        for p in self.particles:
-            for k, lm in p.landmarks.items():
-                if k <= anchor_j:
-                    continue
-                if self.downstream_snap_mode == "unseen_only" and lm.seen_count > 0:
-                    continue
-
-                s_k = self.row_origin_s + int(k) * self.slot_spacing
-                d_k = self._template_d_for_slot(int(k)) if lm.seen_count == 0 else float(np.dot(lm.mu - self.row_origin_xy, self.n_hat_assoc))
-                lm.mu = self.row_origin_xy + s_k * self.t_hat_assoc + d_k * self.n_hat_assoc
 
     # =========================================================
     #  Resampling
@@ -2320,7 +2755,9 @@ class RowFastSLAMNode(Node):
                     )
                     for j, lm in lm_src.items()
                 }
-            new_particles.append(Particle(idx=i, landmarks=lm_new, _poses=poses, _weights=w))
+            new_particles.append(Particle(idx=i, landmarks=lm_new,
+                                          last_slot=self.particles[int(parents[i])].last_slot,
+                                          _poses=poses, _weights=w))
 
         self.particles = new_particles
 
