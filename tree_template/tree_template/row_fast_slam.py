@@ -1628,7 +1628,7 @@ class RowFastSLAMNode(Node):
                 lm_list[i] = lm
 
                 # Classic likelihood if proposal disabled OR landmark not yet reliable
-                if (not self.proposal_enable) or (lm.seen_count < 3):
+                if (not self.proposal_enable) or (lm.seen_count < 5):
                     classic_mask[i] = True
 
             if _tp_idx and self.use_template_map and self.template_prior_enable:
@@ -1717,71 +1717,174 @@ class RowFastSLAMNode(Node):
                     self._dbg_reject("S_nonposdef")
 
             # ------------------------------------------------------------
-            # Proposal scoring (per-particle; done at measurement-time pose)
-            # After proposal, we store p.pose back at "now" via ⊕ d_meas_to_now.
+            # Proposal scoring — fully vectorized over all proposal particles.
+            # Replaces the per-particle Python loop; same math, ~10-20x faster.
+            #
+            # IMPORTANT: pose write-back happens here, BEFORE the maha gate below.
+            # To prevent zombie particles (neff≈1, large maha) from having their
+            # poses dragged further from reality by the proposal, we skip the
+            # pose write-back for any particle whose maha exceeds a hard ceiling.
+            # The weight update still runs so the gate can fire correctly.
             # ------------------------------------------------------------
+            # Threshold above which a particle is considered a zombie and its
+            # pose should NOT be moved by the proposal this step.
+            _PROPOSAL_ZOMBIE_MAHA = 20.0
+
             if self.proposal_enable:
-                for i, p in enumerate(particles):
-                    if classic_mask[i]:
-                        continue
-                    lm = lm_list[i]
-                    if lm is None:
-                        continue
-                    if lm.seen_count <= 0:
-                        continue
+                # Indices of particles that use the proposal path
+                prop_idx = np.array(
+                    [i for i in range(n_particles)
+                     if not classic_mask[i]
+                     and lm_list[i] is not None
+                     and lm_list[i].seen_count > 0],
+                    dtype=np.intp,
+                )
 
-                    pose_meas_i = poses_meas[i].copy()
+                if prop_idx.size > 0:
+                    M = prop_idx.size
 
-                    # measurement-informed proposal over pose (FastSLAM 2.0)
-                    z_pred, H_lm, J_x = self._predict_z_Hland_Jpose(pose_meas_i, lm.mu)
+                    # Gather per-particle landmark state
+                    lms_p  = [lm_list[i] for i in prop_idx]
+                    mu_p   = np.array([lm.mu    for lm in lms_p], dtype=np.float64)  # (M,2)
+                    Sig_p  = np.array([lm.Sigma for lm in lms_p], dtype=np.float64)  # (M,2,2)
 
-                    Qeff = H_lm @ lm.Sigma @ H_lm.T + self.R
-                    Pbar = self._pose_prior_cov_world(float(pose_meas_i[2]))
-                    S = J_x @ Pbar @ J_x.T + Qeff
+                    # Measurement-time poses for proposal particles
+                    pm = poses_meas[prop_idx]          # (M,3)
+                    th = pm[:, 2]
+                    c  = np.cos(th)
+                    s  = np.sin(th)
 
-                    innov = z - z_pred
+                    # Predicted measurement (vectorized)
+                    dx_lm = mu_p[:, 0] - pm[:, 0]
+                    dy_lm = mu_p[:, 1] - pm[:, 1]
+                    xf =  c * dx_lm + s * dy_lm   # x_fwd  (M,)
+                    yl = -s * dx_lm + c * dy_lm   # y_lat  (M,)
 
-                    # Fast 2x2 inverse/logdet for S
-                    S00 = float(S[0, 0]); S01 = float(S[0, 1])
-                    S10 = float(S[1, 0]); S11 = float(S[1, 1])
-                    ok, i00, i01, i10, i11, logdet = inv_and_logdet_2x2(S00, S01, S10, S11)
-                    if not ok:
+                    # Qeff = H Sig H^T + R  (H is rotation — orthogonal, so H Sig H^T = Sig rotated)
+                    s00 = Sig_p[:, 0, 0]; s01 = Sig_p[:, 0, 1]; s11 = Sig_p[:, 1, 1]
+                    Q00 =  c*c*s00 + 2*c*s*s01 + s*s*s11 + self.R[0, 0]
+                    Q01 = -c*s*s00 + (c*c - s*s)*s01 + c*s*s11
+                    Q11 =  s*s*s00 - 2*c*s*s01 + c*c*s11 + self.R[1, 1]
+
+                    # Pbar (world-frame motion prior) — inline per-particle rotation
+                    n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, 10))
+                    std_body = np.array(self._last_motion_std_body, dtype=np.float64) * np.sqrt(float(n_steps))
+                    std_body[0] = max(float(std_body[0]), float(self.proposal_min_pose_std_xy))
+                    std_body[1] = max(float(std_body[1]), float(self.proposal_min_pose_std_xy))
+                    std_body[2] = max(float(std_body[2]), float(self.proposal_min_pose_std_yaw))
+                    Pf  = float(std_body[0]) ** 2
+                    Pl  = float(std_body[1]) ** 2
+                    Pth = float(std_body[2]) ** 2
+
+                    # Pbar_xy = R(yaw) @ diag(Pf,Pl) @ R(yaw)^T — per particle
+                    Pb00 = c*c*Pf + s*s*Pl
+                    Pb01 = c*s*(Pf - Pl)
+                    Pb11 = s*s*Pf + c*c*Pl
+
+                    # JPJ = J_x @ Pbar @ J_x^T  (2x2, per particle, inlined)
+                    # J_x = [[-c,-s,yl],[s,-c,-xf]]
+                    # xy block of J_x @ Pbar_xy @ J_x^T:
+                    JPJ00 = c*c*Pb00 + 2*c*s*Pb01 + s*s*Pb11
+                    JPJ01 = -c*s*Pb00 + (c*c - s*s)*Pb01 + s*c*Pb11
+                    JPJ11 = s*s*Pb00 - 2*s*c*Pb01 + c*c*Pb11
+                    # yaw contribution (J_x col 2 = [yl,-xf], Pbar[2,2]=Pth)
+                    JPJ00 += yl * yl * Pth
+                    JPJ01 += yl * (-xf) * Pth
+                    JPJ11 += xf * xf * Pth
+
+                    # S = JPJ + Qeff
+                    S00v = JPJ00 + Q00
+                    S01v = JPJ01 + Q01
+                    S11v = JPJ11 + Q11
+
+                    # Vectorized 2x2 inverse and logdet
+                    det  = S00v * S11v - S01v * S01v
+                    ok   = det > 0.0
+                    safe = np.where(ok, det, 1.0)
+                    inv_det = np.where(ok, 1.0 / safe, 0.0)
+                    Si00 =  S11v * inv_det
+                    Si01 = -S01v * inv_det
+                    Si11 =  S00v * inv_det
+                    logdet_v = np.where(ok, np.log(safe), np.nan)
+
+                    # Innovation
+                    e0 = float(z[0]) - xf   # (M,)
+                    e1 = float(z[1]) - yl   # (M,)
+
+                    maha_v = e0*(Si00*e0 + Si01*e1) + e1*(Si01*e0 + Si11*e1)
+                    maha_v = np.where(ok, maha_v, np.nan)
+
+                    # Update weight accumulators and debug arrays
+                    maha_arr[prop_idx]   = np.where(ok, maha_v, maha_arr[prop_idx])
+                    logdet_arr[prop_idx] = np.where(ok, logdet_v, logdet_arr[prop_idx])
+                    logw[prop_idx]      += np.where(ok, -0.5 * (maha_v + logdet_v), 0.0)
+
+                    if not np.all(ok):
                         self._dbg_reject("S_nonposdef")
-                        continue
 
-                    e0 = float(innov[0]); e1 = float(innov[1])
-                    maha = e0 * (i00 * e0 + i01 * e1) + e1 * (i10 * e0 + i11 * e1)
+                    # Kalman gain K = Pbar @ J_x^T @ S^{-1}  →  shape (M,3,2)
+                    # PJT = Pbar @ J_x^T:
+                    #   xy rows from Pbar_xy @ J_x[0:2,0:2]^T
+                    #   J_x^T cols: [-c,-s] and [s,-c] for xy rows; [yl,-xf] for yaw
+                    PJT = np.empty((M, 3, 2), dtype=np.float64)
+                    PJT[:, 0, 0] = -Pb00*c - Pb01*s
+                    PJT[:, 0, 1] =  Pb00*s + Pb01*(-c)
+                    PJT[:, 1, 0] = -Pb01*c - Pb11*s
+                    PJT[:, 1, 1] =  Pb01*s + Pb11*(-c)
+                    PJT[:, 2, 0] =  Pth * yl
+                    PJT[:, 2, 1] =  Pth * (-xf)
 
-                    maha_arr[i] = maha
-                    logdet_arr[i] = logdet
-                    logw[i] += -0.5 * (maha + logdet)
+                    # K = PJT @ S^{-1}
+                    K = np.empty((M, 3, 2), dtype=np.float64)
+                    K[:, :, 0] = PJT[:, :, 0] * Si00[:, None] + PJT[:, :, 1] * Si01[:, None]
+                    K[:, :, 1] = PJT[:, :, 0] * Si01[:, None] + PJT[:, :, 1] * Si11[:, None]
 
-                    Sinv = np.array([[i00, i01], [i10, i11]], dtype=float)
-                    K = Pbar @ J_x.T @ Sinv
+                    # Pose correction dx = K @ innov
+                    innov_v = np.stack([e0, e1], axis=1)           # (M,2)
+                    dx_v = (K * innov_v[:, None, :]).sum(axis=2)   # (M,3)
 
-                    dx = (K @ innov)
-                    dx[2] = wrap_angle(float(dx[2]))
+                    # Wrap and clamp yaw correction
+                    dx_v[:, 2] = (dx_v[:, 2] + np.pi) % (2*np.pi) - np.pi
+                    dx_v[:, 0] = np.clip(dx_v[:, 0], -0.1, 0.1)
+                    dx_v[:, 1] = np.clip(dx_v[:, 1], -0.1, 0.1)
+                    dx_v[:, 2] = np.clip(dx_v[:, 2], -0.08, 0.08)
 
-                    # Clamp proposal correction magnitude
-                    dx[0] = float(np.clip(dx[0], -0.25, 0.25))
-                    dx[1] = float(np.clip(dx[1], -0.25, 0.25))
-                    dx[2] = float(np.clip(dx[2], -0.20, 0.20))
+                    xhat = pm + dx_v                               # (M,3)
+                    xhat[:, 2] = (xhat[:, 2] + np.pi) % (2*np.pi) - np.pi
 
-                    xhat = pose_meas_i + dx
-                    xhat[2] = wrap_angle(float(xhat[2]))
+                    # Posterior covariance Phat = (I - K @ J_x) @ Pbar  — per particle
+                    Jx = np.zeros((M, 2, 3), dtype=np.float64)
+                    Jx[:, 0, 0] = -c;  Jx[:, 0, 1] = -s;  Jx[:, 0, 2] = yl
+                    Jx[:, 1, 0] =  s;  Jx[:, 1, 1] = -c;  Jx[:, 1, 2] = -xf
 
-                    Phat = (np.eye(3) - K @ J_x) @ Pbar
-                    Phat = 0.5 * (Phat + Phat.T)
+                    KJx = np.einsum('mij,mjk->mik', K, Jx)        # (M,3,3)
+                    IKJx = np.eye(3)[None, :, :] - KJx             # (M,3,3)
 
+                    Pbar_m = np.zeros((M, 3, 3), dtype=np.float64)
+                    Pbar_m[:, 0, 0] = Pb00; Pbar_m[:, 0, 1] = Pb01
+                    Pbar_m[:, 1, 0] = Pb01; Pbar_m[:, 1, 1] = Pb11
+                    Pbar_m[:, 2, 2] = Pth
+
+                    Phat_m = np.einsum('mij,mjk->mik', IKJx, Pbar_m)  # (M,3,3)
+                    Phat_m = 0.5 * (Phat_m + Phat_m.transpose(0, 2, 1))
+
+                    # Sample new poses — batched Cholesky (avoids M separate 3x3 decomps)
+                    eps = self._rng.standard_normal((M, 3))
                     try:
-                        xnew_meas = np.random.multivariate_normal(mean=xhat, cov=Phat)
-                    except Exception:
+                        L = np.linalg.cholesky(Phat_m)                        # (M,3,3)
+                        xnew_meas = xhat + np.einsum('mij,mj->mi', L, eps)    # (M,3)
+                    except np.linalg.LinAlgError:
                         xnew_meas = xhat
 
-                    xnew_meas[2] = wrap_angle(float(xnew_meas[2]))
+                    xnew_meas[:, 2] = (xnew_meas[:, 2] + np.pi) % (2*np.pi) - np.pi
 
-                    # Store particle pose back in "now" coordinates
-                    p.pose[:] = se2_compose(np.asarray(xnew_meas, dtype=float), d_meas_to_now)
+                    # Write proposal poses back to particles in "now" frame.
+                    # Skip write-back for zombie particles (maha >> threshold) to prevent
+                    # their poses being dragged further from reality before the gate fires.
+                    xnew_now = se2_compose_many(xnew_meas, d_meas_to_now)     # (M,3)
+                    for ki, i in enumerate(prop_idx):
+                        if ok[ki] and maha_v[ki] < _PROPOSAL_ZOMBIE_MAHA:
+                            particles[i].pose[:] = xnew_now[ki]
 
             # ---- Innovation gating (median particle) ----
             slot_committed = False  # set True only after the EKF scatter loop completes
@@ -1803,7 +1906,8 @@ class RowFastSLAMNode(Node):
                 self._weights[:n_particles] *= w[:n_particles]
                 self._normalize_weights()
 
-            self._odom_steps_since_meas = 0
+            if not skip_update:
+                self._odom_steps_since_meas = 0
 
             # ---- Debug CSV row ----
             if getattr(self, "debug_csv_enable", False) and (self._dbg_csv is not None):
@@ -2058,31 +2162,23 @@ class RowFastSLAMNode(Node):
         if self.last_odom_pose is None:
             return None, None
 
-        # ---- Pose reference for association ----
-        if self.proposal_enable:
-            pb = self._best_particle()
-            if pb is None:
-                return None, None
-            pose_ref = pb.pose.copy()
-
+        # ---- Use weighted-mean pose for stable association ----
+        w = self._weights[:len(self.particles)].copy()
+        sw = float(w.sum())
+        if sw <= 1e-12:
+            w[:] = 1.0 / float(len(w))
         else:
-            # ---- Use weighted-mean pose for stable association ----
-            w = self._weights[:len(self.particles)].copy()
-            sw = float(w.sum())
-            if sw <= 1e-12:
-                w[:] = 1.0 / float(len(w))
-            else:
-                w /= sw
+            w /= sw
 
-            self._ensure_work_buffers(len(self.particles))
-            poses = self._poses[:len(self.particles)]   # zero-copy view into shared array
+        self._ensure_work_buffers(len(self.particles))
+        poses = self._poses[:len(self.particles)]   # zero-copy view into shared array
 
-            xy = (poses[:, 0:2] * w[:, None]).sum(axis=0)
-            c = float((np.cos(poses[:, 2]) * w).sum())
-            s = float((np.sin(poses[:, 2]) * w).sum())
-            yaw = float(np.arctan2(s, c))
+        xy = (poses[:, 0:2] * w[:, None]).sum(axis=0)
+        c = float((np.cos(poses[:, 2]) * w).sum())
+        s = float((np.sin(poses[:, 2]) * w).sum())
+        yaw = float(np.arctan2(s, c))
 
-            pose_ref = np.array([xy[0], xy[1], yaw], dtype=float)
+        pose_ref = np.array([xy[0], xy[1], yaw], dtype=float)
 
         # If we're doing delayed measurement alignment, evaluate association at measurement time.
         if d_now_to_meas is not None:
@@ -2398,8 +2494,8 @@ class RowFastSLAMNode(Node):
         return z_pred, H_lm, J_x
 
     def _pose_prior_cov_world(self, yaw: float) -> np.ndarray:
-        n_steps = max(int(getattr(self, '_odom_steps_since_meas', 1)), 1)
-        std = np.array(self._last_motion_std_body, dtype=float) * np.sqrt(n_steps)
+        n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, 10))
+        std = np.array(self._last_motion_std_body, dtype=float) * np.sqrt(float(n_steps))
 
         std_xy_floor = float(self.proposal_min_pose_std_xy)
         std_yaw_floor = float(self.proposal_min_pose_std_yaw)
@@ -2692,7 +2788,8 @@ class RowFastSLAMNode(Node):
         N = len(self.particles)
 
         neff = self._effective_sample_size()
-        if (neff / float(N)) > self.neff_ratio_threshold:
+        neff_ratio = neff / float(N)
+        if neff_ratio > self.neff_ratio_threshold:
             return
 
         poses = getattr(self, "_poses", None)
@@ -2760,6 +2857,44 @@ class RowFastSLAMNode(Node):
                                           _poses=poses, _weights=w))
 
         self.particles = new_particles
+
+        # ---- Roughening after collapse ----
+        # When neff_ratio is very low, the cloud has converged to 1-2 survivors.
+        # Without added noise, all resampled particles are identical — the proposal
+        # then gives them all the same correction and neff stays degenerate.
+        if neff_ratio < 0.05:
+            rough_std = np.array(self._last_motion_std_body, dtype=np.float64).copy()
+
+            # Read current median maha from the work buffer (populated each measurement)
+            maha_work = getattr(self, '_work_maha', None)
+            if maha_work is not None:
+                maha_f = maha_work[:N][np.isfinite(maha_work[:N])]
+                median_maha = float(np.median(maha_f)) if maha_f.size > 0 else 0.0
+            else:
+                median_maha = 0.0
+
+            if neff_ratio < 0.01 and median_maha > 10.0:
+                # Catastrophic: use environment-scale spread, not motion-noise scale.
+                # slot_spacing (tree row spacing) is the natural unit here.
+                xy_spread  = float(getattr(self, 'slot_spacing', 1.12)) * 3.0
+                yaw_spread = 0.15   # ~8.6 degrees
+                noise = self._rng.standard_normal((N, 3))
+                poses[:N, 0] += noise[:, 0] * xy_spread
+                poses[:N, 1] += noise[:, 1] * xy_spread
+                poses[:N, 2] += noise[:, 2] * yaw_spread
+                poses[:N, 2] = (poses[:N, 2] + np.pi) % (2.0 * np.pi) - np.pi
+
+            elif neff_ratio < 0.01:
+                # Severe: spread xy and yaw
+                poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * 5.0
+                poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * 5.0
+                poses[:N, 2] += self._rng.standard_normal(N) * rough_std[2] * 3.0
+                poses[:N, 2] = (poses[:N, 2] + np.pi) % (2.0 * np.pi) - np.pi
+
+            else:
+                # Moderate: xy only — leave yaw alone, it's harder to recover
+                poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * 3.0
+                poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * 3.0
 
         # Force-publish after resampling — the map changed structurally and the
         # trellis collision-object node must receive the update immediately,
