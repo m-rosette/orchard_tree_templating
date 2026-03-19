@@ -78,6 +78,7 @@ class TrunkDetectionRelay(Node):
         # -------- TF2 --------
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self._T_cached: Optional[np.ndarray] = None
 
         # -------- Pub/Sub --------
         self.meas_pub = self.create_publisher(TrunkInfo, self.output_topic, 10)
@@ -181,10 +182,11 @@ class TrunkDetectionRelay(Node):
 
         # TF: camera optical -> base (or output frame)
         if self.output_frame != self.camera_frame:
-            T = self._lookup_T(self.output_frame, self.camera_frame)  # target=base, source=optical
-            if T is None:
+            if self._T_cached is None:
+                self._T_cached = self._lookup_T(self.output_frame, self.camera_frame)
+            if self._T_cached is None:
                 return
-            p_base = self._apply_T_batch(T, pos_cam)
+            p_base = self._apply_T_batch(self._T_cached, pos_cam)
         else:
             p_base = pos_cam
 

@@ -20,48 +20,48 @@ trunk_detection_relay:
 
 row_fast_slam:
   ros__parameters:
-    num_particles: 800
+    num_particles: 1000
     measurement_topic: /trunk_measurements_raw
     odom_topic: /odometry/filtered
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
-
+ 
     # Slot initialization (map init)
-    slot_spacing: 1.2
-    num_slots: 60
+    slot_spacing: 1.15
+    num_slots: 50
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_s: 0.0
-    slot_s_gate: 0.7
-
+    slot_s_gate: 0.5
+ 
     row_origin_x: .nan
     row_origin_y: .nan
     row_dir_sign: 1
-    row_yaw_init_window: 50
+    row_yaw_init_window: 25
     min_seen_count_to_publish: 5
     use_template_map: true
     template_origin_from_first_measurement: true
     template_origin_min_hits: 8
     publish_unseen_template_landmarks: false
     use_global_row_yaw: true
-
+ 
     # Initial covariance - landmark uncertainty (meters, row frame)
-    prior_sigma_s: 0.6
-    prior_sigma_d: 0.5
-
+    prior_sigma_s: 0.7
+    prior_sigma_d: 0.3
+ 
     # Row-relative particle initialization
-    init_sigma_s: 0.5
-    init_sigma_d: 0.4
+    init_sigma_s: 0.7
+    init_sigma_d: 0.15
     init_sigma_yaw: 0.04
-
+ 
     landmark_init.include_pose_uncertainty: true   # default — pure FastSLAM (correct)
                                                     # true — adds cloud spread to init Sigma
-
+ 
     # Local trunk associations
     assoc.per_particle: true
     max_back_assoc: 1
-    max_fwd_assoc: 1
-
+    max_fwd_assoc: 2
+ 
     # Trunk row side classification
     start_side: near
     init_d_near: 0.0
@@ -69,14 +69,14 @@ row_fast_slam:
     side_mode: semantic
     semantic_side_min_votes: 3
     semantic_side_fallback: fixed
-
+ 
     # Measurement distribution (meters, robot frame)
-    meas_std_y_lat: 0.4
-    meas_std_x_fwd: 0.5
-    meas_fwd_gate: 0.8
-
+    meas_std_y_lat: 0.25
+    meas_std_x_fwd: 0.7
+    meas_fwd_gate: 1.0
+ 
     # Motion distribution (robot frame)
-    motion_noise.a_trans: 0.08   # meters of std per meter traveled
+    motion_noise.a_trans: 0.06   # meters of std per meter traveled
     motion_noise.b_trans: 0.03   # meters of std per radian of rotation
     motion_noise.c_lat: 0.01     # meters of std for lateral motion (e.g. slip)
     motion_noise.a_rot: 0.01    # radians of std per radian of rotation
@@ -84,62 +84,79 @@ row_fast_slam:
     motion_noise.x_floor: 1e-4 # minimum motion noise in x to prevent particle deprivation
     motion_noise.y_floor: 1e-4 # minimum motion noise in y to prevent particle deprivation
     motion_noise.yaw_floor: 1e-4 # minimum motion noise in yaw to prevent particle deprivation
-
+ 
     # Resampling
     resample_interval: 30
-    neff_ratio_threshold: 0.25
-    resample_burn_in: 20
+    neff_ratio_threshold: 0.35
+    resample_burn_in: 30
 
+    # Post-resample roughening tiers (applied when neff_ratio falls below threshold)
+    resample_roughen.neff_moderate: 0.08        # trigger roughening at all
+    resample_roughen.neff_severe: 0.01          # severe / catastrophic tier
+    resample_roughen.maha_catastrophic: 10.0    # Mahalanobis^2 to escalate to catastrophic
+    resample_roughen.scale_moderate_xy: 3.0     # multiplier on motion noise std (moderate tier)
+    resample_roughen.scale_severe_xy: 5.0       # multiplier on motion noise std (severe tier)
+    resample_roughen.scale_severe_yaw: 3.0
+    resample_roughen.catastrophic_xy_slots: 3.0 # xy spread = slot_spacing * this
+    resample_roughen.catastrophic_yaw: 0.15     # rad (~8.6 deg)
+ 
     # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
-    maha_gate_median: 3.0
-    maha_gate_min_particles: 50
-
+    maha_gate_median: 7.0
+    maha_gate_min_particles: 25
+ 
     # World-frame floor
     landmark_sigma_floor_x: 0.0
     landmark_sigma_floor_y: 0.0
-
+ 
     # Row-frame floor params
     landmark_sigma_floor_s: 0.1
     landmark_sigma_floor_d: 0.1
-
+ 
     # Merge neighboring associations
     publish_merge_duplicates.enable: false
     publish_merge_duplicates.dist_m: 0.1
     publish_merge_duplicates.only_adjacent: true
-
+ 
     # FASTSLAM 2.0 - measurement-informed pose proposal
     proposal.enable: true
-    proposal.min_pose_std_xy: 0.05
-    proposal.min_pose_std_yaw: 0.02
-
+    proposal.min_pose_std_xy: 0.01
+    proposal.min_pose_std_yaw: 0.005
+    proposal.max_correction_xy: 0.10    # m -> Max per-step pose correction applied by the proposal
+    proposal.max_correction_yaw: 0.08   # rad -> Max per-step pose correction applied by the proposal
+    proposal.zombie_maha_threshold: 20.0 # Particles with Mahalanobis^2 above this are not moved by the proposal (zombie guard)
+    proposal.min_landmark_seen: 5 # Min observations before a landmark is used on the proposal path (below → classic)
+    proposal.max_odom_steps: 10 # Cap on accumulated odom steps used to scale pose prior uncertainty in proposal
+ 
     # Template soft prior (weight update per landmark)
-    template_prior.enable: false
+    template_prior.enable: true
     template_prior.sigma_s: 0.30
     template_prior.sigma_d: 0.20
-    template_prior.decay_k: 8.0
+    template_prior.decay_k: 10.0
     template_prior.max_seen: 20
     template_prior.w: 1.0
-
+ 
     origin_recal.enable: true
     origin_recal.min_seen: 8
-    origin_recal.alpha: 0.04
+    origin_recal.alpha: 0.06
     origin_recal.interval: 5
-
+ 
     # Inter-landmark spacing propagation
     spacing_propagation.enable: true
     spacing_propagation.min_seen: 8     # detections before propagating FROM this slot
-    spacing_propagation.max_unseen: 8  # detections before stop nudging TO this slot
-    spacing_propagation.alpha: 0.05      # nudge strength per hop [0,1]
+    spacing_propagation.max_unseen: 8   # detections before stop nudging TO this slot
+    spacing_propagation.alpha: 0.06     # nudge strength per hop [0,1]
     spacing_propagation.n_hops: 1       # how many neighbours each direction
-
+    spacing_propagation.consistency_sigma_frac: 0.3 # Consistency scoring: sigma as fraction of slot_spacing (0.2 = ±22 cm at 1.12 m spacing)
+    spacing_propagation.consistency_min_seen: 3 # Neighbour must have this many real observations before it counts as evidence
+ 
     # Publish throttle
     publish.registry_min_interval: 0.1   # s  (10 Hz)
     publish.odom_min_interval: 0.05      # s  (20 Hz)
-
+ 
     # Message lag
     meas_max_lag_sec: 0.5
     odom_history_sec: 20.0
-
+ 
     # Debugging
     debug.csv_enable: true
     debug.log_every_n_meas: 0

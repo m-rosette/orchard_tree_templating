@@ -194,75 +194,92 @@ class RowFastSLAMNode(Node):
         super().__init__("row_fast_slam")
 
         # ---------- Parameters ----------
-        self.declare_parameter("num_particles", 800)
+        self.declare_parameter("num_particles", 600)
         self.declare_parameter("measurement_topic", "trunk_measurements_raw")
         self.declare_parameter("odom_topic", "/odometry/filtered")
         self.declare_parameter("registry_topic", "fastslam_registry")
         self.declare_parameter("odom_best_topic", "odom_slam_best")
 
         # Row structure (slot indexing along the row)
-        self.declare_parameter("slot_spacing", 1.0)          # [m]
+        self.declare_parameter("slot_spacing", 1.2)          # [m]
         self.declare_parameter("row_origin_s", 0.0)          # [m] s coordinate of slot 0
-        self.declare_parameter("slot_s_gate", 0.65)           # [m] max |s_meas - s_slot| to accept
+        self.declare_parameter("slot_s_gate", 0.6)           # [m] max |s_meas - s_slot| to accept
 
         # Template-map initialization
         self.declare_parameter("use_template_map", True)
         self.declare_parameter("publish_unseen_template_landmarks", False) # If False, we will NOT publish template landmarks until they've been seen at least N times.
-        self.declare_parameter("min_seen_count_to_publish", 5)
+        self.declare_parameter("min_seen_count_to_publish", 3)
         self.declare_parameter("use_global_row_yaw", True)
         self.declare_parameter("num_slots", 60) # Marcus manually counted 68 trunk in Jostan's dataset for row 12 (not sure which are "polinators")
         self.declare_parameter("exceed_slot_num", True) # Allow dynamic extension beyond num_slots (when template map is enabled)
-        self.declare_parameter("max_extra_slots", 0)  # 0 disables cap
+        self.declare_parameter("max_extra_slots", 20)  # 0 disables cap
         self.declare_parameter("row_origin_x", float("nan"))          # if NaN, use first odom pose
         self.declare_parameter("row_origin_y", float("nan"))         # if NaN, use first odom pose
         self.declare_parameter("row_dir_sign", 1)            # (+1 => +X, -1 => -X)
         self.declare_parameter("max_back_assoc", 2)
-        self.declare_parameter("max_fwd_assoc", 3)
+        self.declare_parameter("max_fwd_assoc", 2)
 
         # Row-relative particle initialisation spread
-        self.declare_parameter("init_sigma_s",   1.5)
-        self.declare_parameter("init_sigma_d",   0.25)
-        self.declare_parameter("init_sigma_yaw", 0.03)
+        self.declare_parameter("init_sigma_s",   0.5)
+        self.declare_parameter("init_sigma_d",   0.15)
+        self.declare_parameter("init_sigma_yaw", 0.02)
         
         self.declare_parameter("start_side", "near")       # slot 0 side (for template parity)
         self.declare_parameter("init_d_near", 0.0)
         self.declare_parameter("init_d_far", 0.0)
-        self.declare_parameter("prior_sigma_s", 0.5)
-        self.declare_parameter("prior_sigma_d", 0.45)
+        self.declare_parameter("prior_sigma_s", 0.7)
+        self.declare_parameter("prior_sigma_d", 0.3)
         self.declare_parameter("side_mode", "semantic")    # "fixed" or "geometry" or "semantic"
 
         # Measurement noise (std dev) in robot frame
         self.declare_parameter("meas_std_y_lat", 0.3)        # left/right
-        self.declare_parameter("meas_std_x_fwd", 0.3)        # forward/back - heading
+        self.declare_parameter("meas_std_x_fwd", 0.5)        # forward/back - heading
 
-        self.declare_parameter("meas_fwd_gate", 0.90)   # m — above this, suppress s-update
+        self.declare_parameter("meas_fwd_gate", 1.1)   # m — above this, suppress s-update
 
         # Data association mode:
         #   False (default) — single shared weighted-mean pose used for all particles (original behaviour)
         #   True            — each particle computes s_meas from its own pose; particles may be assigned
         #                     different slots and only update their individually-assigned landmark
-        self.declare_parameter("assoc.per_particle", False)
+        self.declare_parameter("assoc.per_particle", True)
 
         # Motion noise parameters (interpreted in body frame)
-        self.declare_parameter("motion_noise.a_trans", 0.03)
-        self.declare_parameter("motion_noise.b_trans", 0.03)
-        self.declare_parameter("motion_noise.c_lat", 0.12)
-        self.declare_parameter("motion_noise.a_rot", 0.05)
-        self.declare_parameter("motion_noise.b_rot", 0.08)
+        self.declare_parameter("motion_noise.a_trans", 0.08)
+        self.declare_parameter("motion_noise.b_trans", 0.02)
+        self.declare_parameter("motion_noise.c_lat", 0.003)
+        self.declare_parameter("motion_noise.a_rot", 0.01)
+        self.declare_parameter("motion_noise.b_rot", 0.005)
         self.declare_parameter("motion_noise.x_floor", 1e-4)
         self.declare_parameter("motion_noise.y_floor", 1e-4)
         self.declare_parameter("motion_noise.yaw_floor", 1e-4)
 
         # Resampling
-        self.declare_parameter("resample_interval", 75) # 0 disables
-        self.declare_parameter("neff_ratio_threshold", 0.5)
+        self.declare_parameter("resample_interval", 30) # 0 disables
+        self.declare_parameter("neff_ratio_threshold", 0.25)
         self.declare_parameter("resample_burn_in", 15)
+        # Post-resample roughening: applied when neff_ratio falls below these thresholds.
+        # Three severity tiers: moderate (< roughen_neff_moderate), severe (< roughen_neff_severe),
+        # catastrophic (< roughen_neff_severe AND median Mahalanobis > roughen_maha_catastrophic).
+        self.declare_parameter("resample_roughen.neff_moderate",        0.08)  # trigger roughening at all
+        self.declare_parameter("resample_roughen.neff_severe",          0.01)  # severe / catastrophic tier
+        self.declare_parameter("resample_roughen.maha_catastrophic",   10.0)   # Mahalanobis^2 for catastrophic tier
+        self.declare_parameter("resample_roughen.scale_moderate_xy",    3.0)   # multiplier on motion noise std
+        self.declare_parameter("resample_roughen.scale_severe_xy",      5.0)
+        self.declare_parameter("resample_roughen.scale_severe_yaw",     3.0)
+        self.declare_parameter("resample_roughen.catastrophic_xy_slots", 3.0)  # multiplier on slot_spacing
+        self.declare_parameter("resample_roughen.catastrophic_yaw",     0.15)  # rad (~8.6 deg)
 
         self.declare_parameter("spacing_propagation.enable",     True)
-        self.declare_parameter("spacing_propagation.min_seen",   8)
-        self.declare_parameter("spacing_propagation.max_unseen", 10)
-        self.declare_parameter("spacing_propagation.alpha",      0.2)
-        self.declare_parameter("spacing_propagation.n_hops",     2)
+        self.declare_parameter("spacing_propagation.min_seen",   5)
+        self.declare_parameter("spacing_propagation.max_unseen", 8)
+        self.declare_parameter("spacing_propagation.alpha",      0.06)
+        self.declare_parameter("spacing_propagation.n_hops",     1)
+        # Spacing-consistency log-weight: penalises particles whose neighbour
+        # landmarks are inconsistent with the measured anchor's spacing.
+        # sigma_frac: neighbour error is normalised by (slot_spacing * sigma_frac).
+        # min_seen_neighbour: only score neighbours with >= this many observations.
+        self.declare_parameter("spacing_propagation.consistency_sigma_frac", 0.2)
+        self.declare_parameter("spacing_propagation.consistency_min_seen",   3)
 
         # Semantic side memory
         self.declare_parameter("semantic_side_min_votes", 3)
@@ -271,25 +288,38 @@ class RowFastSLAMNode(Node):
         # Innovation gating (optional): reject measurement updates if median Mahalanobis is too large.
         # Set <= 0.0 to disable.
         self.declare_parameter("maha_gate_median", 0.0)  # dimensionless (Mahalanobis^2)
-        self.declare_parameter("maha_gate_min_particles", 50)
+        self.declare_parameter("maha_gate_min_particles", 30)
         
         # Landmark covariance floor (optional): prevents EKF landmarks from becoming unrealistically overconfident.
         # Set <= 0.0 to disable a component.
-        self.declare_parameter("landmark_sigma_floor_x", 0.2)  # meters (world X)
-        self.declare_parameter("landmark_sigma_floor_y", 0.2)  # meters (world Y)
-        self.declare_parameter("landmark_sigma_floor_s", 0.18)   # m along-row (row frame)
+        self.declare_parameter("landmark_sigma_floor_x", 0.0)  # meters (world X)
+        self.declare_parameter("landmark_sigma_floor_y", 0.0)  # meters (world Y)
+        self.declare_parameter("landmark_sigma_floor_s", 0.15)   # m along-row (row frame)
         self.declare_parameter("landmark_sigma_floor_d", 0.12)   # m lateral (row frame)
 
         # Publish-time de-duplication: merge nearby slots so we don't publish
         # two trunks at (almost) the same location.
-        self.declare_parameter("publish_merge_duplicates.enable", True)
+        self.declare_parameter("publish_merge_duplicates.enable", False)
         self.declare_parameter("publish_merge_duplicates.dist_m", 0.1)  # meters
         self.declare_parameter("publish_merge_duplicates.only_adjacent", True)
 
         # Measurement-informed pose proposal (FastSLAM 2.0)
-        self.declare_parameter("proposal.enable", False)
-        self.declare_parameter("proposal.min_pose_std_xy", 0.08)     # m
-        self.declare_parameter("proposal.min_pose_std_yaw", 0.06)    # rad
+        self.declare_parameter("proposal.enable", True)
+        self.declare_parameter("proposal.min_pose_std_xy", 0.025)     # m
+        self.declare_parameter("proposal.min_pose_std_yaw", 0.008)    # rad
+        # Max per-step pose correction from proposal (prevents large jumps)
+        self.declare_parameter("proposal.max_correction_xy",  0.10)  # m
+        self.declare_parameter("proposal.max_correction_yaw", 0.08)  # rad
+        # Particles whose Mahalanobis^2 exceeds this threshold are not moved by the
+        # proposal (zombie guard). Must be > 0.
+        self.declare_parameter("proposal.zombie_maha_threshold", 20.0)
+        # Min seen_count before a landmark is considered reliable enough for the
+        # proposal path (particles below this fall back to classic likelihood).
+        self.declare_parameter("proposal.min_landmark_seen", 3)
+        # Max odom steps accumulated between measurements used to scale pose prior
+        # uncertainty in the proposal (caps the spread so it doesn't blow up if
+        # measurements are delayed for many odom cycles).
+        self.declare_parameter("proposal.max_odom_steps", 10)
 
         # Landmark initialisation covariance.
         #
@@ -300,30 +330,30 @@ class RowFastSLAMNode(Node):
         #      when the cloud is still spread out (early run) the *empirical* cloud spread
         #      is a useful proxy for how uncertain the landmark position really is.
         #      Set include_pose_uncertainty=True to add  G_x_xy @ P_cloud_xy @ G_x_xy^T.
-        self.declare_parameter("landmark_init.include_pose_uncertainty", False)
+        self.declare_parameter("landmark_init.include_pose_uncertainty", True)
 
         # Debug
         self.declare_parameter("debug.log_every_n_meas", 0)          # 0 disables
         self.declare_parameter("debug.print_measurement_stamp", False)
 
-        self.declare_parameter("row_yaw_init_window", 35)
+        self.declare_parameter("row_yaw_init_window", 10)
 
         # Template prior (soft anchor toward template slot position)
         self.declare_parameter("template_prior.enable", True)
-        self.declare_parameter("template_prior.sigma_s", 0.15)     # m along-row
-        self.declare_parameter("template_prior.sigma_d", 0.15)     # m lateral
-        self.declare_parameter("template_prior.decay_k", 1.5)     # hits; larger = prior lasts longer
-        self.declare_parameter("template_prior.max_seen", 30)      # stop applying after this many hits
-        self.declare_parameter("template_prior.w", 5.0)           # weight multiplier
+        self.declare_parameter("template_prior.sigma_s", 0.35)     # m along-row
+        self.declare_parameter("template_prior.sigma_d", 0.20)     # m lateral
+        self.declare_parameter("template_prior.decay_k", 10.0)     # hits; larger = prior lasts longer
+        self.declare_parameter("template_prior.max_seen", 20)      # stop applying after this many hits
+        self.declare_parameter("template_prior.w", 0.5)           # weight multiplier
 
         # assoc_origin_s recalibration — periodically re-estimates the s origin
         # from well-observed best-particle landmarks to correct slow along-row drift.
-        self.declare_parameter("origin_recal.enable",    True)
-        self.declare_parameter("origin_recal.min_seen",  5)    # landmark must have >= N hits
-        self.declare_parameter("origin_recal.alpha",     0.02)  # blend rate (0=frozen, 1=instant)
-        self.declare_parameter("origin_recal.interval",  5)     # run every N measurements
+        self.declare_parameter("origin_recal.enable",    False)
+        self.declare_parameter("origin_recal.min_seen",  8)    # landmark must have >= N hits
+        self.declare_parameter("origin_recal.alpha",     0.03)  # blend rate (0=frozen, 1=instant)
+        self.declare_parameter("origin_recal.interval",  10)     # run every N measurements
 
-        self.declare_parameter("meas_max_lag_sec", 0.1)
+        self.declare_parameter("meas_max_lag_sec", 0.5)
 
         # Odom history for delayed measurement alignment (seconds).
         self.declare_parameter("odom_history_sec", 20.0)
@@ -440,11 +470,24 @@ class RowFastSLAMNode(Node):
         self.neff_ratio_threshold = float(self.get_parameter("neff_ratio_threshold").value)
         self.resample_burn_in = int(self.get_parameter("resample_burn_in").value)
 
+        self._roughen_neff_moderate       = float(self.get_parameter("resample_roughen.neff_moderate").value)
+        self._roughen_neff_severe         = float(self.get_parameter("resample_roughen.neff_severe").value)
+        self._roughen_maha_catastrophic   = float(self.get_parameter("resample_roughen.maha_catastrophic").value)
+        self._roughen_scale_moderate_xy   = float(self.get_parameter("resample_roughen.scale_moderate_xy").value)
+        self._roughen_scale_severe_xy     = float(self.get_parameter("resample_roughen.scale_severe_xy").value)
+        self._roughen_scale_severe_yaw    = float(self.get_parameter("resample_roughen.scale_severe_yaw").value)
+        self._roughen_catastrophic_xy_slots = float(self.get_parameter("resample_roughen.catastrophic_xy_slots").value)
+        self._roughen_catastrophic_yaw    = float(self.get_parameter("resample_roughen.catastrophic_yaw").value)
+
         self._spacing_prop_enable    = bool(self.get_parameter("spacing_propagation.enable").value)
         self._spacing_prop_min_seen  = int(self.get_parameter("spacing_propagation.min_seen").value)
         self._spacing_prop_max_unseen = int(self.get_parameter("spacing_propagation.max_unseen").value)
         self._spacing_prop_alpha     = float(self.get_parameter("spacing_propagation.alpha").value)
         self._spacing_prop_n_hops    = int(self.get_parameter("spacing_propagation.n_hops").value)
+        self._spacing_consistency_sigma_frac = float(
+            self.get_parameter("spacing_propagation.consistency_sigma_frac").value)
+        self._spacing_consistency_min_seen   = int(
+            self.get_parameter("spacing_propagation.consistency_min_seen").value)
 
         self.semantic_side_min_votes = int(self.get_parameter("semantic_side_min_votes").value)
         self.semantic_side_fallback = str(self.get_parameter("semantic_side_fallback").value).strip().lower()
@@ -473,6 +516,11 @@ class RowFastSLAMNode(Node):
         self.proposal_enable = bool(self.get_parameter("proposal.enable").value)
         self.proposal_min_pose_std_xy = float(self.get_parameter("proposal.min_pose_std_xy").value)
         self.proposal_min_pose_std_yaw = float(self.get_parameter("proposal.min_pose_std_yaw").value)
+        self._proposal_max_correction_xy  = float(self.get_parameter("proposal.max_correction_xy").value)
+        self._proposal_max_correction_yaw = float(self.get_parameter("proposal.max_correction_yaw").value)
+        self._proposal_zombie_maha        = float(self.get_parameter("proposal.zombie_maha_threshold").value)
+        self._proposal_min_landmark_seen  = int(self.get_parameter("proposal.min_landmark_seen").value)
+        self._proposal_max_odom_steps     = int(self.get_parameter("proposal.max_odom_steps").value)
 
         self._lm_init_include_pose_uncertainty = bool(
             self.get_parameter("landmark_init.include_pose_uncertainty").value
@@ -531,6 +579,11 @@ class RowFastSLAMNode(Node):
         self._boot_odom_pose: Optional[np.ndarray] = None
         self._pf_initialized = False
         self.assoc_last_slot = None
+
+        # Pre-generate motion noise buffer
+        _NOISE_BUFFER_SIZE = 20_000
+        self._noise_buf = self._rng.standard_normal((_NOISE_BUFFER_SIZE, 3))  # (20000, 3)
+        self._noise_buf_idx = 0
 
         # Store last motion noise (body-frame) from odom updates
         self._last_motion_std_body = np.array([0.2, 0.2, 0.1], dtype=float)
@@ -926,15 +979,31 @@ class RowFastSLAMNode(Node):
 
     def _recalibrate_origin_s(self) -> None:
         """
-        Re-estimate assoc_origin_s from well-observed landmarks on the best particle.
+        Re-estimate assoc_origin_s from well-observed landmarks across ALL particles,
+        weighted by both particle weight and landmark seen_count.
 
-        For each landmark j with seen_count >= min_seen, the implied origin is:
-            implied_origin_s = mu_s_j - j * slot_spacing
-        where mu_s_j is the landmark's current s coordinate in the row frame.
+        The old implementation drew only from the best particle's landmark map.
+        This was fragile: if the best particle's map had drifted (e.g. it happened
+        to survive a resample with a slightly biased s-estimate), the recalibration
+        would encode that drift into assoc_origin_s — a global shared value that
+        governs slot association for every particle.
 
-        We take the weighted median of all such implied origins (median is more
-        robust than mean to one or two badly-placed landmarks) and blend it into
-        assoc_origin_s with a small alpha so the correction is gradual.
+        The fix aggregates implied origins across the entire particle cloud:
+
+            implied_origin_s(p, j) = mu_s_j(p) - j * slot_spacing
+
+        Each (particle, landmark) pair contributes with weight:
+
+            w(p, j) = particle_weight(p) * seen_count(j)
+
+        Particle weight ensures well-supported hypotheses dominate; seen_count
+        ensures landmarks with more observations outweigh freshly-initialised ones.
+        We then take the weighted median of this joint distribution (robust to
+        outlier particles with badly-placed individual landmarks) and blend it
+        into assoc_origin_s with the configured alpha.
+
+        A minimum of 2 qualifying (particle, landmark) pairs is required before
+        any update fires, so the recalibration stays silent during burn-in.
         """
         if not self.origin_recal_enable:
             return
@@ -942,36 +1011,52 @@ class RowFastSLAMNode(Node):
             return
         if getattr(self, "assoc_origin_xy", None) is None:
             return
-
-        p_best = self._best_particle()
-        if p_best is None:
+        if not self.particles:
             return
 
-        origin_xy = self.assoc_origin_xy
-        t = self.t_hat_assoc
+        origin_xy  = self.assoc_origin_xy
+        t          = self.t_hat_assoc
+        spacing    = float(self.slot_spacing)
+        min_seen   = self.origin_recal_min_seen
+
+        # Normalise particle weights so they sum to 1.
+        # Use a local copy — do not touch the live weight array.
+        N = len(self.particles)
+        pw = self._weights[:N].copy()
+        pw_sum = float(pw.sum())
+        if pw_sum <= 1e-12:
+            pw[:] = 1.0 / float(N)
+        else:
+            pw /= pw_sum
 
         implied = []
         weights = []
-        for j, lm in p_best.landmarks.items():
-            if lm.seen_count < self.origin_recal_min_seen:
+
+        for k, p in enumerate(self.particles):
+            p_w = float(pw[k])
+            if p_w <= 0.0:
                 continue
-            mu_s = float(np.dot(lm.mu - origin_xy, t))
-            implied_s0 = mu_s - int(j) * float(self.slot_spacing)
-            implied.append(implied_s0)
-            # Weight by seen_count so landmarks with more observations
-            # contribute more to the estimate
-            weights.append(float(lm.seen_count))
+            for j, lm in p.landmarks.items():
+                if lm.seen_count < min_seen:
+                    continue
+                mu_s = float(np.dot(lm.mu - origin_xy, t))
+                implied_s0 = mu_s - int(j) * spacing
+                implied.append(implied_s0)
+                # Joint weight: particle credibility x landmark reliability
+                weights.append(p_w * float(lm.seen_count))
 
         if len(implied) < 2:
             return
 
-        # Weighted median: sort by implied value, find weight-cumulative midpoint
-        order = sorted(range(len(implied)), key=lambda i: implied[i])
+        # Weighted median over the joint (particle x landmark) distribution.
+        # Median is robust to outlier particles that survived a resample with
+        # a biased map — they contribute low weight and cannot shift the median.
+        order       = sorted(range(len(implied)), key=lambda i: implied[i])
         sorted_vals = [implied[i] for i in order]
-        sorted_wts  = [weights[i]  for i in order]
-        total_w = sum(sorted_wts)
-        cumulative = 0.0
-        median_est = sorted_vals[0]
+        sorted_wts  = [weights[i] for i in order]
+        total_w     = sum(sorted_wts)
+        cumulative  = 0.0
+        median_est  = sorted_vals[0]
         for v, w in zip(sorted_vals, sorted_wts):
             cumulative += w
             if cumulative >= total_w * 0.5:
@@ -987,7 +1072,7 @@ class RowFastSLAMNode(Node):
         if abs(delta) > 1e-4:
             self.get_logger().debug(
                 f"origin_s recal: {old:.4f} → {new:.4f}  (Δ={delta:+.4f}m, "
-                f"anchors={len(implied)}, median_est={median_est:.4f})"
+                f"n_pairs={len(implied)}, median_est={median_est:.4f})"
             )
     
     def _extend_template_slots_to(self, new_max_slot: int) -> None:
@@ -1229,8 +1314,11 @@ class RowFastSLAMNode(Node):
         dx_expected = abs(v) * dt
         dtheta_expected = abs(omega) * dt
 
-        sigma_fwd = (self.a_trans * dx_expected) + (self.b_trans * dtheta_expected) + self.x_floor
-        sigma_lat = (self.c_lat) + self.y_floor
+        sigma_fwd   = (self.a_trans * dx_expected) + (self.b_trans * dtheta_expected) + self.x_floor
+        # c_lat is now meters of lateral std per meter traveled (same unit convention
+        # as a_trans), so lateral noise scales with forward distance rather than
+        # being injected as a flat constant every odom step regardless of speed.
+        sigma_lat   = (self.c_lat * dx_expected) + self.y_floor
         sigma_theta = (self.a_rot * dtheta_expected) + (self.b_rot * dx_expected) + self.yaw_floor
         return np.array([sigma_fwd, sigma_lat, sigma_theta], dtype=float)
 
@@ -1286,7 +1374,7 @@ class RowFastSLAMNode(Node):
             omega = float(msg.twist.twist.angular.z)
             noise_std = self._motion_noise_std(v, omega, dt)  # [fwd, lat, yaw]
             self._last_motion_std_body = noise_std.copy()
-            self._odom_steps_since_meas = getattr(self, '_odom_steps_since_meas', 0) + 1 
+            self._odom_steps_since_meas = getattr(self, '_odom_steps_since_meas', 0) + 1
 
             # Vectorized motion update across all particles (poses live in shared array)
             poses = getattr(self, "_poses", None)
@@ -1307,8 +1395,18 @@ class RowFastSLAMNode(Node):
             else:
                 N = poses.shape[0]
 
-                eps = self._rng.standard_normal((N, 3))
-                eps *= noise_std  # in-place broadcast
+                # Slice from pre-generated noise buffer instead of allocating each tick
+                end = self._noise_buf_idx + N
+                if end <= len(self._noise_buf):
+                    eps = self._noise_buf[self._noise_buf_idx:end] * noise_std
+                else:
+                    # Buffer exhausted — regenerate and reset
+                    self._noise_buf[:] = self._rng.standard_normal(self._noise_buf.shape)
+                    self._noise_buf_idx = 0
+                    eps = self._noise_buf[:N] * noise_std
+                    end = N
+                self._noise_buf_idx = end
+
                 df = d_fwd + eps[:, 0]
                 dl = d_lat + eps[:, 1]
                 dth = dyaw + eps[:, 2]
@@ -1598,6 +1696,7 @@ class RowFastSLAMNode(Node):
             _tp_mu0: List[float] = []        # lm.mu[0]
             _tp_mu1: List[float] = []        # lm.mu[1]
             _tp_seen: List[int] = []         # lm.seen_count
+            _tp_slot: List[int] = []         # per-particle slot index (NOT consensus)
 
             for i, p in enumerate(particles):
                 # In per-particle mode each particle has its own slot assignment.
@@ -1624,11 +1723,12 @@ class RowFastSLAMNode(Node):
                     _tp_mu0.append(float(lm.mu[0]))
                     _tp_mu1.append(float(lm.mu[1]))
                     _tp_seen.append(int(lm.seen_count))
+                    _tp_slot.append(p_slot_j)   # each particle references its own slot
 
                 lm_list[i] = lm
 
                 # Classic likelihood if proposal disabled OR landmark not yet reliable
-                if (not self.proposal_enable) or (lm.seen_count < 5):
+                if (not self.proposal_enable) or (lm.seen_count < self._proposal_min_landmark_seen):
                     classic_mask[i] = True
 
             if _tp_idx and self.use_template_map and self.template_prior_enable:
@@ -1642,9 +1742,16 @@ class RowFastSLAMNode(Node):
                     alpha[tp_seen >= float(self.template_prior_max_seen)] = 0.0
 
                 if np.any(alpha > 0.0):
-                    # Template prior uses consensus slot for the reference position.
-                    mu0_vec = self._template_mu0_for_slot(slot_j)   # (2,) — same for all particles
-                    e = tp_mu - mu0_vec.reshape(1, 2)               # (M,2) world error
+                    # Build per-particle template reference positions using each
+                    # particle's own slot index. This preserves pose diversity —
+                    # a particle that legitimately associates to slot j+1 is
+                    # evaluated against slot j+1's template position, not the
+                    # consensus slot's position which could be j or j-1.
+                    mu0_arr = np.array(
+                        [self._template_mu0_for_slot(j) for j in _tp_slot],
+                        dtype=np.float64,
+                    )                                                # (M,2)
+                    e = tp_mu - mu0_arr                              # (M,2) world error
                     e_s = e @ self.t_hat_assoc                       # (M,) along-row component
                     e_d = e @ self.n_hat_assoc                       # (M,) lateral component
 
@@ -1728,7 +1835,7 @@ class RowFastSLAMNode(Node):
             # ------------------------------------------------------------
             # Threshold above which a particle is considered a zombie and its
             # pose should NOT be moved by the proposal this step.
-            _PROPOSAL_ZOMBIE_MAHA = 20.0
+            _PROPOSAL_ZOMBIE_MAHA = self._proposal_zombie_maha
 
             if self.proposal_enable:
                 # Indices of particles that use the proposal path
@@ -1767,7 +1874,7 @@ class RowFastSLAMNode(Node):
                     Q11 =  s*s*s00 - 2*c*s*s01 + c*c*s11 + self.R[1, 1]
 
                     # Pbar (world-frame motion prior) — inline per-particle rotation
-                    n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, 10))
+                    n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, self._proposal_max_odom_steps))
                     std_body = np.array(self._last_motion_std_body, dtype=np.float64) * np.sqrt(float(n_steps))
                     std_body[0] = max(float(std_body[0]), float(self.proposal_min_pose_std_xy))
                     std_body[1] = max(float(std_body[1]), float(self.proposal_min_pose_std_xy))
@@ -1845,9 +1952,9 @@ class RowFastSLAMNode(Node):
 
                     # Wrap and clamp yaw correction
                     dx_v[:, 2] = (dx_v[:, 2] + np.pi) % (2*np.pi) - np.pi
-                    dx_v[:, 0] = np.clip(dx_v[:, 0], -0.1, 0.1)
-                    dx_v[:, 1] = np.clip(dx_v[:, 1], -0.1, 0.1)
-                    dx_v[:, 2] = np.clip(dx_v[:, 2], -0.08, 0.08)
+                    dx_v[:, 0] = np.clip(dx_v[:, 0], -self._proposal_max_correction_xy,  self._proposal_max_correction_xy)
+                    dx_v[:, 1] = np.clip(dx_v[:, 1], -self._proposal_max_correction_xy,  self._proposal_max_correction_xy)
+                    dx_v[:, 2] = np.clip(dx_v[:, 2], -self._proposal_max_correction_yaw, self._proposal_max_correction_yaw)
 
                     xhat = pm + dx_v                               # (M,3)
                     xhat[:, 2] = (xhat[:, 2] + np.pi) % (2*np.pi) - np.pi
@@ -1885,6 +1992,67 @@ class RowFastSLAMNode(Node):
                     for ki, i in enumerate(prop_idx):
                         if ok[ki] and maha_v[ki] < _PROPOSAL_ZOMBIE_MAHA:
                             particles[i].pose[:] = xnew_now[ki]
+
+            # ---- Spacing-consistency log-weight ----
+            # For each particle, check whether its already-observed neighbours of
+            # the just-measured slot are positioned where the spacing prior predicts
+            # they should be.  Particles whose map is internally inconsistent with
+            # regular spacing get a log-weight penalty.  This converts the spacing
+            # constraint from a pure map-correction (propagation) into a particle-
+            # selection criterion — which is the correct place for it in a PF.
+            #
+            # We only score neighbours that:
+            #   (a) exist in the particle's landmark map, AND
+            #   (b) have been seen >= consistency_min_seen times (avoid penalising
+            #       particles for template slots that haven't been observed yet), AND
+            #   (c) the anchor slot itself has been seen >= min_seen times (so the
+            #       anchor position is trustworthy enough to compare against).
+            #
+            # The penalty is a Gaussian in along-row error only:
+            #   logw -= 0.5 * (err_s / sigma_s)^2
+            # where sigma_s = slot_spacing * consistency_sigma_frac.
+            # Lateral error is not penalised — spacing only constrains along-row.
+            if self._spacing_prop_enable:
+                _c_min_seen   = self._spacing_consistency_min_seen
+                _c_sigma_s    = float(self.slot_spacing) * self._spacing_consistency_sigma_frac
+                _c_var_s      = _c_sigma_s * _c_sigma_s
+                _c_n_hops     = self._spacing_prop_n_hops
+                _c_spacing    = float(self.slot_spacing)
+                _t0           = float(self.t_hat_assoc[0])
+                _t1           = float(self.t_hat_assoc[1])
+
+                for i, p in enumerate(particles):
+                    # Resolve this particle's anchor slot
+                    p_slot_j = int(slot_j_arr[i]) if (slot_j_arr is not None) else slot_j
+                    if p_slot_j < 0:
+                        continue
+
+                    lm_anchor = p.landmarks.get(p_slot_j)
+                    if lm_anchor is None or lm_anchor.seen_count < self._spacing_prop_min_seen:
+                        continue
+
+                    ax = float(lm_anchor.mu[0])
+                    ay = float(lm_anchor.mu[1])
+
+                    for direction in (+1, -1):
+                        for hop in range(1, _c_n_hops + 1):
+                            nb_j = p_slot_j + direction * hop
+                            if nb_j < 0:
+                                continue
+                            lm_nb = p.landmarks.get(nb_j)
+                            if lm_nb is None or lm_nb.seen_count < _c_min_seen:
+                                continue
+
+                            # Predicted neighbour position from anchor + spacing chain
+                            pred_x = ax + direction * hop * _c_spacing * _t0
+                            pred_y = ay + direction * hop * _c_spacing * _t1
+
+                            # Along-row error only
+                            err_x  = float(lm_nb.mu[0]) - pred_x
+                            err_y  = float(lm_nb.mu[1]) - pred_y
+                            err_s  = err_x * _t0 + err_y * _t1
+
+                            logw[i] -= 0.5 * (err_s * err_s) / _c_var_s
 
             # ---- Innovation gating (median particle) ----
             slot_committed = False  # set True only after the EKF scatter loop completes
@@ -2401,15 +2569,14 @@ class RowFastSLAMNode(Node):
 
         # Apply per-particle hysteresis window
         j_cand_arr = j_raw_arr.copy()
-        for k, p in enumerate(self.particles):
-            last = p.last_slot
-            if last is not None:
-                lo = last - self.max_back_assoc
-                hi = last + self.max_fwd_assoc
-                if j_cand_arr[k] < lo:
-                    j_cand_arr[k] = lo
-                if j_cand_arr[k] > hi:
-                    j_cand_arr[k] = hi
+        last_slots = np.array(
+            [p.last_slot if p.last_slot is not None else -9999 for p in self.particles],
+            dtype=np.int32
+        )
+        has_last = last_slots != -9999
+        lo = np.where(has_last, last_slots - self.max_back_assoc, -999999)
+        hi = np.where(has_last, last_slots + self.max_fwd_assoc,  999999)
+        j_cand_arr = np.clip(j_raw_arr, lo, hi)
 
         # ---- Gate: reject particles whose s_meas is too far from their candidate slot ----
         s_slot_arr = origin_s + j_cand_arr.astype(float) * spacing
@@ -2429,18 +2596,14 @@ class RowFastSLAMNode(Node):
         slot_j_arr[in_gate] = j_cand_arr[in_gate]
 
         # ---- Plurality winner (for last_slot commit and global bookkeeping) ----
-        votes: Dict[int, float] = {}
-        w_arr = self._weights[:N]
-        for k in range(N):
-            if not in_gate[k]:
-                continue
-            j_p = int(j_cand_arr[k])
-            votes[j_p] = votes.get(j_p, 0.0) + float(w_arr[k])
-
-        if not votes:
+        if not in_gate.any():
             return slot_j_arr, mu_world_arr
 
-        j_plurality = int(max(votes, key=lambda k: votes[k]))
+        valid_js = j_cand_arr[in_gate]
+        valid_ws = self._weights[:N][in_gate]
+        j_min, j_max = int(valid_js.min()), int(valid_js.max())
+        bins = np.bincount(valid_js - j_min, weights=valid_ws, minlength=j_max - j_min + 1)
+        j_plurality = int(np.argmax(bins)) + j_min
 
         # ---- Commit last_slot: only for particles that agree with plurality winner ----
         for k, p in enumerate(self.particles):
@@ -2494,7 +2657,7 @@ class RowFastSLAMNode(Node):
         return z_pred, H_lm, J_x
 
     def _pose_prior_cov_world(self, yaw: float) -> np.ndarray:
-        n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, 10))
+        n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, self._proposal_max_odom_steps))
         std = np.array(self._last_motion_std_body, dtype=float) * np.sqrt(float(n_steps))
 
         std_xy_floor = float(self.proposal_min_pose_std_xy)
@@ -2619,53 +2782,135 @@ class RowFastSLAMNode(Node):
         The nudge is applied per-particle so each particle's landmark map stays
         internally consistent with its own anchor estimate.
 
+        In addition to nudging mu, we also tighten the along-row (s) component of
+        each neighbour's Sigma toward the uncertainty implied by the spacing
+        prediction.  Without this, the prior nudge on mu gets washed out on the
+        very next EKF measurement update because the Kalman gain is still high.
+        The lateral (d) component of Sigma is left unchanged — the spacing
+        prediction carries no information about cross-row position.
+
+        The predicted along-row variance for a neighbour k hops away is:
+
+            var_pred_s = (hop * spacing * _SPACING_SIGMA_FRAC)^2
+
+        where _SPACING_SIGMA_FRAC encodes how uncertain we are about the
+        regularity of tree spacing (~15% of spacing per hop is conservative).
+        The same eff_alpha blend used for mu is applied to Sigma_ss so the
+        two updates stay coupled.  The result is clamped to the existing
+        landmark_sigma_floor_s so we never produce a covariance tighter than
+        what a real measurement could achieve.
+
         Parameters controlled by spacing_propagation.* ROS params.
         """
         if not self.particles:
             return
 
-        min_seen  = self._spacing_prop_min_seen
+        min_seen   = self._spacing_prop_min_seen
         max_unseen = self._spacing_prop_max_unseen
-        alpha     = self._spacing_prop_alpha
-        n_hops    = self._spacing_prop_n_hops
-        spacing   = float(self.slot_spacing)
-        t0        = float(self.t_hat_assoc[0])
-        t1        = float(self.t_hat_assoc[1])
+        alpha      = self._spacing_prop_alpha
+        n_hops     = self._spacing_prop_n_hops
+        spacing    = float(self.slot_spacing)
+        t0         = float(self.t_hat_assoc[0])
+        t1         = float(self.t_hat_assoc[1])
+        n0         = -t1          # n_hat components (perpendicular, left-hand)
+        n1         =  t0
 
-        for p in self.particles:
-            lm_anchor = p.landmarks.get(anchor_j)
-            if lm_anchor is None or lm_anchor.seen_count < min_seen:
-                continue
+        # Fractional spacing uncertainty per hop: 15% of slot_spacing.
+        # Larger values = more conservative (less Sigma tightening per hop).
+        _SPACING_SIGMA_FRAC = 0.15
 
-            ax = float(lm_anchor.mu[0])
-            ay = float(lm_anchor.mu[1])
+        # ---- vectorized replacement ----
+        anchor_mus = np.array([
+            p.landmarks[anchor_j].mu if (
+                anchor_j in p.landmarks and
+                p.landmarks[anchor_j].seen_count >= min_seen
+            ) else [np.nan, np.nan]
+            for p in self.particles
+        ], dtype=np.float64)  # (N, 2)
 
-            # Propagate to both forward (+) and backward (-) neighbours
-            for direction in (+1, -1):
-                for hop in range(1, n_hops + 1):
-                    nb_j = anchor_j + direction * hop
-                    if nb_j < 0:
+        valid = np.isfinite(anchor_mus[:, 0])
+        if not valid.any():
+            return
+
+        for direction in (+1, -1):
+            for hop in range(1, n_hops + 1):
+                nb_j = anchor_j + direction * hop
+                if nb_j < 0:
+                    continue
+                nb_mus = np.array([
+                    p.landmarks[nb_j].mu if nb_j in p.landmarks else [np.nan, np.nan]
+                    for p in self.particles
+                ], dtype=np.float64)
+                nb_seen = np.array([
+                    p.landmarks[nb_j].seen_count if nb_j in p.landmarks else max_unseen
+                    for p in self.particles
+                ], dtype=np.float64)
+
+                pred = anchor_mus + np.array([direction * hop * spacing * t0,
+                                              direction * hop * spacing * t1])
+                obs_scale = 1.0 - nb_seen / float(max_unseen)
+                eff_alpha = (alpha / float(hop)) * obs_scale
+                update_mask = valid & np.isfinite(nb_mus[:, 0]) & (nb_seen < max_unseen)
+
+                new_mus = (1.0 - eff_alpha[:, None]) * nb_mus + eff_alpha[:, None] * pred
+
+                # ------------------------------------------------------------------
+                # Sigma tightening: blend along-row variance toward the spacing
+                # prediction uncertainty.  The prediction gets less reliable with
+                # each hop, so var_pred_s grows quadratically with hop distance.
+                # We only move Sigma_ss — never Sigma_dd — because the spacing
+                # chain predicts s position only.
+                # ------------------------------------------------------------------
+                pred_sigma_s  = hop * spacing * _SPACING_SIGMA_FRAC
+                pred_var_s    = pred_sigma_s * pred_sigma_s
+                # Clamp target to never go below the configured covariance floor
+                target_var_s  = max(pred_var_s, self._lm_sigma_floor_var_s)
+
+                for k, p in enumerate(self.particles):
+                    if not (update_mask[k] and nb_j in p.landmarks):
                         continue
-                    lm_nb = p.landmarks.get(nb_j)
-                    if lm_nb is None or lm_nb.seen_count >= max_unseen:
+
+                    lm_nb = p.landmarks[nb_j]
+                    lm_nb.mu[:] = new_mus[k]
+
+                    # Current along-row variance: sigma_ss = t^T Sigma t
+                    S = lm_nb.Sigma
+                    cur_var_s = (S[0,0]*t0*t0
+                                 + 2.0*S[0,1]*t0*t1
+                                 + S[1,1]*t1*t1)
+
+                    # Only tighten, never inflate — if the landmark already has
+                    # lower variance than the prediction (e.g. from real measurements)
+                    # leave it alone.
+                    if cur_var_s <= target_var_s:
                         continue
 
-                    # Predicted position of neighbour from anchor + spacing chain
-                    pred_x = ax + direction * hop * spacing * t0
-                    pred_y = ay + direction * hop * spacing * t1
+                    new_var_s = (1.0 - float(eff_alpha[k])) * cur_var_s + float(eff_alpha[k]) * target_var_s
 
-                    # Confidence in the prediction decays with hop distance and
-                    # grows with anchor certainty.  Hops further away get a
-                    # weaker nudge since each step compounds spacing uncertainty.
-                    # Unseen slots (seen_count=0) get the full alpha; slots with
-                    # a few observations get a proportionally smaller nudge so we
-                    # don't undo real measurements.
-                    hop_alpha = alpha / float(hop)
-                    obs_scale = 1.0 - float(lm_nb.seen_count) / float(max_unseen)
-                    effective_alpha = hop_alpha * obs_scale
+                    # Convert the delta in row-frame s-variance back to world-frame
+                    # Sigma by adding/subtracting along the t_hat outer product:
+                    #   Sigma_new = Sigma_old + (new_var_s - cur_var_s) * t_hat @ t_hat^T
+                    delta_var_s = new_var_s - cur_var_s   # always <= 0 (tightening)
+                    S[0,0] += delta_var_s * t0 * t0
+                    S[0,1] += delta_var_s * t0 * t1
+                    S[1,0]  = S[0,1]
+                    S[1,1] += delta_var_s * t1 * t1
 
-                    lm_nb.mu[0] = (1.0 - effective_alpha) * float(lm_nb.mu[0]) + effective_alpha * pred_x
-                    lm_nb.mu[1] = (1.0 - effective_alpha) * float(lm_nb.mu[1]) + effective_alpha * pred_y
+                    # Enforce symmetry and the full covariance floor (mirrors EKF update)
+                    if self._lm_sigma_floor_var_x > 0.0:
+                        S[0,0] = max(S[0,0], self._lm_sigma_floor_var_x)
+                    if self._lm_sigma_floor_var_y > 0.0:
+                        S[1,1] = max(S[1,1], self._lm_sigma_floor_var_y)
+                    if self._lm_sigma_floor_var_s > 0.0 or self._lm_sigma_floor_var_d > 0.0:
+                        sym01   = float(S[0,1])
+                        new_ss  = S[0,0]*t0*t0 + 2.0*sym01*t0*t1 + S[1,1]*t1*t1
+                        new_dd  = S[0,0]*n0*n0 + 2.0*sym01*n0*n1 + S[1,1]*n1*n1
+                        add_ss  = max(0.0, self._lm_sigma_floor_var_s - new_ss)
+                        add_dd  = max(0.0, self._lm_sigma_floor_var_d - new_dd)
+                        S[0,0] += add_ss*t0*t0 + add_dd*n0*n0
+                        S[1,1] += add_ss*t1*t1 + add_dd*n1*n1
+                        S[0,1] += add_ss*t0*t1 + add_dd*n0*n1
+                        S[1,0]  = S[0,1]
 
     def _ekf_update_landmark(self, p: Particle, lm: LandmarkEKF, z: np.ndarray, R_meas: np.ndarray):
         """OPT: inlined scalar version — delegates to at-pose variant using particle's current pose."""
@@ -2862,7 +3107,7 @@ class RowFastSLAMNode(Node):
         # When neff_ratio is very low, the cloud has converged to 1-2 survivors.
         # Without added noise, all resampled particles are identical — the proposal
         # then gives them all the same correction and neff stays degenerate.
-        if neff_ratio < 0.05:
+        if neff_ratio < self._roughen_neff_moderate:
             rough_std = np.array(self._last_motion_std_body, dtype=np.float64).copy()
 
             # Read current median maha from the work buffer (populated each measurement)
@@ -2873,28 +3118,28 @@ class RowFastSLAMNode(Node):
             else:
                 median_maha = 0.0
 
-            if neff_ratio < 0.01 and median_maha > 10.0:
+            if neff_ratio < self._roughen_neff_severe and median_maha > self._roughen_maha_catastrophic:
                 # Catastrophic: use environment-scale spread, not motion-noise scale.
                 # slot_spacing (tree row spacing) is the natural unit here.
-                xy_spread  = float(getattr(self, 'slot_spacing', 1.12)) * 3.0
-                yaw_spread = 0.15   # ~8.6 degrees
+                xy_spread  = float(getattr(self, 'slot_spacing', 1.12)) * self._roughen_catastrophic_xy_slots
+                yaw_spread = self._roughen_catastrophic_yaw
                 noise = self._rng.standard_normal((N, 3))
                 poses[:N, 0] += noise[:, 0] * xy_spread
                 poses[:N, 1] += noise[:, 1] * xy_spread
                 poses[:N, 2] += noise[:, 2] * yaw_spread
                 poses[:N, 2] = (poses[:N, 2] + np.pi) % (2.0 * np.pi) - np.pi
 
-            elif neff_ratio < 0.01:
+            elif neff_ratio < self._roughen_neff_severe:
                 # Severe: spread xy and yaw
-                poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * 5.0
-                poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * 5.0
-                poses[:N, 2] += self._rng.standard_normal(N) * rough_std[2] * 3.0
+                poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * self._roughen_scale_severe_xy
+                poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * self._roughen_scale_severe_xy
+                poses[:N, 2] += self._rng.standard_normal(N) * rough_std[2] * self._roughen_scale_severe_yaw
                 poses[:N, 2] = (poses[:N, 2] + np.pi) % (2.0 * np.pi) - np.pi
 
             else:
                 # Moderate: xy only — leave yaw alone, it's harder to recover
-                poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * 3.0
-                poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * 3.0
+                poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * self._roughen_scale_moderate_xy
+                poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * self._roughen_scale_moderate_xy
 
         # Force-publish after resampling — the map changed structurally and the
         # trellis collision-object node must receive the update immediately,
