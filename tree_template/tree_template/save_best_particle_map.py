@@ -141,6 +141,7 @@ class SaveBestParticleMap(Node):
         # Final GPS topics: support BOTH NavSatFix and Point (lat/lon/alt)
         self.declare_parameter("final_gps_navsat_topic", "/fix")
         self.declare_parameter("final_gps_point_topic", "/final_gps_fix")
+        self.declare_parameter("final_gps_samples", 30)
 
         # YAML fallback
         self.declare_parameter("initials_yaml", "")
@@ -164,6 +165,7 @@ class SaveBestParticleMap(Node):
 
         self.final_gps_navsat_topic = str(self.get_parameter("final_gps_navsat_topic").value)
         self.final_gps_point_topic = str(self.get_parameter("final_gps_point_topic").value)
+        self.final_gps_samples = int(self.get_parameter("final_gps_samples").value)
 
         self.initials_yaml = Path(str(self.get_parameter("initials_yaml").value)).expanduser()
         self.use_initials_yaml_fallback = bool(self.get_parameter("use_initials_yaml_fallback").value)
@@ -186,6 +188,10 @@ class SaveBestParticleMap(Node):
         self._latest_odom_corr_pose: Optional[Pose] = None
         self._latest_gps_fix: Optional[Point] = None
         self._latest_final_gps_list: Optional[List[float]] = None
+        self._final_gps_readings: deque[List[float]] = deque(maxlen=max(self.final_gps_samples, 1))
+
+        # Raw GPS readings (every valid NavSatFix sample, unbounded)
+        self._raw_gps_readings: List[List[float]] = []
 
         # YAML fallback cache
         self._initials_from_yaml: Optional[dict] = None
@@ -250,17 +256,39 @@ class SaveBestParticleMap(Node):
             self._robot_path.append(row)
             self._robot_last_keep = row
 
+    def _accumulate_final_gps(self, lat: float, lon: float, alt: float):
+        self._final_gps_readings.append([lat, lon, alt])
+        count = len(self._final_gps_readings)
+
+        if count < self.final_gps_samples:
+            self.get_logger().debug(
+                f"Accumulating final GPS: {count}/{self.final_gps_samples}"
+            )
+            return
+
+        arr = np.array(self._final_gps_readings, dtype=np.float64)
+        mean = np.mean(arr, axis=0)
+        self._latest_final_gps_list = [float(mean[0]), float(mean[1]), float(mean[2])]
+
+        self.get_logger().debug(
+            f"Updated averaged final GPS from {count} samples: "
+            f"lat={self._latest_final_gps_list[0]:.8f}, "
+            f"lon={self._latest_final_gps_list[1]:.8f}, "
+            f"alt={self._latest_final_gps_list[2]:.3f}"
+        )
+
     def _final_gps_navsat_cb(self, msg: NavSatFix):
         if not np.isfinite(msg.latitude) or not np.isfinite(msg.longitude):
             return
         alt = float(msg.altitude) if np.isfinite(msg.altitude) else 0.0
-        self._latest_final_gps_list = [float(msg.latitude), float(msg.longitude), alt]
+        self._raw_gps_readings.append([float(msg.latitude), float(msg.longitude), alt])
+        self._accumulate_final_gps(float(msg.latitude), float(msg.longitude), alt)
 
     def _final_gps_point_cb(self, msg: Point):
         if not np.isfinite(msg.x) or not np.isfinite(msg.y):
             return
         alt = float(msg.z) if np.isfinite(msg.z) else 0.0
-        self._latest_final_gps_list = [float(msg.x), float(msg.y), alt]
+        self._accumulate_final_gps(float(msg.x), float(msg.y), alt)
 
     def _fill_from_yaml_if_needed(self):
         if not self.use_initials_yaml_fallback:
@@ -362,6 +390,7 @@ class SaveBestParticleMap(Node):
             "initial_yaw_correction_rad": init_yaw,
             "initial_gps_fix": _point_to_list(self._latest_gps_fix),
             "final_gps_fix": self._latest_final_gps_list,
+            "raw_gps_coords": list(self._raw_gps_readings),
             "robot_path": robot_path,
             "trees": trees,
         }
@@ -399,6 +428,7 @@ class SaveBestParticleMap(Node):
             yaw = data.get("initial_yaw_correction_rad")
             gps = data.get("initial_gps_fix")
             final_gps = data.get("final_gps_fix")
+            raw_gps = data.get("raw_gps_coords", [])
             robot_path = data.get("robot_path", [])
             trees = data.get("trees", {})
 
@@ -406,6 +436,13 @@ class SaveBestParticleMap(Node):
             f.write("initial_yaw_correction_rad: " + ("null\n" if yaw is None else f"{yaw:.8f}\n"))
             f.write("initial_gps_fix: " + ("null\n" if gps is None else f"[{gps[0]}, {gps[1]}, {gps[2]}]\n"))
             f.write("final_gps_fix: " + ("null\n" if final_gps is None else f"[{final_gps[0]}, {final_gps[1]}, {final_gps[2]}]\n"))
+
+            f.write("raw_gps_coords:\n")
+            if not raw_gps:
+                f.write("  []\n")
+            else:
+                for reading in raw_gps:
+                    f.write(f"  - [{reading[0]:.10f}, {reading[1]:.10f}, {reading[2]:.4f}]\n")
 
             f.write("robot_path:\n")
             if not robot_path:

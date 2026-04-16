@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple
@@ -11,12 +10,10 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 import threading
-
 import numpy as np
-# scipy.spatial.transform.Rotation removed — yaw extracted directly via math.atan2 (faster)
 
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
@@ -25,20 +22,12 @@ from nav_msgs.msg import Odometry
 
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
 
-try:
-    profile
-except NameError:
-    def profile(func):
-        return func
-
 
 # ============= Utility / math helpers =============
 
 def wrap_angle(theta: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return (theta + np.pi) % (2.0 * np.pi) - np.pi
-
-
 
 def inv_and_logdet_2x2(a: float, b: float, c: float, d: float) -> Tuple[bool, float, float, float, float, float]:
     """
@@ -210,7 +199,7 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("publish_unseen_template_landmarks", False) # If False, we will NOT publish template landmarks until they've been seen at least N times.
         self.declare_parameter("min_seen_count_to_publish", 3)
         self.declare_parameter("use_global_row_yaw", True)
-        self.declare_parameter("num_slots", 60) # Marcus manually counted 68 trunk in Jostan's dataset for row 12 (not sure which are "polinators")
+        self.declare_parameter("num_slots", 60) 
         self.declare_parameter("exceed_slot_num", True) # Allow dynamic extension beyond num_slots (when template map is enabled)
         self.declare_parameter("max_extra_slots", 20)  # 0 disables cap
         self.declare_parameter("row_origin_x", float("nan"))          # if NaN, use first odom pose
@@ -218,6 +207,7 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("row_dir_sign", 1)            # (+1 => +X, -1 => -X)
         self.declare_parameter("max_back_assoc", 2)
         self.declare_parameter("max_fwd_assoc", 2)
+        self.declare_parameter("widen_init_assoc", False)
 
         # Row-relative particle initialisation spread
         self.declare_parameter("init_sigma_s",   0.5)
@@ -231,9 +221,14 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("prior_sigma_d", 0.3)
         self.declare_parameter("side_mode", "semantic")    # "fixed" or "geometry" or "semantic"
 
-        # Measurement noise (std dev) in robot frame
+        # Measurement noise model selector
+        self.declare_parameter("meas_noise_model", "cartesian")   # "cartesian" | "polar"
+        # Measurement noise (std dev) in robot frame — used when meas_noise_model="cartesian"
         self.declare_parameter("meas_std_y_lat", 0.3)        # left/right
         self.declare_parameter("meas_std_x_fwd", 0.5)        # forward/back - heading
+        # Measurement noise (std dev) in polar frame — used when meas_noise_model="polar"
+        self.declare_parameter("meas_std_range",   0.15)     # [m]    range std dev
+        self.declare_parameter("meas_std_bearing", 0.04)     # [rad]  bearing std dev (~2.3 deg)
 
         self.declare_parameter("meas_fwd_gate", 1.1)   # m — above this, suppress s-update
 
@@ -258,8 +253,6 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("neff_ratio_threshold", 0.25)
         self.declare_parameter("resample_burn_in", 15)
         # Post-resample roughening: applied when neff_ratio falls below these thresholds.
-        # Three severity tiers: moderate (< roughen_neff_moderate), severe (< roughen_neff_severe),
-        # catastrophic (< roughen_neff_severe AND median Mahalanobis > roughen_maha_catastrophic).
         self.declare_parameter("resample_roughen.neff_moderate",        0.08)  # trigger roughening at all
         self.declare_parameter("resample_roughen.neff_severe",          0.01)  # severe / catastrophic tier
         self.declare_parameter("resample_roughen.maha_catastrophic",   10.0)   # Mahalanobis^2 for catastrophic tier
@@ -269,15 +262,12 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("resample_roughen.catastrophic_xy_slots", 3.0)  # multiplier on slot_spacing
         self.declare_parameter("resample_roughen.catastrophic_yaw",     0.15)  # rad (~8.6 deg)
 
-        self.declare_parameter("spacing_propagation.enable",     True)
-        self.declare_parameter("spacing_propagation.min_seen",   5)
-        self.declare_parameter("spacing_propagation.max_unseen", 8)
-        self.declare_parameter("spacing_propagation.alpha",      0.06)
-        self.declare_parameter("spacing_propagation.n_hops",     1)
-        # Spacing-consistency log-weight: penalises particles whose neighbour
-        # landmarks are inconsistent with the measured anchor's spacing.
-        # sigma_frac: neighbour error is normalised by (slot_spacing * sigma_frac).
-        # min_seen_neighbour: only score neighbours with >= this many observations.
+        self.declare_parameter("spacing_propagation.enable",       True)
+        self.declare_parameter("spacing_propagation.min_seen",     5)
+        self.declare_parameter("spacing_propagation.max_unseen",   8)
+        self.declare_parameter("spacing_propagation.alpha",        0.06)
+        self.declare_parameter("spacing_propagation.n_hops",       1)
+        self.declare_parameter("spacing_propagation.forward_only", False)
         self.declare_parameter("spacing_propagation.consistency_sigma_frac", 0.2)
         self.declare_parameter("spacing_propagation.consistency_min_seen",   3)
 
@@ -286,16 +276,18 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("semantic_side_fallback", "fixed")  # "fixed" or "unknown"
 
         # Innovation gating (optional): reject measurement updates if median Mahalanobis is too large.
-        # Set <= 0.0 to disable.
         self.declare_parameter("maha_gate_median", 0.0)  # dimensionless (Mahalanobis^2)
         self.declare_parameter("maha_gate_min_particles", 30)
         
         # Landmark covariance floor (optional): prevents EKF landmarks from becoming unrealistically overconfident.
-        # Set <= 0.0 to disable a component.
         self.declare_parameter("landmark_sigma_floor_x", 0.0)  # meters (world X)
         self.declare_parameter("landmark_sigma_floor_y", 0.0)  # meters (world Y)
         self.declare_parameter("landmark_sigma_floor_s", 0.15)   # m along-row (row frame)
         self.declare_parameter("landmark_sigma_floor_d", 0.12)   # m lateral (row frame)
+
+        # Landmark process noise (injected into Sigma after every EKF update).
+        self.declare_parameter("landmark_process_noise_s", 0.0)  # m std dev along-row
+        self.declare_parameter("landmark_process_noise_d", 0.0)  # m std dev lateral
 
         # Publish-time de-duplication: merge nearby slots so we don't publish
         # two trunks at (almost) the same location.
@@ -310,26 +302,13 @@ class RowFastSLAMNode(Node):
         # Max per-step pose correction from proposal (prevents large jumps)
         self.declare_parameter("proposal.max_correction_xy",  0.10)  # m
         self.declare_parameter("proposal.max_correction_yaw", 0.08)  # rad
-        # Particles whose Mahalanobis^2 exceeds this threshold are not moved by the
-        # proposal (zombie guard). Must be > 0.
+        # Particles whose Mahalanobis^2 exceeds this threshold are not moved by the proposal (zombie guard). Must be > 0.
         self.declare_parameter("proposal.zombie_maha_threshold", 20.0)
-        # Min seen_count before a landmark is considered reliable enough for the
-        # proposal path (particles below this fall back to classic likelihood).
         self.declare_parameter("proposal.min_landmark_seen", 3)
-        # Max odom steps accumulated between measurements used to scale pose prior
-        # uncertainty in the proposal (caps the spread so it doesn't blow up if
-        # measurements are delayed for many odom cycles).
+        # Max odom steps accumulated between measurements used to scale pose prior uncertainty in the proposal
         self.declare_parameter("proposal.max_odom_steps", 10)
 
         # Landmark initialisation covariance.
-        #
-        # The fixed diag(0.5², 0.5²) initialisation ignores two sources of information:
-        #   1. Measurement noise (R): the lidar is tighter laterally than along-heading.
-        #      Sigma_meas = G_z @ R @ G_z^T  where G_z = R(θ)  (always applied).
-        #   2. Pose uncertainty: the particle's pose is known exactly in FastSLAM, but
-        #      when the cloud is still spread out (early run) the *empirical* cloud spread
-        #      is a useful proxy for how uncertain the landmark position really is.
-        #      Set include_pose_uncertainty=True to add  G_x_xy @ P_cloud_xy @ G_x_xy^T.
         self.declare_parameter("landmark_init.include_pose_uncertainty", True)
 
         # Debug
@@ -431,6 +410,7 @@ class RowFastSLAMNode(Node):
 
         self.max_back_assoc = int(self.get_parameter("max_back_assoc").value)
         self.max_fwd_assoc = int(self.get_parameter("max_fwd_assoc").value)
+        self.widen_init_assoc = bool(self.get_parameter("widen_init_assoc").value)
 
         self.init_sigma_s   = float(self.get_parameter("init_sigma_s").value)
         self.init_sigma_d   = float(self.get_parameter("init_sigma_d").value)
@@ -443,6 +423,13 @@ class RowFastSLAMNode(Node):
         self.prior_sigma_d = float(self.get_parameter("prior_sigma_d").value)
         self.side_mode = str(self.get_parameter("side_mode").value).strip().lower()
 
+        self._meas_noise_model = str(self.get_parameter("meas_noise_model").value).strip().lower()
+        if self._meas_noise_model not in ("cartesian", "polar"):
+            self.get_logger().warn(
+                f"Unknown meas_noise_model '{self._meas_noise_model}'; falling back to 'cartesian'."
+            )
+            self._meas_noise_model = "cartesian"
+
         self.meas_std = np.array(
             [
                 float(self.get_parameter("meas_std_x_fwd").value),
@@ -450,9 +437,31 @@ class RowFastSLAMNode(Node):
             ],
             dtype=float,
         )
-        self.R = np.diag(self.meas_std ** 2)
-        self.R00 = float(self.R[0, 0])
-        self.R11 = float(self.R[1, 1])
+        self._meas_std_range   = float(self.get_parameter("meas_std_range").value)
+        self._meas_std_bearing = float(self.get_parameter("meas_std_bearing").value)
+
+        if self._meas_noise_model == "cartesian":
+            # Fixed R for the whole run — store scalars for fast hot-path access
+            self.R = np.diag(self.meas_std ** 2)
+            self.R00 = float(self.R[0, 0])
+            self.R11 = float(self.R[1, 1])
+        else:
+            # Polar model: R is computed per-measurement via _polar_R().
+            # We keep self.R as a placeholder (updated each callback) and also
+            # expose scalar scalars R00/R11 (updated each callback) so the
+            # hot-path vectorized code can use them without branching.
+            self.R   = np.eye(2, dtype=float)
+            self.R00 = 1.0
+            self.R11 = 1.0
+
+        self.get_logger().info(
+            f"Measurement noise model: {self._meas_noise_model} | "
+            + (f"std_xfwd={self.meas_std[0]:.3f} m  std_ylat={self.meas_std[1]:.3f} m"
+               if self._meas_noise_model == "cartesian"
+               else f"std_range={self._meas_std_range:.3f} m  "
+                    f"std_bearing={self._meas_std_bearing:.4f} rad "
+                    f"({np.degrees(self._meas_std_bearing):.2f} deg)")
+        )
 
         self._meas_fwd_gate = float(self.get_parameter("meas_fwd_gate").value)
         self._assoc_per_particle = bool(self.get_parameter("assoc.per_particle").value)
@@ -479,11 +488,12 @@ class RowFastSLAMNode(Node):
         self._roughen_catastrophic_xy_slots = float(self.get_parameter("resample_roughen.catastrophic_xy_slots").value)
         self._roughen_catastrophic_yaw    = float(self.get_parameter("resample_roughen.catastrophic_yaw").value)
 
-        self._spacing_prop_enable    = bool(self.get_parameter("spacing_propagation.enable").value)
-        self._spacing_prop_min_seen  = int(self.get_parameter("spacing_propagation.min_seen").value)
-        self._spacing_prop_max_unseen = int(self.get_parameter("spacing_propagation.max_unseen").value)
-        self._spacing_prop_alpha     = float(self.get_parameter("spacing_propagation.alpha").value)
-        self._spacing_prop_n_hops    = int(self.get_parameter("spacing_propagation.n_hops").value)
+        self._spacing_prop_enable       = bool(self.get_parameter("spacing_propagation.enable").value)
+        self._spacing_prop_min_seen     = int(self.get_parameter("spacing_propagation.min_seen").value)
+        self._spacing_prop_max_unseen   = int(self.get_parameter("spacing_propagation.max_unseen").value)
+        self._spacing_prop_alpha        = float(self.get_parameter("spacing_propagation.alpha").value)
+        self._spacing_prop_n_hops       = int(self.get_parameter("spacing_propagation.n_hops").value)
+        self._spacing_prop_forward_only = bool(self.get_parameter("spacing_propagation.forward_only").value)
         self._spacing_consistency_sigma_frac = float(
             self.get_parameter("spacing_propagation.consistency_sigma_frac").value)
         self._spacing_consistency_min_seen   = int(
@@ -506,6 +516,11 @@ class RowFastSLAMNode(Node):
         sf_d = float(self.get_parameter("landmark_sigma_floor_d").value)
         self._lm_sigma_floor_var_s = (sf_s * sf_s) if sf_s > 0.0 else 0.0
         self._lm_sigma_floor_var_d = (sf_d * sf_d) if sf_d > 0.0 else 0.0
+
+        pn_s = float(self.get_parameter("landmark_process_noise_s").value)
+        pn_d = float(self.get_parameter("landmark_process_noise_d").value)
+        self._lm_process_var_s = (pn_s * pn_s) if pn_s > 0.0 else 0.0
+        self._lm_process_var_d = (pn_d * pn_d) if pn_d > 0.0 else 0.0
 
         self.publish_merge_duplicates_enable = bool(self.get_parameter("publish_merge_duplicates.enable").value)
         self.publish_merge_duplicates_dist_m = float(self.get_parameter("publish_merge_duplicates.dist_m").value)
@@ -907,6 +922,11 @@ class RowFastSLAMNode(Node):
         This is intended to run ONCE, early, before any meaningful landmark updates.
         """
         with self._init_lock:
+            self.get_logger().debug(
+                f"ANCHOR DEBUG: boot_pose={self._boot_odom_pose}, "
+                f"mu_world_first={mu_world_first}, "
+                f"t_hat={self.t_hat_assoc}, n_hat={self.n_hat_assoc}"
+            )
             if self._template_origin_anchored:
                 return
             if not self.use_template_map:
@@ -982,26 +1002,6 @@ class RowFastSLAMNode(Node):
         Re-estimate assoc_origin_s from well-observed landmarks across ALL particles,
         weighted by both particle weight and landmark seen_count.
 
-        The old implementation drew only from the best particle's landmark map.
-        This was fragile: if the best particle's map had drifted (e.g. it happened
-        to survive a resample with a slightly biased s-estimate), the recalibration
-        would encode that drift into assoc_origin_s — a global shared value that
-        governs slot association for every particle.
-
-        The fix aggregates implied origins across the entire particle cloud:
-
-            implied_origin_s(p, j) = mu_s_j(p) - j * slot_spacing
-
-        Each (particle, landmark) pair contributes with weight:
-
-            w(p, j) = particle_weight(p) * seen_count(j)
-
-        Particle weight ensures well-supported hypotheses dominate; seen_count
-        ensures landmarks with more observations outweigh freshly-initialised ones.
-        We then take the weighted median of this joint distribution (robust to
-        outlier particles with badly-placed individual landmarks) and blend it
-        into assoc_origin_s with the configured alpha.
-
         A minimum of 2 qualifying (particle, landmark) pairs is required before
         any update fires, so the recalibration stays silent during burn-in.
         """
@@ -1048,9 +1048,7 @@ class RowFastSLAMNode(Node):
         if len(implied) < 2:
             return
 
-        # Weighted median over the joint (particle x landmark) distribution.
-        # Median is robust to outlier particles that survived a resample with
-        # a biased map — they contribute low weight and cannot shift the median.
+        # Weighted median over the joint (particle x landmark) distribution
         order       = sorted(range(len(implied)), key=lambda i: implied[i])
         sorted_vals = [implied[i] for i in order]
         sorted_wts  = [weights[i] for i in order]
@@ -1246,8 +1244,12 @@ class RowFastSLAMNode(Node):
 
         t0 = float(hist[0][0])
         tN = float(hist[-1][0])
-        if t_query < t0 or t_query > tN:
+        if t_query < t0:
             return None
+        if t_query > tN:
+            if t_query - tN > 0.1:   # more than 100ms ahead — genuinely too old
+                return None
+            t_query = tN              # clamp to latest odom — robot barely moves in <100ms
 
         import bisect
         times = [entry[0] for entry in hist]
@@ -1281,7 +1283,8 @@ class RowFastSLAMNode(Node):
             # so that when the anchor fires it has the best available pose.
             if self.use_template_map and self.template_origin_from_first_measurement:
                 if not self._pf_ready_to_init:
-                    self._boot_odom_pose = cur_pose.copy()
+                    # Do NOT update _boot_odom_pose here — it was frozen at
+                    # row-axis-lock time in odom_callback
                     return False
 
             if not np.isfinite(self.row_origin_xy).all():
@@ -1315,16 +1318,15 @@ class RowFastSLAMNode(Node):
         dtheta_expected = abs(omega) * dt
 
         sigma_fwd   = (self.a_trans * dx_expected) + (self.b_trans * dtheta_expected) + self.x_floor
-        # c_lat is now meters of lateral std per meter traveled (same unit convention
-        # as a_trans), so lateral noise scales with forward distance rather than
-        # being injected as a flat constant every odom step regardless of speed.
         sigma_lat   = (self.c_lat * dx_expected) + self.y_floor
         sigma_theta = (self.a_rot * dtheta_expected) + (self.b_rot * dx_expected) + self.yaw_floor
         return np.array([sigma_fwd, sigma_lat, sigma_theta], dtype=float)
 
-    @profile
     def odom_callback(self, msg: Odometry):
         with self._pf_lock:
+            if self.debug_print_measurement_stamp:
+                t_odom = self._stamp_to_sec(msg.header.stamp)
+                self.get_logger().info(f"Received odom at t={t_odom:.3f} sec")
             self._last_odom_msg = msg
             cur_pose = se2_from_odom(msg)
             dt = self._dt_from_stamp(msg.header.stamp)
@@ -1349,7 +1351,6 @@ class RowFastSLAMNode(Node):
             # PF is not yet initialized (deferred pending template anchor) — keep
             # boot pose fresh and skip the motion update entirely until ready.
             if not self._pf_initialized:
-                self._boot_odom_pose = cur_pose.copy()
                 return
 
             # --- Motion update ---
@@ -1468,7 +1469,7 @@ class RowFastSLAMNode(Node):
         self._poses[:, 2] = (float(init_pose[2]) + yaw_offsets + np.pi) % (2.0 * np.pi) - np.pi
 
         # ------------------------------------------------------------------
-        # Temporarily widen the slot association window so that particles
+        # Optionally widen the slot association window so that particles
         # spread across multiple slots can each find a valid association.
         # Covers 3-sigma of the s distribution; restores after the filter
         # has had time to converge.
@@ -1477,17 +1478,25 @@ class RowFastSLAMNode(Node):
         self._init_max_fwd_assoc_saved  = self.max_fwd_assoc
         self._init_assoc_restore_at     = max(3, self.num_slots // 3)
 
-        s_slots = math.ceil(3.0 * self.init_sigma_s / max(float(self.slot_spacing), 1e-3))
-        self.max_back_assoc = max(self.max_back_assoc, s_slots)
-        self.max_fwd_assoc  = max(self.max_fwd_assoc,  s_slots)
-
-        self.get_logger().info(
-            f"Row-relative particle init: "
-            f"sigma_s={self.init_sigma_s:.2f}m  sigma_d={self.init_sigma_d:.2f}m  "
-            f"sigma_yaw={self.init_sigma_yaw:.4f}rad | "
-            f"assoc window widened to ±{s_slots} slots, "
-            f"restores after {self._init_assoc_restore_at} measurements"
-        )
+        if self.widen_init_assoc:
+            s_slots = math.ceil(3.0 * self.init_sigma_s / max(float(self.slot_spacing), 1e-3))
+            self.max_back_assoc = max(self.max_back_assoc, s_slots)
+            self.max_fwd_assoc  = max(self.max_fwd_assoc,  s_slots)
+            
+            self.get_logger().info(
+                f"Row-relative particle init: "
+                f"sigma_s={self.init_sigma_s:.2f}m  sigma_d={self.init_sigma_d:.2f}m  "
+                f"sigma_yaw={self.init_sigma_yaw:.4f}rad | "
+                f"assoc window widened to ±{s_slots} slots, "
+                f"restores after {self._init_assoc_restore_at} measurements"
+            )
+        else:
+            self.get_logger().info(
+                f"Row-relative particle init: "
+                f"sigma_s={self.init_sigma_s:.2f}m  sigma_d={self.init_sigma_d:.2f}m  "
+                f"sigma_yaw={self.init_sigma_yaw:.4f}rad | "
+                f"assoc window widening disabled"
+            )
 
         self.particles = []
         for i in range(self.num_particles):
@@ -1506,7 +1515,6 @@ class RowFastSLAMNode(Node):
     # =========================================================
     #  Measurement update
     # =========================================================
-    @profile
     def measurement_callback(self, msg: TrunkInfo):
         with self._pf_lock:
             t_meas_sec = self._meas_time_sec(msg)
@@ -1531,6 +1539,10 @@ class RowFastSLAMNode(Node):
                 self._dbg_reject("range_gate")
                 return
 
+            # Update measurement noise matrix for polar model (no-op for cartesian)
+            if self._meas_noise_model == "polar":
+                self._update_R_from_measurement(x_fwd, y_lat)
+
             # ---- Pre-init anchor accumulation (runs before particles exist) ----
             if (
                 self.use_template_map
@@ -1539,6 +1551,13 @@ class RowFastSLAMNode(Node):
             ):
                 # Use boot pose directly — no particles yet, no odom history alignment needed
                 mu_world_approx = self._world_from_robot(self._boot_odom_pose, z)
+
+                self.get_logger().debug(
+                    f"ANCHOR ACCUM: hit={self._template_origin_hit_count} "
+                    f"boot_pose={self._boot_odom_pose} z={z} "
+                    f"mu_world={mu_world_approx}"
+                )
+
                 self._template_origin_hit_count += 1
                 self._template_origin_mu_sum += mu_world_approx.reshape(2,)
 
@@ -1561,7 +1580,19 @@ class RowFastSLAMNode(Node):
             pose_odom_meas = self._lookup_odom_pose(t_meas_sec)
             if pose_odom_meas is None:
                 self._dbg_reject("meas_too_old")
+                if len(self._odom_hist) >= 2:
+                    t0 = self._odom_hist[0][0]
+                    tN = self._odom_hist[-1][0]
+                    self.get_logger().debug(
+                        f"meas_too_old: t_meas={t_meas_sec:.6f}  odom_hist=[{t0:.6f}, {tN:.6f}]  delta_lo={t_meas_sec - t0:.3f}  delta_hi={t_meas_sec - tN:.3f}",
+                        throttle_duration_sec=1.0
+                    )
                 return
+
+            self.get_logger().debug(
+                f"MEAS ACCEPTED: t={t_meas_sec:.3f} z=[{x_fwd:.3f},{y_lat:.3f}]",
+                throttle_duration_sec=0.5
+            )
 
             pose_odom_now = self.last_odom_pose.copy()
             d_meas_to_now = se2_between(pose_odom_meas, pose_odom_now)
@@ -1570,15 +1601,7 @@ class RowFastSLAMNode(Node):
             w_meas = float(msg.width) if np.isfinite(msg.width) else None
 
             # ---- Slot association ----
-            # shared-pose mode  → one slot_j for all particles (original behaviour)
-            # per-particle mode → each particle gets its own slot assignment;
-            #                     consensus_slot_j (best particle's assignment) is used
-            #                     for global bookkeeping that needs a single value.
             if self._assoc_per_particle:
-                # poses_meas is not yet computed here; build it now so the
-                # per-particle associator can use it.  The weight/EKF update
-                # loop will reuse the same array (it is computed again there
-                # but se2_compose_many is cheap and idempotent).
                 n_particles_pre = len(self.particles)
                 self._ensure_work_buffers(n_particles_pre)
                 _pm_pre = self._work_poses_meas
@@ -1597,6 +1620,11 @@ class RowFastSLAMNode(Node):
                 if consensus_slot_j < 0:
                     valid_mask = slot_j_arr >= 0
                     if not valid_mask.any():
+                        self.get_logger().warn(
+                            f"ASSOC FAILED: z=[{x_fwd:.3f},{y_lat:.3f}] "
+                            f"s_meas via best particle, origin_s={getattr(self,'assoc_origin_s',None)}",
+                            throttle_duration_sec=0.5
+                        )
                         self._dbg_reject("assoc_failed")
                         return
                     w_valid = np.where(valid_mask, self._weights[:n_particles_pre], 0.0)
@@ -1787,12 +1815,13 @@ class RowFastSLAMNode(Node):
                 e1 = float(z[1]) - ypred
 
                 # S = H*Sigma*H^T + R, H = [[c,s],[-s,c]]
+                # For cartesian model R is diagonal so R01=0; for polar R01 may be non-zero.
                 q00 = c * c * sxx + 2.0 * c * s * sxy + s * s * syy
                 q01 = -c * s * sxx + (c * c - s * s) * sxy + c * s * syy
                 q11 = s * s * sxx - 2.0 * c * s * sxy + c * c * syy
 
                 S00 = q00 + self.R00
-                S01 = q01
+                S01 = q01 + float(self.R[0, 1])   # self.R[0,1] == 0 for cartesian model
                 S11 = q11 + self.R11
 
                 det = S00 * S11 - S01 * S01
@@ -1823,18 +1852,6 @@ class RowFastSLAMNode(Node):
                 if not np.all(ok):
                     self._dbg_reject("S_nonposdef")
 
-            # ------------------------------------------------------------
-            # Proposal scoring — fully vectorized over all proposal particles.
-            # Replaces the per-particle Python loop; same math, ~10-20x faster.
-            #
-            # IMPORTANT: pose write-back happens here, BEFORE the maha gate below.
-            # To prevent zombie particles (neff≈1, large maha) from having their
-            # poses dragged further from reality by the proposal, we skip the
-            # pose write-back for any particle whose maha exceeds a hard ceiling.
-            # The weight update still runs so the gate can fire correctly.
-            # ------------------------------------------------------------
-            # Threshold above which a particle is considered a zombie and its
-            # pose should NOT be moved by the proposal this step.
             _PROPOSAL_ZOMBIE_MAHA = self._proposal_zombie_maha
 
             if self.proposal_enable:
@@ -1868,9 +1885,10 @@ class RowFastSLAMNode(Node):
                     yl = -s * dx_lm + c * dy_lm   # y_lat  (M,)
 
                     # Qeff = H Sig H^T + R  (H is rotation — orthogonal, so H Sig H^T = Sig rotated)
+                    # For cartesian model R is diagonal so R[0,1]=0; for polar it may be non-zero.
                     s00 = Sig_p[:, 0, 0]; s01 = Sig_p[:, 0, 1]; s11 = Sig_p[:, 1, 1]
                     Q00 =  c*c*s00 + 2*c*s*s01 + s*s*s11 + self.R[0, 0]
-                    Q01 = -c*s*s00 + (c*c - s*s)*s01 + c*s*s11
+                    Q01 = -c*s*s00 + (c*c - s*s)*s01 + c*s*s11 + self.R[0, 1]
                     Q11 =  s*s*s00 - 2*c*s*s01 + c*c*s11 + self.R[1, 1]
 
                     # Pbar (world-frame motion prior) — inline per-particle rotation
@@ -1994,24 +2012,6 @@ class RowFastSLAMNode(Node):
                             particles[i].pose[:] = xnew_now[ki]
 
             # ---- Spacing-consistency log-weight ----
-            # For each particle, check whether its already-observed neighbours of
-            # the just-measured slot are positioned where the spacing prior predicts
-            # they should be.  Particles whose map is internally inconsistent with
-            # regular spacing get a log-weight penalty.  This converts the spacing
-            # constraint from a pure map-correction (propagation) into a particle-
-            # selection criterion — which is the correct place for it in a PF.
-            #
-            # We only score neighbours that:
-            #   (a) exist in the particle's landmark map, AND
-            #   (b) have been seen >= consistency_min_seen times (avoid penalising
-            #       particles for template slots that haven't been observed yet), AND
-            #   (c) the anchor slot itself has been seen >= min_seen times (so the
-            #       anchor position is trustworthy enough to compare against).
-            #
-            # The penalty is a Gaussian in along-row error only:
-            #   logw -= 0.5 * (err_s / sigma_s)^2
-            # where sigma_s = slot_spacing * consistency_sigma_frac.
-            # Lateral error is not penalised — spacing only constrains along-row.
             if self._spacing_prop_enable:
                 _c_min_seen   = self._spacing_consistency_min_seen
                 _c_sigma_s    = float(self.slot_spacing) * self._spacing_consistency_sigma_frac
@@ -2093,8 +2093,8 @@ class RowFastSLAMNode(Node):
                     float(t_meas_sec),
                     int(self.measurement_count),
                     int(slot_j),
-                    float(z[0]),  # z_x_fwd
-                    float(z[1]),  # z_y_lat
+                    float(z[0]),
+                    float(z[1]),
                     float(r),
                     int(self.proposal_enable),
                     neff,
@@ -2122,8 +2122,6 @@ class RowFastSLAMNode(Node):
             # ---- Landmark EKF update AFTER pose proposal ----
             if not skip_update:
                 # --- gather indices of valid particles for this slot ---
-                # In per-particle mode each particle may have a different slot;
-                # valid_slots records the slot for each entry in valid_idx.
                 valid_idx = []
                 valid_slots = []  # parallel to valid_idx
                 for i, p in enumerate(self.particles):
@@ -2185,8 +2183,8 @@ class RowFastSLAMNode(Node):
                     hs01 = -cv*sv*sxx_v + (cv*cv - sv*sv)*sxy_v + cv*sv*syy_v
                     hs11 =  sv*sv*sxx_v - 2*cv*sv*sxy_v + cv*cv*syy_v
 
-                    # S = H Sigma H^T + R
-                    S00 = hs00 + self.R00;  S01 = hs01;  S11 = hs11 + self.R11
+                    # S = H Sigma H^T + R  (R[0,1] == 0 for cartesian, non-zero for polar)
+                    S00 = hs00 + self.R00;  S01 = hs01 + self.R[0, 1];  S11 = hs11 + self.R11
                     det = S00 * S11 - S01 * S01
                     ok  = det > 0.0
                     if not np.all(ok):
@@ -2247,6 +2245,16 @@ class RowFastSLAMNode(Node):
                         new_s11 = new_s11 + add_ss*t1**2 + add_dd*n1**2
                         sym01   = sym01   + add_ss*t0*t1 + add_dd*n0*n1
 
+                    # Process noise: inject a fixed variance increment each update so
+                    # landmark uncertainty never collapses to zero regardless of how many
+                    # observations have been made
+                    if self._lm_process_var_s > 0.0 or self._lm_process_var_d > 0.0:
+                        t0, t1 = float(self.t_hat_assoc[0]), float(self.t_hat_assoc[1])
+                        n0, n1 = -t1, t0
+                        new_s00 = new_s00 + self._lm_process_var_s*t0**2 + self._lm_process_var_d*n0**2
+                        new_s11 = new_s11 + self._lm_process_var_s*t1**2 + self._lm_process_var_d*n1**2
+                        sym01   = sym01   + self._lm_process_var_s*t0*t1 + self._lm_process_var_d*n0*n1
+
                     # Scatter results back to landmark objects (only valid particles)
                     for k, i in enumerate(valid_idx):
                         if not ok[k]:
@@ -2291,10 +2299,6 @@ class RowFastSLAMNode(Node):
             # ---- Resampling ----
             self.measurement_count += 1
             past_burn_in = (self.measurement_count > self.resample_burn_in)
-            # Only resample when the slot EKF update fully committed (mu, Sigma,
-            # seen_count all written) AND weights were updated this step.
-            # Suppressing on skip_update prevents resampling from a weight
-            # distribution that doesn't reflect the current measurement.
             if (slot_committed
                     and past_burn_in
                     and self.resample_interval > 0
@@ -2317,7 +2321,6 @@ class RowFastSLAMNode(Node):
         dy_w = s * x_fwd + c * y_lat
         return np.array([rx + dx_w, ry + dy_w], dtype=float)
 
-    @profile
     def _data_association_slot(self, z_robot: np.ndarray, d_now_to_meas: Optional[np.ndarray] = None) -> Tuple[Optional[int], Optional[np.ndarray]]:
         """
         Returns:
@@ -2353,7 +2356,6 @@ class RowFastSLAMNode(Node):
             pose_ref = se2_compose(pose_ref, d_now_to_meas)
 
         # mu_world_approx from the raw measurement — returned to callers for bookkeeping
-        # (template-origin accumulation, snap_downstream_spacing, debug CSV).
         mu_world_approx = self._world_from_robot(pose_ref, z_robot)  # (2,)
 
         # ---- Stable association origin (xy anchor) ----
@@ -2371,11 +2373,6 @@ class RowFastSLAMNode(Node):
             return None, None
 
         # ---- Row coordinate for this measurement ----
-        # Apply the forward gate before projecting to s_meas so that association
-        # and the EKF s-update are consistent.  Without this, a detection at
-        # z[0] > meas_fwd_gate maps to a biased s_meas that can pull j_raw one
-        # slot too far forward, even though the EKF later zeroes e0 for the same
-        # measurement.  mu_world_approx above is kept un-clamped for callers.
         if self._meas_fwd_gate > 0.0 and float(z_robot[0]) > self._meas_fwd_gate:
             z_assoc = z_robot.copy()
             z_assoc[0] = self._meas_fwd_gate
@@ -2437,9 +2434,6 @@ class RowFastSLAMNode(Node):
                     return None, None
 
         # ---- Commit: only update last_slot for particles that agreed on j_idx ----
-        # Particles that were clamped to a different candidate keep their current
-        # last_slot so their individual hysteresis windows stay anchored to their
-        # own pose history rather than being dragged by the plurality winner.
         for p in self.particles:
             last = p.last_slot
             if last is None:
@@ -2455,7 +2449,6 @@ class RowFastSLAMNode(Node):
         self.assoc_last_slot = int(j_idx)   # keep in sync for pre-init paths
         return int(j_idx), mu_world_approx
 
-    @profile
     def _data_association_slot_per_particle(
         self,
         z_robot: np.ndarray,
@@ -2478,16 +2471,6 @@ class RowFastSLAMNode(Node):
         mu_world_arr : np.ndarray, shape (N, 2), dtype float64
             Approximate world position of the measurement for each particle.
             Rows corresponding to rejected particles are set to NaN.
-
-        Global side-effects
-        -------------------
-        * assoc_origin_xy / assoc_origin_s are initialised on the first call (same
-          logic as the shared-pose path).
-        * p.last_slot is updated for particles whose per-particle j matches the
-          plurality winner (same selective-commit rule as the shared-pose path).
-        * assoc_last_slot is set to the plurality winner (for pre-init paths).
-        * _extend_template_slots_to() is called if any particle maps to a slot
-          beyond num_slots.
         """
         N = len(self.particles)
         slot_j_arr = np.full(N, -1, dtype=np.int32)
@@ -2597,6 +2580,12 @@ class RowFastSLAMNode(Node):
 
         # ---- Plurality winner (for last_slot commit and global bookkeeping) ----
         if not in_gate.any():
+            self.get_logger().warn(
+                f"PER_PARTICLE NO GATE: s_meas=[{s_meas_arr.min():.2f},{s_meas_arr.max():.2f}] "
+                f"origin_s={origin_s:.2f} j_raw=[{j_raw_arr.min()},{j_raw_arr.max()}] "
+                f"slot_s_gate={self.slot_s_gate:.2f}",
+                throttle_duration_sec=0.5
+            )
             return slot_j_arr, mu_world_arr
 
         valid_js = j_cand_arr[in_gate]
@@ -2611,7 +2600,63 @@ class RowFastSLAMNode(Node):
                 p.last_slot = j_plurality
         self.assoc_last_slot = j_plurality
 
+        self.get_logger().debug(
+            f"PER_PARTICLE: s_meas=[{s_meas_arr.min():.2f},{s_meas_arr.max():.2f}] "
+            f"origin_s={origin_s:.2f} j_raw=[{j_raw_arr.min()},{j_raw_arr.max()}] "
+            f"in_gate={int(in_gate.sum())}/{len(in_gate)} "
+            f"slot_s_gate={self.slot_s_gate:.2f}",
+            throttle_duration_sec=0.5
+        )
+
         return slot_j_arr, mu_world_arr
+
+    # ------------- Measurement noise helpers -------------
+
+    def _polar_R(self, x_fwd: float, y_lat: float) -> Tuple[float, float, float]:
+        """
+        Compute the 2×2 measurement noise covariance in the robot Cartesian frame
+        from range / bearing noise, linearized at the measured point (x_fwd, y_lat).
+
+        The polar-to-Cartesian Jacobian at a point (r, α) is:
+            J = [[cos α, -r·sin α],
+                 [sin α,  r·cos α]]
+        with  r = sqrt(x² + y²),  α = atan2(y, x).
+
+        Therefore  R_cart = J @ diag(σ_r², σ_α²) @ J^T.
+
+        Returns (R00, R01/R10, R11) — the three unique elements of the symmetric matrix.
+        The off-diagonal R01 is zero only when α = 0 or α = π/2; in general it is non-zero,
+        so callers must use the full 2×2 matrix for a correct innovation covariance.
+        Note: hot-path code that uses only self.R00 / self.R11 (the diagonal) will
+        over-simplify; call _update_R_from_measurement() once per measurement callback
+        to keep self.R, self.R00, self.R11 up to date.
+        """
+        r2  = x_fwd * x_fwd + y_lat * y_lat
+        r   = max(float(np.sqrt(r2)), 1e-6)
+        sr2 = self._meas_std_range   ** 2   # σ_r²
+        sb2 = self._meas_std_bearing ** 2   # σ_α²
+
+        # cos α = x/r,  sin α = y/r
+        ca = x_fwd / r
+        sa = y_lat / r
+
+        R00 = ca * ca * sr2 + r2 * sa * sa * sb2
+        R11 = sa * sa * sr2 + r2 * ca * ca * sb2
+        R01 = ca * sa * (sr2 - r2 * sb2)
+        return float(R00), float(R01), float(R11)
+
+    def _update_R_from_measurement(self, x_fwd: float, y_lat: float) -> None:
+        """
+        For polar noise model: recompute self.R, self.R00, self.R11 for the
+        current measurement.  Call once at the top of measurement_callback.
+        """
+        R00, R01, R11 = self._polar_R(x_fwd, y_lat)
+        self.R[0, 0] = R00
+        self.R[0, 1] = R01
+        self.R[1, 0] = R01
+        self.R[1, 1] = R11
+        self.R00 = R00
+        self.R11 = R11
 
     # ------------- Landmark EKF update + proposal helpers -------------
 
@@ -2633,7 +2678,6 @@ class RowFastSLAMNode(Node):
                     [-s,  c]], dtype=float)
         return z_pred, H
 
-    @profile
     def _predict_z_Hland_Jpose(self, pose: np.ndarray, mu_lm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         x, y, th = float(pose[0]), float(pose[1]), float(pose[2])
         c, s = float(np.cos(th)), float(np.sin(th))
@@ -2688,24 +2732,6 @@ class RowFastSLAMNode(Node):
     ) -> np.ndarray:
         """
         Compute the initial landmark covariance for a new EKF slot.
-
-        The measurement model inverse is:
-            lm_x = px + cos(θ) * x_fwd - sin(θ) * y_lat
-            lm_y = py + sin(θ) * x_fwd + cos(θ) * y_lat
-
-        Two uncertainty sources contribute:
-
-        1. Measurement noise (always applied):
-               Sigma_meas = G_z @ R @ G_z^T
-           where G_z = R(θ) (the 2×2 rotation matrix), so
-               Sigma_meas = R(θ) @ R_noise @ R(θ)^T
-           This correctly rotates the sensor's axis-aligned noise into world frame:
-           lateral noise stays tight, along-heading noise stays large.
-
-        2. Pose uncertainty (only when landmark_init.include_pose_uncertainty=True):
-               Sigma_pose = G_x_xy @ P_pose_xy @ G_x_xy^T
-           where G_x_xy = I (identity — lm_xy shifts 1:1 with robot xy),
-           so Sigma_pose = P_pose_xy (the robot xy covariance in world frame).
 
         Parameters
         ----------
@@ -2766,41 +2792,6 @@ class RowFastSLAMNode(Node):
 
     def _propagate_spacing_prior(self, anchor_j: int) -> None:
         """Propagate updated landmark positions to unseen neighbours via spacing prior.
-
-        After slot anchor_j is updated by a measurement, each particle's estimate
-        of that slot's position is the most accurate it will be until the next
-        observation.  We use it as an anchor to nudge neighbouring slots that
-        haven't been seen much yet, encoding the prior that tree spacing is regular:
-
-            mu_{j±k} ≈ mu_{anchor} ± k * slot_spacing * t_hat
-
-        This is a soft Bayesian nudge — not a hard assignment — controlled by alpha.
-        Only propagates FROM anchor slots with >= min_seen observations (avoids
-        spreading noise from uncertain first-hit estimates) and only TO slots with
-        < max_unseen observations (stops overwriting well-observed landmarks).
-
-        The nudge is applied per-particle so each particle's landmark map stays
-        internally consistent with its own anchor estimate.
-
-        In addition to nudging mu, we also tighten the along-row (s) component of
-        each neighbour's Sigma toward the uncertainty implied by the spacing
-        prediction.  Without this, the prior nudge on mu gets washed out on the
-        very next EKF measurement update because the Kalman gain is still high.
-        The lateral (d) component of Sigma is left unchanged — the spacing
-        prediction carries no information about cross-row position.
-
-        The predicted along-row variance for a neighbour k hops away is:
-
-            var_pred_s = (hop * spacing * _SPACING_SIGMA_FRAC)^2
-
-        where _SPACING_SIGMA_FRAC encodes how uncertain we are about the
-        regularity of tree spacing (~15% of spacing per hop is conservative).
-        The same eff_alpha blend used for mu is applied to Sigma_ss so the
-        two updates stay coupled.  The result is clamped to the existing
-        landmark_sigma_floor_s so we never produce a covariance tighter than
-        what a real measurement could achieve.
-
-        Parameters controlled by spacing_propagation.* ROS params.
         """
         if not self.particles:
             return
@@ -2832,7 +2823,8 @@ class RowFastSLAMNode(Node):
         if not valid.any():
             return
 
-        for direction in (+1, -1):
+        directions = (+1,) if self._spacing_prop_forward_only else (+1, -1)
+        for direction in directions:
             for hop in range(1, n_hops + 1):
                 nb_j = anchor_j + direction * hop
                 if nb_j < 0:
@@ -2856,10 +2848,7 @@ class RowFastSLAMNode(Node):
 
                 # ------------------------------------------------------------------
                 # Sigma tightening: blend along-row variance toward the spacing
-                # prediction uncertainty.  The prediction gets less reliable with
-                # each hop, so var_pred_s grows quadratically with hop distance.
-                # We only move Sigma_ss — never Sigma_dd — because the spacing
-                # chain predicts s position only.
+                # prediction uncertainty
                 # ------------------------------------------------------------------
                 pred_sigma_s  = hop * spacing * _SPACING_SIGMA_FRAC
                 pred_var_s    = pred_sigma_s * pred_sigma_s
@@ -2916,7 +2905,6 @@ class RowFastSLAMNode(Node):
         """OPT: inlined scalar version — delegates to at-pose variant using particle's current pose."""
         self._ekf_update_landmark_at_pose(p.pose, lm, z, R_meas)
 
-    @profile
     def _ekf_update_landmark_at_pose(self, pose: np.ndarray, lm: LandmarkEKF, z: np.ndarray, R_meas: np.ndarray):
         """Single-landmark EKF update.
         """
@@ -3104,9 +3092,6 @@ class RowFastSLAMNode(Node):
         self.particles = new_particles
 
         # ---- Roughening after collapse ----
-        # When neff_ratio is very low, the cloud has converged to 1-2 survivors.
-        # Without added noise, all resampled particles are identical — the proposal
-        # then gives them all the same correction and neff stays degenerate.
         if neff_ratio < self._roughen_neff_moderate:
             rough_std = np.array(self._last_motion_std_body, dtype=np.float64).copy()
 
@@ -3141,9 +3126,7 @@ class RowFastSLAMNode(Node):
                 poses[:N, 0] += self._rng.standard_normal(N) * rough_std[0] * self._roughen_scale_moderate_xy
                 poses[:N, 1] += self._rng.standard_normal(N) * rough_std[1] * self._roughen_scale_moderate_xy
 
-        # Force-publish after resampling — the map changed structurally and the
-        # trellis collision-object node must receive the update immediately,
-        # regardless of the normal throttle interval.
+        # Force-publish after resampling
         self._publish_registry_from_best(force=True)
         self._publish_odom_from_best(force=True)
 

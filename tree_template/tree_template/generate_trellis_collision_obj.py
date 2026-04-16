@@ -30,6 +30,7 @@ class TreeSceneNode(Node):
         self.declare_parameter("num_side_branches", 4.0)
         self.declare_parameter("side_branch_radii", 0.04)
         self.declare_parameter("side_branch_len", 2.0)
+        self.declare_parameter("side_branch_starting_height", 0.5)  # m, height of first side branch
         self.declare_parameter("trellis_angle", -18.435)  # Martin's angle (deg)
         self.declare_parameter("branch_spacing", 0.5)      # m
         self.declare_parameter("trellis_frame", "map")
@@ -56,6 +57,9 @@ class TreeSceneNode(Node):
         self.side_branch_len = self.get_parameter(
             "side_branch_len"
         ).get_parameter_value().double_value
+        self.side_branch_starting_height = self.get_parameter(
+            "side_branch_starting_height"
+        ).get_parameter_value().double_value
         self.trellis_angle = np.deg2rad(
             self.get_parameter("trellis_angle").get_parameter_value().double_value
         )
@@ -80,7 +84,7 @@ class TreeSceneNode(Node):
         # Services (manual add + clear)
         self.update_position_service = self.create_service(
             UpdateTrellisPosition,
-            'update_trellis_position',
+            '/update_trellis_position',
             self.update_trellis_position_callback
         )
 
@@ -162,7 +166,22 @@ class TreeSceneNode(Node):
         Each call adds a new tree instance at (x, y, z) using the manual service.
         This is separate from the registry-driven map.
         """
-        self.add_tree_instance_at(request.pose, request.side)
+        self.get_logger().debug(
+            "Received /update_trellis_position request: "
+            f"x={request.pose.position.x:.3f}, "
+            f"y={request.pose.position.y:.3f}, "
+            f"z={request.pose.position.z:.3f}, "
+            f"side={request.side}"
+        )
+
+        try:
+            self.add_tree_instance_at(request.pose, request.side)
+        except Exception as exc:
+            response.success = False
+            self.get_logger().error(
+                f"Failed to add tree instance from service request: {exc}"
+            )
+            return response
 
         response.success = True
         self.get_logger().info(
@@ -249,7 +268,7 @@ class TreeSceneNode(Node):
             branch_pose = Pose()
             branch_pose.position.x = 0.0
             branch_pose.position.y = 0.0
-            branch_pose.position.z = j * self.branch_spacing
+            branch_pose.position.z = self.side_branch_starting_height + (j - 1) * self.branch_spacing
 
             branch_orientation = R.from_euler("xyz", [3.14159265 / 2, 0.0, 0.0]).as_quat()
             branch_pose.orientation.x = branch_orientation[0]

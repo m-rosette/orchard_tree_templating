@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
 from typing import Optional, Tuple
 
@@ -48,6 +47,9 @@ class TrunkDetectionRelay(Node):
         # Filtering
         self.declare_parameter("min_trunk_width", 0.03)     # meters; 0 disables
         self.declare_parameter("required_class", 0)        # only allow this class id
+        self.declare_parameter("min_depth", 0.3)           # meters
+        self.declare_parameter("max_depth", 5.0)           # meters
+        self.declare_parameter("side_class_skipping", "near")  # skip detections classified as "near" side (more likely to be occlusions or false positives)
 
         # Optional debug marker publishing
         self.declare_parameter("publish_debug_markers", True)
@@ -56,6 +58,9 @@ class TrunkDetectionRelay(Node):
 
         # Logging control
         self.declare_parameter("log_rejection_every_n_msgs", 30)  # 0 disables
+
+        # Camera coordinate convention assumptions
+        self.declare_parameter("base_x_is_right", True)  # if False, base X is left and we flip the sign of lateral
 
         # -------- Read params --------
         self.input_topic = str(self.get_parameter("input_topic").value)
@@ -67,6 +72,9 @@ class TrunkDetectionRelay(Node):
 
         self.min_trunk_width = float(self.get_parameter("min_trunk_width").value)
         self.required_class = int(self.get_parameter("required_class").value)
+        self.min_depth = float(self.get_parameter("min_depth").value)
+        self.max_depth = float(self.get_parameter("max_depth").value)
+        self.side_class_skipping = str(self.get_parameter("side_class_skipping").value)
 
         self.publish_debug_markers = bool(self.get_parameter("publish_debug_markers").value)
         self.debug_marker_topic = str(self.get_parameter("debug_marker_topic").value)
@@ -74,6 +82,8 @@ class TrunkDetectionRelay(Node):
 
         self.log_rejection_every_n_msgs = int(self.get_parameter("log_rejection_every_n_msgs").value)
         self._rej_log_counter = 0
+
+        self.base_x_is_right = bool(self.get_parameter("base_x_is_right").value)
 
         # -------- TF2 --------
         self.tf_buffer = tf2_ros.Buffer()
@@ -101,6 +111,7 @@ class TrunkDetectionRelay(Node):
             f"  Frames: camera_frame='{self.camera_frame}', output_frame='{self.output_frame}'\n"
             f"  width_addition={self.use_trunk_width_addition}\n"
             f"  min_trunk_width={self.min_trunk_width:.3f} m, required_class={self.required_class}\n"
+            f"  min_depth={self.min_depth:.2f} m, max_depth={self.max_depth:.2f} m\n"
             f"  debug_markers={self.publish_debug_markers}"
         )
 
@@ -137,7 +148,6 @@ class TrunkDetectionRelay(Node):
         if dropped > 0 and self.log_rejection_every_n_msgs != 0:
             self._rej_log_counter += 1
             if (self._rej_log_counter % self.log_rejection_every_n_msgs) == 0:
-                # Provide useful breakdown if available
                 parts = [f"kept={kept}/{n0}"]
 
                 if classes is not None and classes.size == n0:
@@ -160,12 +170,12 @@ class TrunkDetectionRelay(Node):
         if widths is not None and widths.size == n0:
             widths = widths[valid]
         else:
-            widths = None  # avoid mismatched lengths downstream
+            widths = None
 
         n = int(pts.shape[0])
 
         # --- Depth/radius tweak on DEPTH ---
-        z_depth = bottom_pts[:, 1].astype(np.float64)  # meters, positive
+        z_depth = bottom_pts[:, 1].astype(np.float64)
         if self.use_trunk_width_addition and widths is not None:
             radii = widths.astype(np.float64) * 0.5
             z_depth = z_depth + radii
@@ -176,9 +186,9 @@ class TrunkDetectionRelay(Node):
         # Build point in camera OPTICAL frame for TF:
         # Optical: X=RIGHT, Y=DOWN, Z=FORWARD(depth)
         pos_cam = np.empty((n, 3), dtype=np.float64)
-        pos_cam[:, 0] = x         # optical X (RIGHT)
-        pos_cam[:, 1] = 0.0       # optical Y (DOWN)
-        pos_cam[:, 2] = z_depth   # optical Z (FORWARD / depth)
+        pos_cam[:, 0] = x
+        pos_cam[:, 1] = 0.0
+        pos_cam[:, 2] = z_depth
 
         # TF: camera optical -> base (or output frame)
         if self.output_frame != self.camera_frame:
@@ -190,31 +200,20 @@ class TrunkDetectionRelay(Node):
         else:
             p_base = pos_cam
 
-        # Mounting relationship: optical Z aligns with base Y (depth -> base Y)
-        # Publish TrunkInfo in SLAM convention:
-        #   pose.x = x_fwd = base_Y
-        #   pose.y = y_lat = +/- base_X (left+)
-        base_x_is_right = True
-        lat_sign = -1.0 if base_x_is_right else 1.0
+        lat_sign = -1.0 if self.base_x_is_right else 1.0
 
         for i in range(n):
-            bx = float(p_base[i, 0])  # base X
-            by = -float(p_base[i, 1])  # base Y
-
             ti = TrunkInfo()
             ti.pose = Pose()
 
-            if hasattr(msg, "header"):
-                ti.stamp = msg.header.stamp
-            elif hasattr(msg, "stamp"):
-                ti.stamp = msg.stamp
-            else:
-                ti.stamp = self.get_clock().now().to_msg()
+            bx = float(p_base[i, 0])
+            by = float(p_base[i, 1])
 
-            ti.pose.position.x = bx                # SLAM forward
-            ti.pose.position.y = lat_sign * by     # SLAM lateral (left+)
+            ti.stamp = self.get_clock().now().to_msg()
+
+            ti.pose.position.x = bx
+            ti.pose.position.y = lat_sign * by
             ti.pose.position.z = 0.0
-
             ti.pose.orientation.w = 1.0
 
             if widths is None or not np.isfinite(widths[i]):
@@ -222,7 +221,23 @@ class TrunkDetectionRelay(Node):
             else:
                 ti.width = float(widths[i])
 
-            ti.side = ""
+            # --- Side classification (near vs far) based on top vs bottom position in image ---
+            # In image coordinates (y increases downward), if top_y < bottom_y, top is higher in image,
+            # which likely indicates a far-side trunk (top more occluded). If top_y > bottom_y, near-side.
+            top_y = top_pts[i, 1]
+            bottom_y = bottom_pts[i, 1]
+            if top_y < bottom_y:
+                ti.side = "far"
+            elif top_y > bottom_y:
+                ti.side = "near"
+            else:
+                ti.side = ""
+
+            # Skip detections classified as "near" side
+            if self.side_class_skipping != '' and ti.side == self.side_class_skipping:
+                self.get_logger().warn(f"Skipping detection at x={bx:.2f}m, y={by:.2f}m classified as side='{ti.side}'")
+                continue
+
             self.meas_pub.publish(ti)
 
             if self.marker_pub is not None:
