@@ -1,0 +1,6 @@
+string output_path
+bool append_timestamp
+---
+bool success
+string message
+string written_path

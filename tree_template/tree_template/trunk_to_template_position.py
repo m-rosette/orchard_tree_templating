@@ -42,11 +42,11 @@ class TrunkClusterToTemplateNode(Node):
 
         # -------- Parameters (declare) --------
         self.declare_parameter("input_topic", "tree_image_data")
-        self.declare_parameter("min_samples", 10)
+        self.declare_parameter("min_samples", 3)
         self.declare_parameter("cluster_timer_period", 1.0)
 
-        self.declare_parameter("track_position_gate", 0.5)
-        self.declare_parameter("track_width_gate", 0.03)
+        self.declare_parameter("track_position_gate", 1.0) # 50 cm for Envy | 1.0 cm for Jazzy
+        self.declare_parameter("track_width_gate", 100.0) # 3 cm for Envy | disabled for Jazzy..?
         self.declare_parameter("uniqueness_radius", 0.4)
         self.declare_parameter("use_trunk_width_addition", True)
 
@@ -55,14 +55,14 @@ class TrunkClusterToTemplateNode(Node):
         self.declare_parameter("row_axis_z", 0.0)
 
         self.declare_parameter("side_mode", "trunk_depth")  # "datum" | "slot_alternating" | "trunk_depth"
-        self.declare_parameter("slot_spacing", 0.75)
+        self.declare_parameter("slot_spacing", 1.4) # 0.75 for Envy | 1.4 for Jazzy
         self.declare_parameter("row_origin_s", 0.0)
         self.declare_parameter("start_side", "far")
         self.declare_parameter("along_row_tolerance", 0.25)
         self.declare_parameter("lateral_tolerance", 0.25)
 
         self.declare_parameter("camera_frame", "base_camera_color_optical_frame")
-        self.declare_parameter("target_frame", "odom_slam")
+        self.declare_parameter("target_frame", "map")
 
         self.declare_parameter("row_datum_line_width", 0.1)
 
@@ -189,6 +189,10 @@ class TrunkClusterToTemplateNode(Node):
 
         points_2d, widths, top_2d, bottom_2d = self.extract_points_and_widths_from_msg(msg)
         if points_2d.size == 0 or top_2d.size == 0 or bottom_2d.size == 0:
+            return
+        
+        # If individual widths are smaller than a 0.01, return
+        if widths is not None and np.all(widths < 0.01):
             return
 
         t_msg = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9

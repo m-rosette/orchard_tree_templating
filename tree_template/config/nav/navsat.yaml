@@ -1,0 +1,25 @@
+navsat_transform:
+  ros__parameters:
+    frequency: 10.0
+    delay: 0.0
+
+    # Inputs
+    gps_topic: /gps/fix
+    imu_topic: /imu/data
+    odom_topic: /odometry/local
+
+    # Output
+    output_topic: /odometry/gps
+
+    # If your IMU yaw is not absolute (no mag), use_odometry_yaw can work better.
+    # Try false first if your IMU provides a stable heading.
+    use_odometry_yaw: false
+
+    # Set these if you have a magnetometer / know declination & offsets.
+    magnetic_declination_radians: 0.0
+    yaw_offset: 0.0
+
+    # In ROS 2 you may also see/need this depending on distro/version:
+    # broadcast_utm_transform: false
+    # broadcast_utm_transform_as_parent_frame: false
+    # zero_altitude: true
