@@ -2,18 +2,34 @@
 """
 trellis_from_rgbd_extraction.py
 
-Reads the per-tree meta.yaml files output by fast_slam_rgbd_extraction,
-anchors all trunk positions relative to a chosen tree (placing it at the
-robot origin 0,0,0), then publishes each trunk as a CollisionObject via
-the /update_trellis_position service.
+Reads ALL per-tree meta.yaml files found under extraction_dir at once,
+anchors every trunk position relative to a chosen tree (placing the robot
+at the origin 0,0,0), then publishes the complete set as a single
+TrunkRegistry message so the downstream generate_trellis_collision_obj
+node can spawn all collision objects in one shot.
 
 Usage
 -----
 ros2 run <package> trellis_from_rgbd_extraction --ros-args \
     -p extraction_dir:=/path/to/rgbd_at_trees \
-    -p anchor_tree_id:=8 \
-    -p trellis_side:=near \
-    -p publish_delay_s:=0.5
+    -p trellis_side:=near
+
+Parameters
+----------
+extraction_dir   (str)  – required. Root directory containing tree_*/meta.yaml files.
+trellis_side     (str)  – fallback side when meta.yaml has no 'side' field (default "far").
+z_offset         (float)– vertical offset added to all trunk z-positions (default 0.0).
+registry_topic   (str)  – topic name for the TrunkRegistry message (default "fastslam_registry").
+
+Workflow
+--------
+1. Launch the node — it loads all meta.yaml files immediately and logs available tree IDs.
+2. Set the anchor tree at runtime to trigger publishing:
+
+       ros2 param set /trellis_from_rgbd_extraction anchor_tree_id 8
+
+   The node publishes the full TrunkRegistry as soon as a valid anchor ID is received.
+   You can re-anchor at any time by setting anchor_tree_id again.
 
 Directory structure expected (output of fast_slam_rgbd_extraction):
     extraction_dir/
@@ -22,7 +38,7 @@ Directory structure expected (output of fast_slam_rgbd_extraction):
         tree_008/meta.yaml
         ...
 
-Each meta.yaml is expected to have at minimum (matches fast_slam_rgbd_extraction output):
+Each meta.yaml is expected to have at minimum:
     tree_id: 8
     tree_world_xy_m: [x, y]                  # trunk position in SLAM world frame
     broadside_robot_pose_xyt: [x, y, yaw]    # robot pose when tree was broadside
@@ -33,7 +49,7 @@ import os
 import time
 import glob
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import yaml
@@ -42,7 +58,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geometry_msgs.msg import Pose
-from tree_template_interfaces.srv import UpdateTrellisPosition
+from rcl_interfaces.msg import SetParametersResult
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
 
 
@@ -113,6 +129,7 @@ def _anchor_transform(
     -------
     robot_origin_xy : (2,) world-frame robot position when anchor was broadside
     row_yaw         : yaw (rad) of the row direction at that moment
+    anchor_fwd      : along-row distance of the anchor tree from its broadside robot pose
     """
     if anchor_id not in tree_data:
         raise ValueError(
@@ -142,21 +159,6 @@ def _transform_to_local(
 ) -> np.ndarray:
     """
     Compute local (x, y) for a trunk in the anchor robot frame.
-
-    Along-row (X):
-        Each tree uses its own fwd_dist_to_tree_m from its meta.yaml,
-        offset relative to the anchor tree's fwd_dist_to_tree_m so the
-        anchor lands at its own observed X and all others are spaced from it.
-
-          x = tree_fwd + (along_row_world_offset_from_anchor_robot)
-
-        The world along-row offset is computed by projecting the world
-        delta (tree - robot_origin) onto the row direction, then subtracting
-        the anchor's own projection to re-center around the anchor.
-
-    Lateral (Y):
-        Derived purely from world geometry — subtract the robot's lateral
-        world offset so each tree keeps its own observed lateral distance.
     """
     c, s = np.cos(-row_yaw), np.sin(-row_yaw)
     rot = np.array([[c, -s], [s, c]], dtype=np.float64)
@@ -166,8 +168,8 @@ def _transform_to_local(
     robot_rot = rot @ robot_origin_xy
 
     # Along-row: world spacing from robot origin, re-centered on anchor_fwd
-    along_row_world = trunk_rot[0] - robot_rot[0]   # relative to robot X
-    x = anchor_fwd + along_row_world                 # anchor stays at its own fwd
+    along_row_world = trunk_rot[0] - robot_rot[0]
+    x = anchor_fwd + along_row_world
 
     # Lateral: subtract robot's lateral world offset so robot is at Y=0
     y = trunk_rot[1] - robot_rot[1]
@@ -181,78 +183,97 @@ class TrellisFromExtractionNode(Node):
 
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter("extraction_dir", "")
-        self.declare_parameter("anchor_tree_id", -1)
+        self.declare_parameter("anchor_tree_id", -1)   # set at runtime to trigger publish
         self.declare_parameter("trellis_side", "far")
-        self.declare_parameter("publish_delay_s", 0.1)   # gap between service calls
-        self.declare_parameter("z_offset", 0.0)          # vertical offset for all trunks
-        self.declare_parameter("publish_mode", "service")
+        self.declare_parameter("z_offset", 0.0)
         self.declare_parameter("registry_topic", "fastslam_registry")
 
         self.extraction_dir = self.get_parameter("extraction_dir").value
-        self.anchor_tree_id = self.get_parameter("anchor_tree_id").value
         self.trellis_side = self.get_parameter("trellis_side").value
-        self.publish_delay_s = self.get_parameter("publish_delay_s").value
         self.z_offset = self.get_parameter("z_offset").value
-        self.publish_mode = str(self.get_parameter("publish_mode").value).lower()
         self.registry_topic = str(self.get_parameter("registry_topic").value)
 
         if not self.extraction_dir:
             self.get_logger().fatal("Parameter 'extraction_dir' must be set.")
             raise RuntimeError("extraction_dir not set")
 
-        if self.publish_mode not in ("service", "registry"):
-            self.get_logger().warn(
-                f"publish_mode='{self.publish_mode}' is invalid; defaulting to 'service'."
-            )
-            self.publish_mode = "service"
+        registry_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.registry_pub = self.create_publisher(
+            TrunkRegistry, self.registry_topic, registry_qos
+        )
 
-        if self.publish_mode == "registry":
-            registry_qos = QoSProfile(
-                depth=1,
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            )
-            self.registry_pub = self.create_publisher(
-                TrunkRegistry, self.registry_topic, registry_qos
-            )
-        else:
-            self.client = self.create_client(
-                UpdateTrellisPosition, "update_trellis_position"
-            )
+        # Loaded eagerly in _startup_once; empty until then
+        self._tree_data: Dict[int, dict] = {}
 
         # ── Kick off once the node is spinning ────────────────────────────────
         self.create_timer(0.1, self._startup_once)
         self._started = False
 
-    # ── Startup (runs once after spin begins) ─────────────────────────────────
+    # ── Startup: load yamls, log available IDs, register param callback ───────
 
     def _startup_once(self):
         if self._started:
             return
         self._started = True
 
-        # Load all meta.yaml files
         try:
-            tree_data = _load_meta_yamls(self.extraction_dir)
+            self._tree_data = _load_meta_yamls(self.extraction_dir)
         except FileNotFoundError as e:
             self.get_logger().fatal(str(e))
             return
 
         self.get_logger().info(
-            f"Loaded {len(tree_data)} trees from {self.extraction_dir}\n"
-            f"  Available tree ids: {sorted(tree_data.keys())}"
+            f"Loaded {len(self._tree_data)} trees from {self.extraction_dir}\n"
+            f"  Available tree ids: {sorted(self._tree_data.keys())}\n"
+            f"  Waiting for anchor — run:\n"
+            f"    ros2 param set /{self.get_name()} anchor_tree_id <id>"
         )
 
-        # Prompt for anchor id if not set via parameter
-        anchor_id = self.anchor_tree_id
-        if anchor_id < 0:
-            anchor_id = self._prompt_anchor_id(sorted(tree_data.keys()))
+        # Watch for anchor_tree_id being set (or changed) at runtime
+        self.add_on_set_parameters_callback(self._on_parameter_change)
 
-        # Compute anchor transform
+        # If anchor_tree_id was already provided at launch, publish right away
+        anchor_id = int(self.get_parameter("anchor_tree_id").value)
+        if anchor_id >= 0:
+            self._try_publish(anchor_id)
+
+    # ── Parameter change callback — fires on `ros2 param set` ────────────────
+
+    def _on_parameter_change(self, params) -> SetParametersResult:
+        for param in params:
+            if param.name == "anchor_tree_id":
+                anchor_id = int(param.value)
+                if anchor_id >= 0:
+                    if not self._tree_data:
+                        self.get_logger().warn(
+                            "anchor_tree_id set before yaml data was loaded — ignoring."
+                        )
+                    else:
+                        # Use a one-shot zero-delay timer so we return from this
+                        # callback immediately — blocking here deadlocks the
+                        # parameter service.
+                        # Store timer handle so the callback can cancel itself
+                        self._pending_anchor_timer = None
+                        def _fire(aid=anchor_id):
+                            self._try_publish(aid)
+                            if self._pending_anchor_timer is not None:
+                                self._pending_anchor_timer.cancel()
+                        self._pending_anchor_timer = self.create_timer(0.0, _fire)
+        return SetParametersResult(successful=True)
+
+    # ── Core publish ──────────────────────────────────────────────────────────
+
+    def _try_publish(self, anchor_id: int):
         try:
-            robot_origin_xy, row_yaw, anchor_fwd = _anchor_transform(tree_data, anchor_id)
+            robot_origin_xy, row_yaw, anchor_fwd = _anchor_transform(
+                self._tree_data, anchor_id
+            )
         except ValueError as e:
-            self.get_logger().fatal(str(e))
+            self.get_logger().error(str(e))
             return
 
         self.get_logger().info(
@@ -261,97 +282,7 @@ class TrellisFromExtractionNode(Node):
             f"row_yaw={np.degrees(row_yaw):.1f} deg"
         )
 
-        if self.publish_mode == "registry":
-            self._publish_trunk_registry(tree_data, anchor_id, robot_origin_xy, row_yaw, anchor_fwd)
-        else:
-            self.get_logger().info("Waiting for /update_trellis_position service...")
-            if not self.client.wait_for_service(timeout_sec=10.0):
-                self.get_logger().fatal(
-                    "/update_trellis_position service not available after 10s. "
-                    "Is generate_trellis_collision_obj running?"
-                )
-                return
-            self._publish_all_trunks(tree_data, anchor_id, robot_origin_xy, row_yaw, anchor_fwd)
-
-    # ── Core publish loop ─────────────────────────────────────────────────────
-
-    def _publish_all_trunks(
-        self,
-        tree_data: Dict[int, dict],
-        anchor_id: int,
-        robot_origin_xy: np.ndarray,
-        row_yaw: float,
-        anchor_fwd: float,
-    ):
-        published = 0
-        skipped = 0
-
-        for tid in sorted(tree_data.keys()):
-            meta = tree_data[tid]
-
-            try:
-                world_xy = _extract_world_xy(meta)
-                world_z = _extract_world_z(meta)
-            except KeyError as e:
-                self.get_logger().warn(f"tree_{tid:03d}: skipping — {e}")
-                skipped += 1
-                continue
-
-            # Per-tree along-row distance from its own meta.yaml
-            tree_fwd = float(meta.get("fwd_dist_to_tree_m", 0.0))
-
-            # Transform to local frame anchored on anchor tree
-            local_xy = _transform_to_local(world_xy, robot_origin_xy, row_yaw, tree_fwd, anchor_fwd)
-
-            # Determine side — prefer per-tree meta, fall back to parameter
-            side = str(meta.get("side", self.trellis_side)) or self.trellis_side
-
-            # Build pose: robot at 0,0,0. Anchor tree appears at its real
-            # observed lateral offset; all others relative to that.
-            pose = Pose()
-            pose.position.x = float(local_xy[0])
-            pose.position.y = float(local_xy[1])
-            pose.position.z = float(world_z) + float(self.z_offset)
-            pose.orientation.x = 0.0
-            pose.orientation.y = 0.0
-            pose.orientation.z = 0.0
-            pose.orientation.w = 1.0
-
-            self.get_logger().info(
-                f"tree_{tid:03d} {'[ANCHOR]' if tid == anchor_id else '        '} "
-                f"local=({local_xy[0]:+.3f}, {local_xy[1]:+.3f})  side={side}"
-            )
-
-            # Call service synchronously (simple fire-and-wait)
-            req = UpdateTrellisPosition.Request()
-            req.pose = pose
-            req.side = side
-
-            future = self.client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-
-            if not future.done():
-                self.get_logger().error(
-                    f"tree_{tid:03d}: service call timed out (no response after 5s)"
-                )
-                skipped += 1
-            elif future.result() is None:
-                self.get_logger().error(
-                    f"tree_{tid:03d}: service call failed (exception in response)"
-                )
-                skipped += 1
-            elif not future.result().success:
-                self.get_logger().error(f"tree_{tid:03d}: service returned failure")
-                skipped += 1
-            else:
-                published += 1
-
-            # Small delay so MoveIt/RViz doesn't get flooded
-            time.sleep(float(self.publish_delay_s))
-
-        self.get_logger().info(
-            f"Done. Published {published} trunks, skipped {skipped}."
-        )
+        self._publish_trunk_registry(self._tree_data, anchor_id, robot_origin_xy, row_yaw, anchor_fwd)
 
     def _publish_trunk_registry(
         self,
@@ -406,7 +337,7 @@ class TrellisFromExtractionNode(Node):
 
         self.registry_pub.publish(msg)
         self.get_logger().info(
-            f"Published TrunkRegistry with {len(msg.trunks)} trunks and skipped {skipped}."
+            f"Published TrunkRegistry with {len(msg.trunks)} trunks, skipped {skipped}."
         )
 
     def _wait_for_registry_subscriber(self, timeout_sec: float = 10.0) -> bool:
@@ -416,22 +347,6 @@ class TrellisFromExtractionNode(Node):
                 return True
             time.sleep(0.1)
         return False
-
-    # ── Interactive prompt ────────────────────────────────────────────────────
-
-    def _prompt_anchor_id(self, available_ids: List[int]) -> int:
-        print("\n" + "=" * 60)
-        print("Available tree IDs:")
-        print("  " + ", ".join(str(i) for i in available_ids))
-        while True:
-            try:
-                val = input("Enter tree ID to anchor on (robot will be placed at 0,0,0 in front of this tree): ").strip()
-                tid = int(val)
-                if tid in available_ids:
-                    return tid
-                print(f"  '{tid}' not in available ids. Try again.")
-            except (ValueError, EOFError):
-                print("  Please enter an integer.")
 
 
 def main(args=None):
