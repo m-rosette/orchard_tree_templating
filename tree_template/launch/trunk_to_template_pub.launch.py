@@ -3,14 +3,18 @@ import os
 
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import ExecuteProcess, SetEnvironmentVariable, DeclareLaunchArgument
+from launch.actions import ExecuteProcess, SetEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription
 from launch.substitutions import LaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.conditions import IfCondition
 
 from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
+
+    use_gps_fusion = LaunchConfiguration("use_gps_fusion")
 
     default_params_file = os.path.join(
         get_package_share_directory("tree_template"),
@@ -19,11 +23,22 @@ def generate_launch_description():
     )
     params_file = LaunchConfiguration("params_file")
 
+    robot_localization_sensor_fusion_launch = os.path.join(
+        get_package_share_directory('tree_template'),
+        'launch', 'gps_fusion.launch.py'
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument(
             "use_sim_time",
             default_value="false",
             description="Use simulated clock",
+        ),
+
+        DeclareLaunchArgument(
+            "use_gps_fusion",
+            default_value="false",
+            description="Use robot localization package to fuse IMU and GPS signals",
         ),
 
         DeclareLaunchArgument(
@@ -58,6 +73,17 @@ def generate_launch_description():
         ),
 
         # ----------------------------
+        # gps_fusion launch
+        # ----------------------------
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(robot_localization_sensor_fusion_launch),
+            launch_arguments={
+                'use_sim_time': use_sim_time,
+            }.items(),
+            condition=IfCondition(use_gps_fusion),
+        ),
+
+        # ----------------------------
         # tree_template nodes
         # ----------------------------
         Node(
@@ -74,16 +100,9 @@ def generate_launch_description():
             parameters=[params_file, {"use_sim_time": use_sim_time}],
         ),
 
-        Node(
-            package="tree_template",
-            executable="slam_odom_correction_tf",
-            output="screen",
-            parameters=[params_file, {"use_sim_time": use_sim_time}],
-        ),
-
         # Node(
         #     package="tree_template",
-        #     executable="depth_image_to_pointcloud2",
+        #     executable="slam_odom_correction_tf",
         #     output="screen",
         #     parameters=[params_file, {"use_sim_time": use_sim_time}],
         # ),

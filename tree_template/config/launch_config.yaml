@@ -25,9 +25,9 @@ trunk_detection_relay:
 
 row_fast_slam:
   ros__parameters:
-    num_particles: 1500
+    num_particles: 3000
     measurement_topic: /trunk_measurements_raw
-    odom_topic: /odometry/filtered
+    odom_topic: /odometry/global
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
  
@@ -42,8 +42,8 @@ row_fast_slam:
     row_origin_x: .nan
     row_origin_y: .nan
     row_dir_sign: 1
-    row_yaw_init_window: 10
-    min_seen_count_to_publish: 6
+    row_yaw_init_window: 25
+    min_seen_count_to_publish: 4
     use_template_map: true
     template_origin_from_first_measurement: true
     template_origin_min_hits: 6
@@ -51,21 +51,21 @@ row_fast_slam:
     use_global_row_yaw: true
  
     # Initial covariance - landmark uncertainty (meters, row frame)
-    prior_sigma_s: 0.35
+    prior_sigma_s: 0.3
     prior_sigma_d: 0.2
  
     # Row-relative particle initialization
-    init_sigma_s: 0.55
-    init_sigma_d: 0.45
-    init_sigma_yaw: 0.02
+    init_sigma_s: 0.40
+    init_sigma_d: 0.20
+    init_sigma_yaw: 0.1
  
     landmark_init.include_pose_uncertainty: true   # default — pure FastSLAM (correct) | true — adds cloud spread to init Sigma
  
     # Local trunk associations
     assoc.per_particle: true
-    max_back_assoc: 0
+    max_back_assoc: 1
     max_fwd_assoc: 2
-    widen_init_assoc: false
+    widen_init_assoc: true
  
     # Trunk row side classification
     start_side: near
@@ -87,26 +87,32 @@ row_fast_slam:
     meas_std_bearing: 0.1   # [rad]  — bearing std dev
  
     meas_fwd_gate: 1.2
+
+    # Stationary measurement skip gate
+    meas_skip.enable: false
+    meas_skip.delta_range:   0.01   # m  — range must change by this much to trigger weight update
+    meas_skip.delta_bearing: 0.005   # rad — bearing must change by this much (~0.57°)
  
     # Motion distribution (robot frame)
-    motion_noise.a_trans: 0.12   # meters of std per meter traveled
-    motion_noise.b_trans: 0.08   # meters of std per radian of rotation
-    motion_noise.c_lat: 0.08     # meters of std for lateral motion (e.g. slip)
-    motion_noise.a_rot: 0.05    # radians of std per radian of rotation
-    motion_noise.b_rot: 0.08     # radians of std per meter traveled
-    motion_noise.x_floor: 1e-4 # minimum motion noise in x to prevent particle deprivation
-    motion_noise.y_floor: 1e-4 # minimum motion noise in y to prevent particle deprivation
-    motion_noise.yaw_floor: 1e-4 # minimum motion noise in yaw to prevent particle deprivation
+    motion_noise.a_trans: 0.7   # meters of std per meter traveled
+    motion_noise.b_trans: 0.15   # meters of std per radian of rotation
+    motion_noise.c_lat: 0.15     # meters of std for lateral motion (e.g. slip)
+    motion_noise.a_rot: 0.55    # radians of std per radian of rotation
+    motion_noise.b_rot: 0.2     # radians of std per meter traveled
+    motion_noise.x_floor: 0.03 # minimum motion noise in x to prevent particle deprivation
+    motion_noise.y_floor: 0.03 # minimum motion noise in y to prevent particle deprivation
+    motion_noise.yaw_floor: 0.001 # minimum motion noise in yaw to prevent particle deprivation
  
     # Resampling
-    resample_interval: 15
-    neff_ratio_threshold: 0.35
-    resample_burn_in: 8
+    resample_interval: 25
+    neff_ratio_threshold: 0.25
+    resample_burn_in: 3
+    resample_neff_floor: 0.05   # hard floor — resample even if slot_committed=False
 
     # Post-resample roughening tiers (applied when neff_ratio falls below threshold)
-    resample_roughen.neff_moderate: 0.1        # trigger roughening at all
+    resample_roughen.neff_moderate: 0.15        # trigger roughening at all
     resample_roughen.neff_severe: 0.05          # severe / catastrophic tier
-    resample_roughen.maha_catastrophic: 10.0    # Mahalanobis^2 to escalate to catastrophic
+    resample_roughen.maha_catastrophic: 8.0    # Mahalanobis^2 to escalate to catastrophic
     resample_roughen.scale_moderate_xy: 3.0     # multiplier on motion noise std (moderate tier)
     resample_roughen.scale_severe_xy: 5.0       # multiplier on motion noise std (severe tier)
     resample_roughen.scale_severe_yaw: 3.0
@@ -114,7 +120,7 @@ row_fast_slam:
     resample_roughen.catastrophic_yaw: 0.15     # rad (~8.6 deg)
  
     # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
-    maha_gate_median: 7.0
+    maha_gate_median: 5.0
     maha_gate_min_particles: 25
  
     # World-frame floor
@@ -122,24 +128,25 @@ row_fast_slam:
     landmark_sigma_floor_y: 0.0
  
     # Row-frame floor params
-    landmark_sigma_floor_s: 0.03
-    landmark_sigma_floor_d: 0.03
-    landmark_process_noise_s: 0.012  # std → var = 1.44e-4 per update
-    landmark_process_noise_d: 0.012
+    landmark_sigma_floor_s: 0.06
+    landmark_sigma_floor_d: 0.04
+    landmark_process_noise_s: 0.0  # std → var = 1.44e-4 per update
+    landmark_process_noise_d: 0.0
  
     # Merge neighboring associations
-    publish_merge_duplicates.enable: true
+    publish_merge_duplicates.enable: false
     publish_merge_duplicates.dist_m: 0.1
     publish_merge_duplicates.only_adjacent: true
  
     # FASTSLAM 2.0 - measurement-informed pose proposal
     proposal.enable: true
-    proposal.min_pose_std_xy: 0.025
-    proposal.min_pose_std_yaw: 0.006
-    proposal.max_correction_xy: 0.10    # m -> Max per-step pose correction applied by the proposal
-    proposal.max_correction_yaw: 0.08   # rad -> Max per-step pose correction applied by the proposal
+    proposal.min_pose_std_range:   0.035   # m  — range floor (suppresses along-row drift)
+    proposal.min_pose_std_bearing: 0.01   # rad — bearing floor (lateral correction)
+    proposal.min_pose_std_yaw: 0.006   # rad
+    proposal.max_correction_xy: 0.25    # m -> Max per-step pose correction applied by the proposal
+    proposal.max_correction_yaw: 0.06   # rad -> Max per-step pose correction applied by the proposal
     proposal.zombie_maha_threshold: 20.0 # Particles with Mahalanobis^2 above this are not moved by the proposal (zombie guard)
-    proposal.min_landmark_seen: 15 # Min observations before a landmark is used on the proposal path (below → classic)
+    proposal.min_landmark_seen: 8 # Min observations before a landmark is used on the proposal path (below → classic)
     proposal.max_odom_steps: 10 # Cap on accumulated odom steps used to scale pose prior uncertainty in proposal
  
     # Template soft prior (weight update per landmark)
@@ -148,7 +155,7 @@ row_fast_slam:
     template_prior.sigma_d: 0.20
     template_prior.decay_k: 6.0
     template_prior.max_seen: 12
-    template_prior.w: 0.15
+    template_prior.w: 0.5
  
     origin_recal.enable: false
     origin_recal.min_seen: 8
@@ -156,8 +163,8 @@ row_fast_slam:
     origin_recal.interval: 20
 
     # Inter-landmark spacing propagation
-    spacing_propagation.enable: true
-    spacing_propagation.min_seen: 20     # detections before propagating FROM this slot
+    spacing_propagation.enable: false
+    spacing_propagation.min_seen: 18     # detections before propagating FROM this slot
     spacing_propagation.max_unseen: 5   # detections before stop nudging TO this slot
     spacing_propagation.alpha: 0.05      # nudge strength per hop [0,1]
     spacing_propagation.n_hops: 1       # how many neighbours each direction
@@ -170,8 +177,8 @@ row_fast_slam:
     publish.odom_min_interval: 0.05      # s  (20 Hz)
  
     # Message lag
-    meas_max_lag_sec: 0.5
-    odom_history_sec: 20.0
+    meas_max_lag_sec: 1.0
+    odom_history_sec: 1.0
  
     # Debugging
     debug.csv_enable: true
@@ -183,10 +190,10 @@ row_fast_slam:
 odom_reframer:
   ros__parameters:
     input_odom_topic: /odometry/filtered
-    output_odom_topic: /odom
+    output_odom_topic: /odometry/wheel
     odom_frame: odom
     base_frame: amiga__base
-    publish_tf: true
+    publish_tf: false
 
     recenter: false
 
@@ -201,12 +208,12 @@ odom_reframer:
     gps_min_status: 0
     gps_require_finite_cov: false
 
-    initial_odom_samples: 30
-    initial_gps_samples: 3
+    initial_odom_samples: 25
+    initial_gps_samples: 5
 
 slam_odom_correction_tf:
   ros__parameters:
-    wheel_odom_topic: /odom
+    wheel_odom_topic: /odometry/global
     slam_odom_topic: /odom_slam_best
 
     odom_frame: odom
@@ -231,7 +238,7 @@ tree_scene_node:
 
     trellis_angle: -18.435
     branch_spacing: 0.5
-    trellis_frame: odom
+    trellis_frame: amiga__base
     trellis_prefix: v_trellis_tree_
 
     registry_topic: fastslam_registry
@@ -249,6 +256,6 @@ save_best_particle_map:
     require_gps_fix: true
     require_trunks: true
     require_final_gps_fix: true
-    final_gps_samples: 2
+    final_gps_samples: 5
 
     service_name: save_slam_results

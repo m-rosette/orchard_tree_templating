@@ -12,8 +12,7 @@ ekf_global:
     publish_tf: true
     publish_acceleration: false
 
-    # Fuse the local EKF output (smooth motion) as a baseline
-    odom0: /odometry/local
+    odom0: /odometry/wheel
     odom0_config: [true,  true,  false,
                    false, false, true,
                    true,  true,  false,
@@ -21,7 +20,6 @@ ekf_global:
                    false, false, false]
     odom0_queue_size: 10
 
-    # Fuse GPS-converted odometry for global x,y (and optionally yaw if you trust it)
     odom1: /odometry/gps
     odom1_config: [true,  true,  false,
                    false, false, false,
@@ -29,3 +27,26 @@ ekf_global:
                    false, false, false,
                    false, false, false]
     odom1_queue_size: 10
+
+    # Reject GPS updates that jump more than this Mahalanobis distance
+    odom1_pose_rejection_threshold: 2.5
+
+    # Process noise — higher x/y values = less GPS authority, more wheel trust
+    # Start here; increase x[0,0] and x[1,1] further if scale error persists
+    process_noise_covariance: [
+      2.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  2.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.06, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.03, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.03, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.25, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  2.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  2.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.06, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.25, 0.0,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.5,  0.0,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.5,  0.0,
+      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01
+    ]

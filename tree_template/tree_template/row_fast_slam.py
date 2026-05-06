@@ -232,6 +232,12 @@ class RowFastSLAMNode(Node):
 
         self.declare_parameter("meas_fwd_gate", 1.1)   # m — above this, suppress s-update
 
+        # Stationary measurement skip gate — suppress weight update (not EKF update)
+        # for near-duplicate measurements to prevent neff drain while robot is stopped.
+        self.declare_parameter("meas_skip.enable", True)
+        self.declare_parameter("meas_skip.delta_range",   0.02)   # m — skip if range moved less than this
+        self.declare_parameter("meas_skip.delta_bearing",  0.01)   # rad — skip if bearing moved less than this
+
         # Data association mode:
         #   False (default) — single shared weighted-mean pose used for all particles (original behaviour)
         #   True            — each particle computes s_meas from its own pose; particles may be assigned
@@ -252,6 +258,7 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("resample_interval", 30) # 0 disables
         self.declare_parameter("neff_ratio_threshold", 0.25)
         self.declare_parameter("resample_burn_in", 15)
+        self.declare_parameter("resample_neff_floor", 0.05)  # hard floor: resample regardless of slot_committed
         # Post-resample roughening: applied when neff_ratio falls below these thresholds.
         self.declare_parameter("resample_roughen.neff_moderate",        0.08)  # trigger roughening at all
         self.declare_parameter("resample_roughen.neff_severe",          0.01)  # severe / catastrophic tier
@@ -297,7 +304,8 @@ class RowFastSLAMNode(Node):
 
         # Measurement-informed pose proposal (FastSLAM 2.0)
         self.declare_parameter("proposal.enable", True)
-        self.declare_parameter("proposal.min_pose_std_xy", 0.025)     # m
+        self.declare_parameter("proposal.min_pose_std_range",   0.005)  # m
+        self.declare_parameter("proposal.min_pose_std_bearing", 0.015)  # rad
         self.declare_parameter("proposal.min_pose_std_yaw", 0.008)    # rad
         # Max per-step pose correction from proposal (prevents large jumps)
         self.declare_parameter("proposal.max_correction_xy",  0.10)  # m
@@ -440,6 +448,11 @@ class RowFastSLAMNode(Node):
         self._meas_std_range   = float(self.get_parameter("meas_std_range").value)
         self._meas_std_bearing = float(self.get_parameter("meas_std_bearing").value)
 
+        self._meas_skip_enable          = bool(self.get_parameter("meas_skip.enable").value)
+        self._meas_skip_delta_range     = float(self.get_parameter("meas_skip.delta_range").value)
+        self._meas_skip_delta_bearing   = float(self.get_parameter("meas_skip.delta_bearing").value)
+        self._last_z_per_slot: dict     = {}   # slot_j -> (last_r, last_bearing)
+
         if self._meas_noise_model == "cartesian":
             # Fixed R for the whole run — store scalars for fast hot-path access
             self.R = np.diag(self.meas_std ** 2)
@@ -478,6 +491,7 @@ class RowFastSLAMNode(Node):
         self.resample_interval = int(self.get_parameter("resample_interval").value)
         self.neff_ratio_threshold = float(self.get_parameter("neff_ratio_threshold").value)
         self.resample_burn_in = int(self.get_parameter("resample_burn_in").value)
+        self._resample_neff_floor = float(self.get_parameter("resample_neff_floor").value)
 
         self._roughen_neff_moderate       = float(self.get_parameter("resample_roughen.neff_moderate").value)
         self._roughen_neff_severe         = float(self.get_parameter("resample_roughen.neff_severe").value)
@@ -529,7 +543,8 @@ class RowFastSLAMNode(Node):
             self.publish_merge_duplicates_enable = False
 
         self.proposal_enable = bool(self.get_parameter("proposal.enable").value)
-        self.proposal_min_pose_std_xy = float(self.get_parameter("proposal.min_pose_std_xy").value)
+        self._proposal_min_std_range   = float(self.get_parameter("proposal.min_pose_std_range").value)
+        self._proposal_min_std_bearing = float(self.get_parameter("proposal.min_pose_std_bearing").value)
         self.proposal_min_pose_std_yaw = float(self.get_parameter("proposal.min_pose_std_yaw").value)
         self._proposal_max_correction_xy  = float(self.get_parameter("proposal.max_correction_xy").value)
         self._proposal_max_correction_yaw = float(self.get_parameter("proposal.max_correction_yaw").value)
@@ -1685,6 +1700,24 @@ class RowFastSLAMNode(Node):
 
             self._update_semantic_side_votes(slot_j, msg.side)
 
+            # ---- Stationary measurement skip gate ----
+            # Suppress weight updates (not EKF updates) for near-duplicate measurements.
+            # Prevents neff drain when the robot is stopped and z barely changes between frames.
+            _skip_weight_update = False
+            if self._meas_skip_enable and self._pf_initialized:
+                _bearing = float(np.arctan2(y_lat, x_fwd))
+                _prev = self._last_z_per_slot.get(slot_j)
+                if _prev is not None:
+                    _prev_r, _prev_bearing = _prev
+                    _delta_r = abs(r - _prev_r)
+                    _delta_b = abs(float(np.arctan2(
+                        np.sin(_bearing - _prev_bearing),
+                        np.cos(_bearing - _prev_bearing))))   # wrapped bearing diff
+                    if _delta_r < self._meas_skip_delta_range and _delta_b < self._meas_skip_delta_bearing:
+                        _skip_weight_update = True
+                        self._dbg_reject("meas_skip_stationary")
+                self._last_z_per_slot[slot_j] = (r, _bearing)
+
             # ---- FastSLAM update: weights + (optional) measurement-informed proposal ----
             n_particles = len(self.particles)
             self._ensure_work_buffers(n_particles)
@@ -1894,11 +1927,15 @@ class RowFastSLAMNode(Node):
                     # Pbar (world-frame motion prior) — inline per-particle rotation
                     n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, self._proposal_max_odom_steps))
                     std_body = np.array(self._last_motion_std_body, dtype=np.float64) * np.sqrt(float(n_steps))
-                    std_body[0] = max(float(std_body[0]), float(self.proposal_min_pose_std_xy))
-                    std_body[1] = max(float(std_body[1]), float(self.proposal_min_pose_std_xy))
+                    r_v  = np.maximum(np.hypot(xf, yl), 0.1)   # (M,) per-particle range
+                    ca_v = xf / r_v;  sa_v = yl / r_v
+                    _sr2 = self._proposal_min_std_range   ** 2
+                    _sb2 = self._proposal_min_std_bearing ** 2
+                    floor_fwd = np.sqrt(ca_v*ca_v*_sr2 + r_v*r_v*sa_v*sa_v*_sb2)  # (M,)
+                    floor_lat = np.sqrt(sa_v*sa_v*_sr2 + r_v*r_v*ca_v*ca_v*_sb2)  # (M,)
+                    Pf = float(max(float(std_body[0]), float(floor_fwd.max())))**2  # scalar P, floor from worst particle
+                    Pl = float(max(float(std_body[1]), float(floor_lat.max())))**2
                     std_body[2] = max(float(std_body[2]), float(self.proposal_min_pose_std_yaw))
-                    Pf  = float(std_body[0]) ** 2
-                    Pl  = float(std_body[1]) ** 2
                     Pth = float(std_body[2]) ** 2
 
                     # Pbar_xy = R(yaw) @ diag(Pf,Pl) @ R(yaw)^T — per particle
@@ -2067,8 +2104,7 @@ class RowFastSLAMNode(Node):
                     self._dbg_reject("maha_gate")
                     skip_update = True
 
-            if not skip_update:
-                # ---- Apply weights safely ----
+            if not skip_update and not _skip_weight_update:
                 maxlog = float(np.max(logw))
                 w = np.exp(logw - maxlog)
                 self._weights[:n_particles] *= w[:n_particles]
@@ -2303,6 +2339,13 @@ class RowFastSLAMNode(Node):
                     and past_burn_in
                     and self.resample_interval > 0
                     and (self.measurement_count % self.resample_interval) == 0):
+                self._maybe_resample()
+            # Hard neff floor — resample unconditionally if particle diversity collapses,
+            # even when slot_committed=False (e.g. maha_gate blocked all updates for a whole tree).
+            elif (past_burn_in
+                    and self._resample_neff_floor > 0.0
+                    and float(self._effective_sample_size()) / float(self.num_particles)
+                        < self._resample_neff_floor):
                 self._maybe_resample()
 
             # ---- Publish ----
@@ -2699,30 +2742,6 @@ class RowFastSLAMNode(Node):
                         [ s, -c, -x_fwd]], dtype=float)
 
         return z_pred, H_lm, J_x
-
-    def _pose_prior_cov_world(self, yaw: float) -> np.ndarray:
-        n_steps = int(np.clip(getattr(self, '_odom_steps_since_meas', 1), 1, self._proposal_max_odom_steps))
-        std = np.array(self._last_motion_std_body, dtype=float) * np.sqrt(float(n_steps))
-
-        std_xy_floor = float(self.proposal_min_pose_std_xy)
-        std_yaw_floor = float(self.proposal_min_pose_std_yaw)
-        std[0] = max(float(std[0]), std_xy_floor)
-        std[1] = max(float(std[1]), std_xy_floor)
-        std[2] = max(float(std[2]), std_yaw_floor)
-
-        Pf = float(std[0] * std[0])
-        Pl = float(std[1] * std[1])
-        Pth = float(std[2] * std[2])
-
-        c, s = float(np.cos(yaw)), float(np.sin(yaw))
-        R2 = np.array([[c, -s],
-                       [s,  c]], dtype=float)
-
-        Pxy = R2 @ np.diag([Pf, Pl]) @ R2.T
-        P = np.zeros((3, 3), dtype=float)
-        P[0:2, 0:2] = Pxy
-        P[2, 2] = Pth
-        return P
 
     def _landmark_init_sigma(
         self,

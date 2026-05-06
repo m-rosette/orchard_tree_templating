@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from datetime import datetime
 import math
 from collections import deque
 
 import numpy as np
+import yaml
 
 import rclpy
 from rclpy.node import Node
@@ -21,35 +21,25 @@ from tree_template_interfaces.srv import SaveSlamResults
 
 from scipy.spatial.transform import Rotation as R
 
-try:
-    import yaml  # type: ignore
-    _HAVE_YAML = True
-except Exception:
-    _HAVE_YAML = False
-
-
-def _f(x: float) -> float:
-    return float(x)
-
 
 def _point_to_list(p: Optional[Point]) -> Optional[List[float]]:
     if p is None:
         return None
-    return [_f(p.x), _f(p.y), _f(p.z)]
+    return [float(p.x), float(p.y), float(p.z)]
 
 
 def _pose_position_to_list(pose: Optional[Pose]) -> Optional[List[float]]:
     if pose is None:
         return None
     p = pose.position
-    return [_f(p.x), _f(p.y), _f(p.z)]
+    return [float(p.x), float(p.y), float(p.z)]
 
 
 def _pose_yaw_rad(pose: Optional[Pose]) -> Optional[float]:
     if pose is None:
         return None
     q = pose.orientation
-    quat = np.array([_f(q.x), _f(q.y), _f(q.z), _f(q.w)], dtype=np.float64)
+    quat = np.array([float(q.x), float(q.y), float(q.z), float(q.w)], dtype=np.float64)
     if not np.all(np.isfinite(quat)):
         return None
     yaw = float(R.from_quat(quat).as_euler("xyz", degrees=False)[2])
@@ -59,7 +49,7 @@ def _pose_yaw_rad(pose: Optional[Pose]) -> Optional[float]:
 def _odom_xy_yaw_t(msg: Odometry) -> Optional[List[float]]:
     p = msg.pose.pose.position
     q = msg.pose.pose.orientation
-    quat = np.array([_f(q.x), _f(q.y), _f(q.z), _f(q.w)], dtype=np.float64)
+    quat = np.array([float(q.x), float(q.y), float(q.z), float(q.w)], dtype=np.float64)
     if not (math.isfinite(p.x) and math.isfinite(p.y) and np.all(np.isfinite(quat))):
         return None
     yaw = float(R.from_quat(quat).as_euler("xyz", degrees=False)[2])
@@ -67,44 +57,7 @@ def _odom_xy_yaw_t(msg: Odometry) -> Optional[List[float]]:
         return None
     t = msg.header.stamp
     t_sec = float(t.sec) + 1e-9 * float(t.nanosec)
-    return [_f(p.x), _f(p.y), float(yaw), float(t_sec)]
-
-
-def _safe_list3(v: Any) -> Optional[List[float]]:
-    if not isinstance(v, (list, tuple)) or len(v) < 3:
-        return None
-    try:
-        out = [float(v[0]), float(v[1]), float(v[2])]
-        if not all(np.isfinite(out)):
-            return None
-        return out
-    except Exception:
-        return None
-
-
-def _read_initials_yaml(path: Path) -> Optional[dict]:
-    if not path.exists():
-        return None
-    try:
-        if _HAVE_YAML:
-            return yaml.safe_load(path.read_text()) or {}
-        data: dict = {}
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if ":" not in line:
-                continue
-            k, rhs = line.split(":", 1)
-            k = k.strip()
-            rhs = rhs.strip()
-            if rhs == "null":
-                data[k] = None
-            else:
-                data[k] = eval(rhs)
-        return data
-    except Exception:
-        return None
+    return [float(p.x), float(p.y), float(yaw), float(t_sec)]
 
 
 class SaveBestParticleMap(Node):
@@ -192,15 +145,6 @@ class SaveBestParticleMap(Node):
 
         # Raw GPS readings (every valid NavSatFix sample, unbounded)
         self._raw_gps_readings: List[List[float]] = []
-
-        # YAML fallback cache
-        self._initials_from_yaml: Optional[dict] = None
-        if str(self.initials_yaml) and self.initials_yaml.exists():
-            self._initials_from_yaml = _read_initials_yaml(self.initials_yaml)
-            if self._initials_from_yaml is not None:
-                self.get_logger().info(f"Loaded initials YAML: {self.initials_yaml}")
-            else:
-                self.get_logger().warn(f"Failed to parse initials YAML: {self.initials_yaml}")
 
         # Robot path buffer
         self._robot_path: deque[List[float]] = deque(maxlen=max(self.robot_max_points, 1))
@@ -290,32 +234,6 @@ class SaveBestParticleMap(Node):
         alt = float(msg.z) if np.isfinite(msg.z) else 0.0
         self._accumulate_final_gps(float(msg.x), float(msg.y), alt)
 
-    def _fill_from_yaml_if_needed(self):
-        if not self.use_initials_yaml_fallback:
-            return
-        if not self._initials_from_yaml:
-            return
-
-        if self._latest_odom_corr_pose is None:
-            corr = _safe_list3(self._initials_from_yaml.get("initial_odom_correction"))
-            if corr is not None:
-                p = Pose()
-                p.position.x, p.position.y, p.position.z = corr[0], corr[1], corr[2]
-                p.orientation.w = 1.0
-                self._latest_odom_corr_pose = p
-
-        if self._latest_gps_fix is None:
-            igps = _safe_list3(self._initials_from_yaml.get("initial_gps_fix"))
-            if igps is not None:
-                pt = Point()
-                pt.x, pt.y, pt.z = igps[0], igps[1], igps[2]
-                self._latest_gps_fix = pt
-
-        if self._latest_final_gps_list is None:
-            fgps = _safe_list3(self._initials_from_yaml.get("final_gps_fix"))
-            if fgps is not None:
-                self._latest_final_gps_list = fgps
-
     def _resolve_base_path(self, requested: str) -> Path:
         """
         If requested is empty -> use node param 'out'.
@@ -343,8 +261,6 @@ class SaveBestParticleMap(Node):
         return p
 
     def _on_dump(self, req: SaveSlamResults.Request, res: SaveSlamResults.Response) -> SaveSlamResults.Response:
-        self._fill_from_yaml_if_needed()
-
         if self._latest_registry is None:
             res.success = False
             res.message = "No TrunkRegistry received yet."
@@ -379,7 +295,7 @@ class SaveBestParticleMap(Node):
         trees: Dict[int, List[float]] = {}
         for i, t in enumerate(trunks):
             p = t.pose.position
-            trees[i] = [_f(p.x), _f(p.y)]
+            trees[i] = [float(p.x), float(p.y)]
 
         init_odom_list = _pose_position_to_list(self._latest_odom_corr_pose)
         init_yaw = _pose_yaw_rad(self._latest_odom_corr_pose)
