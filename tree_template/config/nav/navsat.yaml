@@ -4,7 +4,7 @@ navsat_transform:
     delay: 0.0
 
     # Inputs
-    gps_topic: /gps/fix
+    gps_topic: /fix
     imu_topic: /imu/data
     odom_topic: /odometry/local
 

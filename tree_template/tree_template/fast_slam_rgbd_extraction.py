@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-extract_rgbd_at_tree_broadside.py
+fast_slam_rgbd_extraction.py
 
 Post-processing script: given a SLAM output YAML (with committed tree locations
 and robot poses+timestamps) and a ROS2 bag file containing RealSense RGB-D data,
@@ -8,13 +8,22 @@ this script finds — for each committed tree — the robot pose where the tree 
 perpendicularly in front of the robot (broadside), then extracts and saves the
 nearest RGB-D frame pair (color + depth) from the bag at that timestamp.
 
+Supports TWO camera streams simultaneously.  Each camera's frames are saved
+into a named subdirectory under the tree folder.
+
 Output structure:
     output_dir/
         tree_000/
-            color.png
-            depth.png          (16-bit, millimeters)
-            depth_colormap.png (for quick visualization)
-            meta.yaml          (tree id, tree world pos, robot pose, timestamp)
+            meta.yaml          (tree id, world pos, robot pose, timestamp,
+                                 per-camera topics and timing deltas)
+            cam1/              (name set by --cam1_name, default "cam1")
+                color.png
+                depth.png          (16-bit, millimeters)
+                depth_colormap.png
+            cam2/              (name set by --cam2_name, default "cam2")
+                color.png
+                depth.png
+                depth_colormap.png
         tree_001/
             ...
 
@@ -34,15 +43,19 @@ Clock mismatch handling:
             Prints the detected value so you can hard-code it for future runs.
 
 Usage:
-    python extract_rgbd_at_tree_broadside.py \
-        --yaml slam_trunks_20260331_174636.yaml \
-        --bag  /path/to/your.bag \
-        --output_dir rgbd_at_trees \
-        [--color_topic /base_camera/color/image_raw] \
-        [--depth_topic /base_camera/depth/image_rect_raw] \
-        [--odom_topic  /odometry/filtered] \
-        [--max_time_delta_s 0.5] \
-        [--perpendicular_window_m 0.5] \
+    python fast_slam_rgbd_extraction.py \\
+        --yaml slam_trunks_20260331_174636.yaml \\
+        --bag  /path/to/your.bag \\
+        --output_dir rgbd_at_trees \\
+        --cam1_color_topic /camera/mast_camera/color/image_raw \\
+        --cam1_depth_topic /camera/mast_camera/recovered_depth/image_raw \\
+        --cam2_color_topic /camera/base_camera/color/image_raw \\
+        --cam2_depth_topic /camera/base_camera/depth/image_rect_raw \\
+        [--cam1_name mast_cam] \\
+        [--cam2_name base_cam] \\
+        [--odom_topic  /odometry/filtered] \\
+        [--max_time_delta_s 0.5] \\
+        [--perpendicular_window_m 0.5] \\
         [--image_time_offset_s 1697583500.0 | --auto_detect_clock_offset]
 """
 
@@ -57,6 +70,27 @@ import cv2
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
+
+
+# ---------------------------------------------------------------------------
+# Camera config dataclass (plain dict-style, no dataclasses dependency needed)
+# ---------------------------------------------------------------------------
+
+class CameraConfig:
+    """Holds topic names and output directory name for one camera."""
+
+    def __init__(self, name: str, color_topic: str, depth_topic: str):
+        self.name        = name          # subdirectory name, e.g. "cam1"
+        self.color_topic = color_topic
+        self.depth_topic = depth_topic
+
+    @property
+    def topics(self):
+        return [self.color_topic, self.depth_topic]
+
+    def __repr__(self):
+        return (f"CameraConfig(name={self.name!r}, "
+                f"color={self.color_topic!r}, depth={self.depth_topic!r})")
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +297,54 @@ def ros_image_to_cv2(msg):
 
 
 # ---------------------------------------------------------------------------
+# Per-camera extraction helper
+# ---------------------------------------------------------------------------
+
+def extract_camera_frames(cam_cfg, cache, target_t, max_time_delta_s):
+    """
+    Find the nearest color and depth messages for a single camera.
+
+    Returns:
+        color_img  : numpy array or None
+        depth_img  : numpy array or None
+        dt_color   : float or None
+        dt_depth   : float or None
+        error      : str description if something failed, else None
+    """
+    color_msg, dt_c = find_nearest_message(
+        cache[cam_cfg.color_topic], target_t, max_time_delta_s)
+    depth_msg, dt_d = find_nearest_message(
+        cache[cam_cfg.depth_topic], target_t, max_time_delta_s)
+
+    if color_msg is None or depth_msg is None:
+        return None, None, dt_c, dt_d, (
+            f"no frame within {max_time_delta_s}s  "
+            f"(dt_color={dt_c}, dt_depth={dt_d})"
+        )
+
+    try:
+        color_img = ros_image_to_cv2(color_msg)
+        depth_img = ros_image_to_cv2(depth_msg)
+    except Exception as e:
+        return None, None, dt_c, dt_d, f"image conversion error: {e}"
+
+    return color_img, depth_img, dt_c, dt_d, None
+
+
+def save_camera_images(cam_dir, color_img, depth_img):
+    """
+    Write color.png, depth.png (16-bit), and depth_colormap.png into cam_dir.
+    """
+    os.makedirs(cam_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(cam_dir, "color.png"), color_img)
+    cv2.imwrite(os.path.join(cam_dir, "depth.png"), depth_img)  # 16-bit PNG
+
+    depth_norm  = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO)
+    cv2.imwrite(os.path.join(cam_dir, "depth_colormap.png"), depth_color)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -271,22 +353,49 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--yaml",        required=True,  help="SLAM output YAML file")
-    parser.add_argument("--bag",         required=True,  help="ROS2 bag file path")
-    parser.add_argument("--output_dir",  default="/home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_v3")
-    parser.add_argument("--color_topic", default="/camera/mast_camera/color/image_raw")
-    parser.add_argument("--depth_topic", default="/camera/mast_camera/recovered_depth/image_raw")
-    parser.add_argument("--odom_topic",  default="/filter/state",
-                        help="Only needed with --auto_detect_clock_offset")
-    parser.add_argument("--max_time_delta_s", type=float, default=1.0,
-                        help="Max allowed time gap (s) between broadside pose and image frame")
-    parser.add_argument("--perpendicular_window_m", type=float, default=None,
-                        help="Skip trees whose lateral distance exceeds this (metres)")
+    parser.add_argument("--yaml",       required=True,  help="SLAM output YAML file")
+    parser.add_argument("--bag",        required=True,  help="ROS2 bag file path")
+    parser.add_argument("--output_dir", default="/home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_v3")
+
+    # ── Camera 1 ──────────────────────────────────────────────────────────────
+    cam1_grp = parser.add_argument_group("Camera 1")
+    cam1_grp.add_argument(
+        "--cam1_name",        default="mast_cam",
+        help="Subdirectory name used for camera 1 images (default: mast_cam)")
+    cam1_grp.add_argument(
+        "--cam1_color_topic", default="/camera/mast_camera/color/image_raw",
+        help="Color image topic for camera 1")
+    cam1_grp.add_argument(
+        "--cam1_depth_topic", default="/camera/mast_camera/recovered_depth/image_raw",
+        help="Depth image topic for camera 1")
+
+    # ── Camera 2 ──────────────────────────────────────────────────────────────
+    cam2_grp = parser.add_argument_group("Camera 2")
+    cam2_grp.add_argument(
+        "--cam2_name",        default="base_cam",
+        help="Subdirectory name used for camera 2 images (default: base_cam)")
+    cam2_grp.add_argument(
+        "--cam2_color_topic", default="/camera/base_camera/color/image_raw",
+        help="Color image topic for camera 2")
+    cam2_grp.add_argument(
+        "--cam2_depth_topic", default="/camera/base_camera/depth/image_rect_raw",
+        help="Depth image topic for camera 2")
+
+    # ── Timing / filtering ────────────────────────────────────────────────────
+    parser.add_argument(
+        "--odom_topic", default="/filter/state",
+        help="Odometry topic (only needed with --auto_detect_clock_offset)")
+    parser.add_argument(
+        "--max_time_delta_s", type=float, default=1.0,
+        help="Max allowed time gap (s) between broadside pose and image frame")
+    parser.add_argument(
+        "--perpendicular_window_m", type=float, default=None,
+        help="Skip trees whose lateral distance exceeds this (metres)")
 
     clock_grp = parser.add_mutually_exclusive_group()
     clock_grp.add_argument(
         "--image_time_offset_s", type=float, default=None,
-        help="Subtract this value (s) from all image timestamps. "
+        help="Subtract this value (s) from ALL image timestamps. "
              "Compute as: first_image_stamp - first_odom_stamp",
     )
     clock_grp.add_argument(
@@ -297,10 +406,21 @@ def main():
 
     args = parser.parse_args()
 
+    # Build camera config objects
+    cameras = [
+        CameraConfig(args.cam1_name, args.cam1_color_topic, args.cam1_depth_topic),
+        CameraConfig(args.cam2_name, args.cam2_color_topic, args.cam2_depth_topic),
+    ]
+
+    print("Camera configuration:")
+    for cam in cameras:
+        print(f"  [{cam.name}]  color: {cam.color_topic}")
+        print(f"  [{cam.name}]  depth: {cam.depth_topic}")
+
     # ------------------------------------------------------------------
     # 1. Load YAML
     # ------------------------------------------------------------------
-    print(f"Loading YAML: {args.yaml}")
+    print(f"\nLoading YAML: {args.yaml}")
     with open(args.yaml, "r") as f:
         data = yaml.safe_load(f)
 
@@ -338,25 +458,30 @@ def main():
               f"fwd={fwd:+.3f}m  lat={lat:+.3f}m  (idx={idx})")
 
     # ------------------------------------------------------------------
-    # 3. Read bag
+    # 3. Read bag — collect all camera topics + odom if needed
     # ------------------------------------------------------------------
-    topics_to_read = [args.color_topic, args.depth_topic]
+    all_image_topics = []
+    for cam in cameras:
+        all_image_topics.extend(cam.topics)
+
+    topics_to_read = list(dict.fromkeys(all_image_topics))  # deduplicated, order preserved
     if args.auto_detect_clock_offset:
         topics_to_read.append(args.odom_topic)
 
     cache = build_topic_message_cache(args.bag, topics_to_read)
 
     # ------------------------------------------------------------------
-    # 4. Apply clock offset
+    # 4. Apply clock offset to ALL image topics
     # ------------------------------------------------------------------
     if args.auto_detect_clock_offset:
-        offset = detect_clock_offset(cache, args.color_topic, args.odom_topic)
-        apply_time_offset(cache, [args.color_topic, args.depth_topic], offset)
+        # Use cam1 color as the reference image topic for offset detection
+        offset = detect_clock_offset(cache, cameras[0].color_topic, args.odom_topic)
+        apply_time_offset(cache, all_image_topics, offset)
 
     elif args.image_time_offset_s is not None:
         print(f"\n[Clock correction] Applying manual offset: -{args.image_time_offset_s:.3f} s")
-        apply_time_offset(cache, [args.color_topic, args.depth_topic], args.image_time_offset_s)
-        for topic in [args.color_topic, args.depth_topic]:
+        apply_time_offset(cache, all_image_topics, args.image_time_offset_s)
+        for topic in all_image_topics:
             msgs = cache[topic]
             if msgs:
                 print(f"  '{topic}' corrected range: [{msgs[0][0]:.3f}, {msgs[-1][0]:.3f}] s")
@@ -369,45 +494,69 @@ def main():
     # 5. Extract and save
     # ------------------------------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
-    saved = 0
+    saved   = 0
     skipped = 0
+
+    applied_offset = (
+        args.image_time_offset_s if args.image_time_offset_s is not None
+        else ("auto-detected" if args.auto_detect_clock_offset else 0.0)
+    )
 
     for tree_id, info in broadside_info.items():
         target_t = info["timestamp_s"]
-
-        color_msg, dt_c = find_nearest_message(
-            cache[args.color_topic], target_t, args.max_time_delta_s)
-        depth_msg, dt_d = find_nearest_message(
-            cache[args.depth_topic], target_t, args.max_time_delta_s)
-
-        if color_msg is None or depth_msg is None:
-            print(f"  [SKIP] Tree {tree_id}: no frame within {args.max_time_delta_s}s "
-                  f"of t={target_t:.3f}s  (dt_color={dt_c}, dt_depth={dt_d})")
-            skipped += 1
-            continue
-
-        try:
-            color_img = ros_image_to_cv2(color_msg)
-            depth_img = ros_image_to_cv2(depth_msg)
-        except Exception as e:
-            print(f"  [SKIP] Tree {tree_id}: image conversion error: {e}")
-            skipped += 1
-            continue
-
         tree_dir = os.path.join(args.output_dir, f"tree_{int(tree_id):03d}")
+
+        # -- Try to extract frames from every camera -----------------------
+        cam_results   = {}   # cam.name -> {color_img, depth_img, dt_c, dt_d, error}
+        any_cam_ok    = False
+
+        for cam in cameras:
+            color_img, depth_img, dt_c, dt_d, error = extract_camera_frames(
+                cam, cache, target_t, args.max_time_delta_s)
+
+            cam_results[cam.name] = {
+                "color_img":   color_img,
+                "depth_img":   depth_img,
+                "dt_color_s":  float(dt_c) if dt_c is not None else None,
+                "dt_depth_s":  float(dt_d) if dt_d is not None else None,
+                "error":       error,
+                "color_topic": cam.color_topic,
+                "depth_topic": cam.depth_topic,
+            }
+
+            if error is None:
+                any_cam_ok = True
+            else:
+                print(f"  [WARN] Tree {tree_id} / {cam.name}: {error}")
+
+        if not any_cam_ok:
+            print(f"  [SKIP] Tree {tree_id}: no camera produced valid frames at t={target_t:.3f}s")
+            skipped += 1
+            continue
+
+        # -- Create tree_### directory and save each camera's images -------
         os.makedirs(tree_dir, exist_ok=True)
 
-        cv2.imwrite(os.path.join(tree_dir, "color.png"), color_img)
-        cv2.imwrite(os.path.join(tree_dir, "depth.png"), depth_img)  # 16-bit PNG
+        cam_meta = {}
+        for cam in cameras:
+            r = cam_results[cam.name]
+            cam_meta[cam.name] = {
+                "color_topic":  r["color_topic"],
+                "depth_topic":  r["depth_topic"],
+                "dt_color_s":   r["dt_color_s"],
+                "dt_depth_s":   r["dt_depth_s"],
+                "saved":        r["error"] is None,
+                "skip_reason":  r["error"],
+            }
 
-        depth_norm  = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO)
-        cv2.imwrite(os.path.join(tree_dir, "depth_colormap.png"), depth_color)
+            if r["error"] is None:
+                cam_dir = os.path.join(tree_dir, cam.name)
+                save_camera_images(cam_dir, r["color_img"], r["depth_img"])
+                print(f"  [OK]   Tree {tree_id} / {cam.name}: "
+                      f"saved  dt_color={r['dt_color_s']:.3f}s  "
+                      f"dt_depth={r['dt_depth_s']:.3f}s")
 
-        applied_offset = (
-            args.image_time_offset_s if args.image_time_offset_s is not None
-            else ("auto-detected" if args.auto_detect_clock_offset else 0.0)
-        )
+        # -- Write meta.yaml in tree_### -----------------------------------
         meta = {
             "tree_id":                     int(tree_id),
             "tree_world_xy_m":             info["tree_xy"],
@@ -415,16 +564,12 @@ def main():
             "broadside_timestamp_s":       info["timestamp_s"],
             "fwd_dist_to_tree_m":          info["fwd_dist_m"],
             "lat_dist_to_tree_m":          info["lat_dist_m"],
-            "dt_color_s":                  float(dt_c),
-            "dt_depth_s":                  float(dt_d),
-            "color_topic":                 args.color_topic,
-            "depth_topic":                 args.depth_topic,
             "image_time_offset_applied_s": applied_offset,
+            "cameras":                     cam_meta,
         }
         with open(os.path.join(tree_dir, "meta.yaml"), "w") as f:
-            yaml.dump(meta, f, default_flow_style=False)
+            yaml.dump(meta, f, default_flow_style=False, sort_keys=False)
 
-        print(f"  [OK]   Tree {tree_id}: saved  dt_color={dt_c:.3f}s  dt_depth={dt_d:.3f}s")
         saved += 1
 
     print(f"\nDone. Saved {saved} trees, skipped {skipped}.")

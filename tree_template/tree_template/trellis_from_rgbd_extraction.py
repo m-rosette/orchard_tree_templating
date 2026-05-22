@@ -16,20 +16,21 @@ ros2 run <package> trellis_from_rgbd_extraction --ros-args \
 
 Parameters
 ----------
-extraction_dir   (str)  – required. Root directory containing tree_*/meta.yaml files.
-trellis_side     (str)  – fallback side when meta.yaml has no 'side' field (default "far").
-z_offset         (float)– vertical offset added to all trunk z-positions (default 0.0).
-registry_topic   (str)  – topic name for the TrunkRegistry message (default "fastslam_registry").
+extraction_dir          (str)   – required. Root directory containing tree_*/meta.yaml files.
+trellis_side            (str)   – fallback side when meta.yaml has no 'side' field (default "far").
+z_offset                (float) – vertical offset added to all trunk z-positions (default 0.0).
+registry_topic          (str)   – topic name for the TrunkRegistry message (default "fastslam_registry").
+shift_whole_map         (bool)  – if True, correction shifts all trunks; if False, anchor only (default False).
+max_correction_m        (float) – reject corrections larger than this magnitude in metres (default 1.0).
+measurement_timeout_sec (float) – seconds to wait for a trunk measurement after triggering (default 5.0).
 
 Workflow
 --------
-1. Launch the node — it loads all meta.yaml files immediately and logs available tree IDs.
-2. Set the anchor tree at runtime to trigger publishing:
-
+1. Launch the node.
+2. Set the anchor tree at runtime to publish the initial template:
        ros2 param set /trellis_from_rgbd_extraction anchor_tree_id 8
-
-   The node publishes the full TrunkRegistry as soon as a valid anchor ID is received.
-   You can re-anchor at any time by setting anchor_tree_id again.
+3. Call /correct_template_anchor (std_srvs/Trigger) to refine the anchor
+   trunk position using a live depth measurement.
 
 Directory structure expected (output of fast_slam_rgbd_extraction):
     extraction_dir/
@@ -45,22 +46,30 @@ Each meta.yaml is expected to have at minimum:
     side: near                               # optional, falls back to trellis_side param
 """
 
-import os
-import time
+import copy
 import glob
+import os
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import yaml
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from geometry_msgs.msg import Pose
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
+from std_srvs.srv import Trigger
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
 
+
+# =============================================================================
+#  Pure helper functions
+# =============================================================================
 
 def _load_meta_yamls(extraction_dir: str) -> Dict[int, dict]:
     """
@@ -80,11 +89,9 @@ def _load_meta_yamls(extraction_dir: str) -> Dict[int, dict]:
         with open(p, "r") as f:
             meta = yaml.safe_load(f)
 
-        # Support tree_id stored as int or inferred from directory name
         if "tree_id" in meta:
             tid = int(meta["tree_id"])
         else:
-            # Infer from directory name  tree_008 -> 8
             dir_name = Path(p).parent.name  # e.g. "tree_008"
             tid = int(dir_name.split("_")[-1])
             meta["tree_id"] = tid
@@ -110,20 +117,15 @@ def _extract_world_z(meta: dict) -> float:
 def _anchor_transform(
     tree_data: Dict[int, dict],
     anchor_id: int,
-) -> Tuple[np.ndarray, float, np.ndarray]:
+) -> Tuple[np.ndarray, float, float]:
     """
     Compute the 2-D rigid transform that re-centers the row so that:
 
       - The robot sits at (0, 0).
       - The anchor tree is at its original observed lateral offset
-        (lat_dist_to_tree_m) on the Y axis — i.e. it keeps its real
-        distance from the robot, only the along-row (X) origin shifts.
+        (lat_dist_to_tree_m) on the Y axis.
       - All other trees are positioned relative to the anchor in the
         same rotated frame.
-
-    The translation origin used is the robot's broadside position for
-    the anchor tree (not the trunk itself), so the anchor trunk ends up
-    at (0, lat_dist) rather than (0, 0).
 
     Returns
     -------
@@ -138,13 +140,9 @@ def _anchor_transform(
         )
 
     anchor_meta = tree_data[anchor_id]
-
-    # Robot position & yaw when anchor tree was broadside
     xyt = anchor_meta.get("broadside_robot_pose_xyt", [0.0, 0.0, 0.0])
     robot_origin_xy = np.array([float(xyt[0]), float(xyt[1])], dtype=np.float64)
     row_yaw = float(xyt[2]) if len(xyt) >= 3 else 0.0
-
-    # Anchor's own observed along-row distance — used as the X origin
     anchor_fwd = float(anchor_meta.get("fwd_dist_to_tree_m", 0.0))
 
     return robot_origin_xy, row_yaw, anchor_fwd
@@ -157,63 +155,102 @@ def _transform_to_local(
     tree_fwd: float,
     anchor_fwd: float,
 ) -> np.ndarray:
-    """
-    Compute local (x, y) for a trunk in the anchor robot frame.
-    """
+    """Compute local (x, y) for a trunk in the anchor robot frame."""
     c, s = np.cos(-row_yaw), np.sin(-row_yaw)
     rot = np.array([[c, -s], [s, c]], dtype=np.float64)
 
-    # Rotate both trunk and robot into row-aligned frame
     trunk_rot = rot @ world_xy
     robot_rot = rot @ robot_origin_xy
 
-    # Along-row: world spacing from robot origin, re-centered on anchor_fwd
     along_row_world = trunk_rot[0] - robot_rot[0]
     x = anchor_fwd + along_row_world
-
-    # Lateral: subtract robot's lateral world offset so robot is at Y=0
     y = trunk_rot[1] - robot_rot[1]
 
     return np.array([x, y], dtype=np.float64)
 
 
+# =============================================================================
+#  Node
+# =============================================================================
+
 class TrellisFromExtractionNode(Node):
     def __init__(self):
         super().__init__("trellis_from_rgbd_extraction")
 
+        # ── Callback groups ───────────────────────────────────────────────────
+        # Service handler and trigger client share one group so the async
+        # service call inside the handler doesn't deadlock.
+        self._service_cbg = MutuallyExclusiveCallbackGroup()
+        # Subscriber callbacks run in a separate group so they remain
+        # dispatchable while the service handler thread is blocked on the
+        # threading.Event.
+        self._sub_cbg = MutuallyExclusiveCallbackGroup()
+
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter("extraction_dir", "")
-        self.declare_parameter("anchor_tree_id", -1)   # set at runtime to trigger publish
+        self.declare_parameter("anchor_tree_id", -1)
         self.declare_parameter("trellis_side", "far")
         self.declare_parameter("z_offset", 0.0)
         self.declare_parameter("registry_topic", "fastslam_registry")
+        self.declare_parameter("shift_whole_map", False)
+        self.declare_parameter("max_correction_m", 1.0)
+        self.declare_parameter("measurement_timeout_sec", 5.0)
 
         self.extraction_dir = self.get_parameter("extraction_dir").value
         self.trellis_side = self.get_parameter("trellis_side").value
         self.z_offset = self.get_parameter("z_offset").value
         self.registry_topic = str(self.get_parameter("registry_topic").value)
+        self.shift_whole_map = bool(self.get_parameter("shift_whole_map").value)
+        self.max_correction_m = float(self.get_parameter("max_correction_m").value)
+        self.measurement_timeout_sec = float(self.get_parameter("measurement_timeout_sec").value)
 
         if not self.extraction_dir:
             self.get_logger().fatal("Parameter 'extraction_dir' must be set.")
             raise RuntimeError("extraction_dir not set")
 
-        registry_qos = QoSProfile(
+        # ── State ─────────────────────────────────────────────────────────────
+        self._tree_data: Dict[int, dict] = {}
+        self._last_anchor_id: Optional[int] = None
+        self._last_registry_msg: Optional[TrunkRegistry] = None
+
+        # Trunk measurement state — written by _sub_cbg, read by service handler
+        self._latest_trunk_pose = None
+        self._trunk_received_event: Optional[threading.Event] = None
+
+        # ── Publishers ───────────────────────────────────────────────────────
+        self._registry_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.registry_pub = self.create_publisher(
-            TrunkRegistry, self.registry_topic, registry_qos
+            TrunkRegistry, self.registry_topic, self._registry_qos
         )
 
-        # Loaded eagerly in _startup_once; empty until then
-        self._tree_data: Dict[int, dict] = {}
+        # ── Subscribers ──────────────────────────────────────────────────────
+        self.trunk_meas_sub = self.create_subscription(
+            TrunkInfo,
+            "/trunk_measurements_raw",
+            self._trunk_measurement_callback,
+            10,
+            callback_group=self._sub_cbg,
+        )
 
-        # ── Kick off once the node is spinning ────────────────────────────────
-        self.create_timer(0.1, self._startup_once)
+        # ── Services ─────────────────────────────────────────────────────────
+        self.correction_service = self.create_service(
+            Trigger,
+            "/correct_template_anchor",
+            self._correct_template_anchor_callback,
+            callback_group=self._service_cbg,
+        )
+
+        # ── Startup timer ────────────────────────────────────────────────────
         self._started = False
+        self.create_timer(0.1, self._startup_once)
 
-    # ── Startup: load yamls, log available IDs, register param callback ───────
+    # =========================================================================
+    #  Startup
+    # =========================================================================
 
     def _startup_once(self):
         if self._started:
@@ -233,15 +270,15 @@ class TrellisFromExtractionNode(Node):
             f"    ros2 param set /{self.get_name()} anchor_tree_id <id>"
         )
 
-        # Watch for anchor_tree_id being set (or changed) at runtime
         self.add_on_set_parameters_callback(self._on_parameter_change)
 
-        # If anchor_tree_id was already provided at launch, publish right away
         anchor_id = int(self.get_parameter("anchor_tree_id").value)
         if anchor_id >= 0:
             self._try_publish(anchor_id)
 
-    # ── Parameter change callback — fires on `ros2 param set` ────────────────
+    # =========================================================================
+    #  Parameter change — sets anchor_tree_id at runtime
+    # =========================================================================
 
     def _on_parameter_change(self, params) -> SetParametersResult:
         for param in params:
@@ -253,19 +290,22 @@ class TrellisFromExtractionNode(Node):
                             "anchor_tree_id set before yaml data was loaded — ignoring."
                         )
                     else:
-                        # Use a one-shot zero-delay timer so we return from this
-                        # callback immediately — blocking here deadlocks the
-                        # parameter service.
-                        # Store timer handle so the callback can cancel itself
-                        self._pending_anchor_timer = None
-                        def _fire(aid=anchor_id):
-                            self._try_publish(aid)
-                            if self._pending_anchor_timer is not None:
-                                self._pending_anchor_timer.cancel()
-                        self._pending_anchor_timer = self.create_timer(0.0, _fire)
+                        # Run _try_publish in a thread so we don't block the
+                        # parameter service callback dispatcher, but join()
+                        # before returning so the registry is guaranteed to be
+                        # published before OrchardTemplating's next service call.
+                        t = threading.Thread(
+                            target=self._try_publish,
+                            args=(anchor_id,),
+                            daemon=True,
+                        )
+                        t.start()
+                        t.join()
         return SetParametersResult(successful=True)
 
-    # ── Core publish ──────────────────────────────────────────────────────────
+    # =========================================================================
+    #  Core publish
+    # =========================================================================
 
     def _try_publish(self, anchor_id: int):
         try:
@@ -282,16 +322,38 @@ class TrellisFromExtractionNode(Node):
             f"row_yaw={np.degrees(row_yaw):.1f} deg"
         )
 
-        self._publish_trunk_registry(self._tree_data, anchor_id, robot_origin_xy, row_yaw, anchor_fwd)
+        msg = self._build_trunk_registry(
+            self._tree_data, anchor_id, robot_origin_xy, row_yaw, anchor_fwd
+        )
+        if msg is None:
+            return
 
-    def _publish_trunk_registry(
+        if not self._wait_for_registry_subscriber(timeout_sec=10.0):
+            self.get_logger().fatal(
+                f"No subscribers to '{self.registry_topic}' after 10s. "
+                "Is generate_trellis_collision_obj running with matching registry_topic?"
+            )
+            return
+
+        self.registry_pub.publish(msg)
+
+        # Cache for the correction service
+        self._last_registry_msg = msg
+        self._last_anchor_id = anchor_id
+
+        self.get_logger().info(
+            f"Published TrunkRegistry with {len(msg.trunks)} trunks."
+        )
+
+    def _build_trunk_registry(
         self,
         tree_data: Dict[int, dict],
         anchor_id: int,
         robot_origin_xy: np.ndarray,
         row_yaw: float,
         anchor_fwd: float,
-    ):
+    ) -> Optional[TrunkRegistry]:
+        """Build (but do not publish) a TrunkRegistry from tree_data."""
         msg = TrunkRegistry()
         skipped = 0
 
@@ -307,7 +369,9 @@ class TrellisFromExtractionNode(Node):
                 continue
 
             tree_fwd = float(meta.get("fwd_dist_to_tree_m", 0.0))
-            local_xy = _transform_to_local(world_xy, robot_origin_xy, row_yaw, tree_fwd, anchor_fwd)
+            local_xy = _transform_to_local(
+                world_xy, robot_origin_xy, row_yaw, tree_fwd, anchor_fwd
+            )
             side = str(meta.get("side", self.trellis_side)) or self.trellis_side
 
             trunk = TrunkInfo()
@@ -315,9 +379,6 @@ class TrellisFromExtractionNode(Node):
             trunk.pose.position.x = float(local_xy[0])
             trunk.pose.position.y = float(local_xy[1])
             trunk.pose.position.z = float(world_z) + float(self.z_offset)
-            trunk.pose.orientation.x = 0.0
-            trunk.pose.orientation.y = 0.0
-            trunk.pose.orientation.z = 0.0
             trunk.pose.orientation.w = 1.0
             trunk.width = float(meta.get("width", 0.0))
             trunk.side = side
@@ -328,17 +389,10 @@ class TrellisFromExtractionNode(Node):
                 f"local=({local_xy[0]:+.3f}, {local_xy[1]:+.3f})  side={side}"
             )
 
-        if not self._wait_for_registry_subscriber(timeout_sec=10.0):
-            self.get_logger().fatal(
-                f"No subscribers to '{self.registry_topic}' after 10s. "
-                "Is generate_trellis_collision_obj running with matching registry_topic?"
-            )
-            return
+        if skipped:
+            self.get_logger().warn(f"Skipped {skipped} trees due to missing data.")
 
-        self.registry_pub.publish(msg)
-        self.get_logger().info(
-            f"Published TrunkRegistry with {len(msg.trunks)} trunks, skipped {skipped}."
-        )
+        return msg
 
     def _wait_for_registry_subscriber(self, timeout_sec: float = 10.0) -> bool:
         deadline = time.monotonic() + float(timeout_sec)
@@ -348,12 +402,185 @@ class TrellisFromExtractionNode(Node):
             time.sleep(0.1)
         return False
 
+    # =========================================================================
+    #  Trunk measurement subscriber
+    # =========================================================================
+
+    def _trunk_measurement_callback(self, msg: TrunkInfo):
+        """Runs on _sub_cbg — always free to fire even during service handling."""
+        self._latest_trunk_pose = msg.pose
+        self.get_logger().debug(
+            f"Trunk measurement — x={msg.pose.position.x:.3f} m, "
+            f"y={msg.pose.position.y:.3f} m, width={msg.width:.3f} m"
+        )
+        # Unblock _get_live_trunk_position if it is waiting
+        if self._trunk_received_event is not None:
+            self._trunk_received_event.set()
+
+    # =========================================================================
+    #  Correction service
+    # =========================================================================
+
+    def _correct_template_anchor_callback(
+        self, request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        """
+        Service handler for /correct_template_anchor.
+
+        1. Checks a registry has been published since the last anchor set.
+        2. Identifies the anchor trunk (closest x to 0 in robot frame).
+        3. Triggers a fresh depth estimation and waits for the result.
+        4. Computes delta = live_xy - template_xy.
+        5. Validates the delta magnitude.
+        6. Shifts either the anchor trunk only or the whole map and re-publishes.
+        """
+        self.get_logger().info("Correction service called — starting pipeline.")
+
+        # --- 1. Check a registry exists --------------------------------------
+        if self._last_registry_msg is None or self._last_anchor_id is None:
+            response.success = False
+            response.message = (
+                "No registry has been published yet. "
+                "Set anchor_tree_id before calling /correct_template_anchor."
+            )
+            self.get_logger().warn(response.message)
+            return response
+
+        # --- 2. Identify the anchor trunk ------------------------------------
+        trunks = self._last_registry_msg.trunks
+        if not trunks:
+            response.success = False
+            response.message = "Cached TrunkRegistry contains no trunks."
+            self.get_logger().warn(response.message)
+            return response
+
+        anchor_idx = min(
+            range(len(trunks)),
+            key=lambda i: abs(trunks[i].pose.position.x)
+        )
+        template_xy = np.array([
+            trunks[anchor_idx].pose.position.x,
+            trunks[anchor_idx].pose.position.y,
+        ])
+        self.get_logger().info(
+            f"Anchor trunk (idx={anchor_idx}, tree_id={self._last_anchor_id}) "
+            f"template position — x={template_xy[0]:.4f} m, y={template_xy[1]:.4f} m"
+        )
+
+        # --- 3. Get live trunk position --------------------------------------
+        if self._latest_trunk_pose is None:
+            response.success = False
+            response.message = (
+                "No trunk measurement available. Call /trigger_estimation first "
+                "and ensure trunk_detection_relay is publishing to /trunk_measurements_raw."
+            )
+            self.get_logger().warn(response.message)
+            return response
+
+        live_xy = np.array([
+            self._latest_trunk_pose.position.x,
+            self._latest_trunk_pose.position.y,
+        ])
+        self.get_logger().info(
+            f"Using last trunk measurement — x={live_xy[0]:.4f} m, y={live_xy[1]:.4f} m"
+        )
+
+        # --- 4. Compute delta ------------------------------------------------
+        delta = live_xy - template_xy
+        delta_norm = float(np.linalg.norm(delta))
+        self.get_logger().info(
+            f"Live trunk position  — x={live_xy[0]:.4f} m, y={live_xy[1]:.4f} m\n"
+            f"Correction delta     — dx={delta[0]:.4f} m, dy={delta[1]:.4f} m "
+            f"(|Δ|={delta_norm:.4f} m)"
+        )
+
+        # --- 5. Validate delta -----------------------------------------------
+        if delta_norm > self.max_correction_m:
+            response.success = False
+            response.message = (
+                f"Correction delta {delta_norm:.3f} m exceeds max_correction_m "
+                f"({self.max_correction_m} m). Verify the sensor is seeing the "
+                "correct trunk."
+            )
+            self.get_logger().error(response.message)
+            return response
+
+        # --- 6. Shift and re-publish -----------------------------------------
+        shifted = copy.deepcopy(self._last_registry_msg)
+
+        if self.shift_whole_map:
+            for trunk in shifted.trunks:
+                trunk.pose.position.x += delta[0]
+                trunk.pose.position.y += delta[1]
+            self.get_logger().info(
+                f"Shifted entire map ({len(shifted.trunks)} trunks) "
+                f"by ({delta[0]:.4f}, {delta[1]:.4f}) m."
+            )
+        else:
+            shifted.trunks[anchor_idx].pose.position.x += delta[0]
+            shifted.trunks[anchor_idx].pose.position.y += delta[1]
+            self.get_logger().info(
+                f"Shifted anchor trunk (idx={anchor_idx}) only "
+                f"by ({delta[0]:.4f}, {delta[1]:.4f}) m."
+            )
+
+        self.registry_pub.publish(shifted)
+        # Keep the cache up to date with the corrected version
+        self._last_registry_msg = shifted
+
+        self.get_logger().info("Re-published corrected TrunkRegistry.")
+
+        response.success = True
+        response.message = (
+            f"Correction applied — dx={delta[0]:.4f} m, dy={delta[1]:.4f} m "
+            f"({'whole map' if self.shift_whole_map else 'anchor trunk only'})"
+        )
+        return response
+
+    # =========================================================================
+    #  Live trunk position helper
+    # =========================================================================
+
+    def _get_live_trunk_position(self) -> Optional[np.ndarray]:
+        """
+        Wait for a fresh TrunkInfo on /trunk_measurements_raw.
+        Clears stale state first so we know the measurement is genuinely fresh.
+        """
+        self._latest_trunk_pose = None
+        self._trunk_received_event = threading.Event()
+
+        self.get_logger().info(
+            f"Waiting up to {self.measurement_timeout_sec}s for trunk measurement..."
+        )
+
+        received = self._trunk_received_event.wait(timeout=self.measurement_timeout_sec)
+        self._trunk_received_event = None
+
+        if not received:
+            self.get_logger().warn(
+                f"Timed out after {self.measurement_timeout_sec}s waiting for "
+                "/trunk_measurements_raw. Check trunk_detection_relay is running "
+                "and the camera has a clear view of the trunk."
+            )
+            return None
+
+        x = self._latest_trunk_pose.position.x
+        y = self._latest_trunk_pose.position.y
+        self.get_logger().info(f"Live trunk position — x={x:.4f} m, y={y:.4f} m")
+        return np.array([x, y])
+
+
+# =============================================================================
+#  Entry point
+# =============================================================================
 
 def main(args=None):
     rclpy.init(args=args)
     try:
         node = TrellisFromExtractionNode()
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

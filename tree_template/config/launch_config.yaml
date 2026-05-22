@@ -9,7 +9,8 @@ trunk_detection_relay:
 
     use_trunk_width_addition: true
 
-    min_trunk_width: 0.035
+    # min_trunk_width: 0.038 # for prosser 2023
+    min_trunk_width: 0.0 # for prosser 2025
     required_class: 0
     min_depth: 0.3
     max_depth: 3.0
@@ -32,18 +33,18 @@ row_fast_slam:
     odom_best_topic: odom_slam_best
  
     # Slot initialization (map init)
-    slot_spacing: 1.16
+    slot_spacing: 1.22
     num_slots: 50
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_s: 0.0
-    slot_s_gate: 0.6
+    slot_s_gate: 0.7
  
     row_origin_x: .nan
     row_origin_y: .nan
     row_dir_sign: 1
     row_yaw_init_window: 25
-    min_seen_count_to_publish: 4
+    min_seen_count_to_publish: 6
     use_template_map: true
     template_origin_from_first_measurement: true
     template_origin_min_hits: 6
@@ -59,13 +60,13 @@ row_fast_slam:
     init_sigma_d: 0.20
     init_sigma_yaw: 0.1
  
-    landmark_init.include_pose_uncertainty: true   # default — pure FastSLAM (correct) | true — adds cloud spread to init Sigma
+    landmark_init.include_pose_uncertainty: false   # default — pure FastSLAM (correct) | true — adds cloud spread to init Sigma
  
     # Local trunk associations
     assoc.per_particle: true
-    max_back_assoc: 1
+    max_back_assoc: 0
     max_fwd_assoc: 2
-    widen_init_assoc: true
+    widen_init_assoc: false
  
     # Trunk row side classification
     start_side: near
@@ -83,7 +84,7 @@ row_fast_slam:
     meas_std_x_fwd: 0.6
  
     # Used when meas_noise_model: polar
-    meas_std_range:   0.12   # [m]    — depth / range std dev
+    meas_std_range:   0.10   # [m]    — depth / range std dev
     meas_std_bearing: 0.1   # [rad]  — bearing std dev
  
     meas_fwd_gate: 1.2
@@ -94,19 +95,19 @@ row_fast_slam:
     meas_skip.delta_bearing: 0.005   # rad — bearing must change by this much (~0.57°)
  
     # Motion distribution (robot frame)
-    motion_noise.a_trans: 0.7   # meters of std per meter traveled
-    motion_noise.b_trans: 0.15   # meters of std per radian of rotation
-    motion_noise.c_lat: 0.15     # meters of std for lateral motion (e.g. slip)
-    motion_noise.a_rot: 0.55    # radians of std per radian of rotation
-    motion_noise.b_rot: 0.2     # radians of std per meter traveled
-    motion_noise.x_floor: 0.03 # minimum motion noise in x to prevent particle deprivation
-    motion_noise.y_floor: 0.03 # minimum motion noise in y to prevent particle deprivation
+    motion_noise.a_trans: 0.1   # meters of std per meter traveled
+    motion_noise.b_trans: 0.08   # meters of std per radian of rotation
+    motion_noise.c_lat: 0.08     # meters of std for lateral motion (e.g. slip)
+    motion_noise.a_rot: 0.05    # radians of std per radian of rotation
+    motion_noise.b_rot: 0.08     # radians of std per meter traveled
+    motion_noise.x_floor: 0.005 # minimum motion noise in x to prevent particle deprivation
+    motion_noise.y_floor: 0.005 # minimum motion noise in y to prevent particle deprivation
     motion_noise.yaw_floor: 0.001 # minimum motion noise in yaw to prevent particle deprivation
  
     # Resampling
-    resample_interval: 25
-    neff_ratio_threshold: 0.25
-    resample_burn_in: 3
+    resample_interval: 20
+    neff_ratio_threshold: 0.35
+    resample_burn_in: 20
     resample_neff_floor: 0.05   # hard floor — resample even if slot_committed=False
 
     # Post-resample roughening tiers (applied when neff_ratio falls below threshold)
@@ -120,7 +121,7 @@ row_fast_slam:
     resample_roughen.catastrophic_yaw: 0.15     # rad (~8.6 deg)
  
     # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
-    maha_gate_median: 5.0
+    maha_gate_median: 6.0
     maha_gate_min_particles: 25
  
     # World-frame floor
@@ -128,10 +129,10 @@ row_fast_slam:
     landmark_sigma_floor_y: 0.0
  
     # Row-frame floor params
-    landmark_sigma_floor_s: 0.06
-    landmark_sigma_floor_d: 0.04
-    landmark_process_noise_s: 0.0  # std → var = 1.44e-4 per update
-    landmark_process_noise_d: 0.0
+    landmark_sigma_floor_s: 0.01
+    landmark_sigma_floor_d: 0.01
+    landmark_process_noise_s: 0.004
+    landmark_process_noise_d: 0.004
  
     # Merge neighboring associations
     publish_merge_duplicates.enable: false
@@ -140,31 +141,31 @@ row_fast_slam:
  
     # FASTSLAM 2.0 - measurement-informed pose proposal
     proposal.enable: true
-    proposal.min_pose_std_range:   0.035   # m  — range floor (suppresses along-row drift)
-    proposal.min_pose_std_bearing: 0.01   # rad — bearing floor (lateral correction)
-    proposal.min_pose_std_yaw: 0.006   # rad
-    proposal.max_correction_xy: 0.25    # m -> Max per-step pose correction applied by the proposal
-    proposal.max_correction_yaw: 0.06   # rad -> Max per-step pose correction applied by the proposal
+    proposal.min_pose_std_range:   0.003   # m  — range floor (suppresses along-row drift)
+    proposal.min_pose_std_bearing: 0.003   # rad — bearing floor (lateral correction)
+    proposal.min_pose_std_yaw: 0.001   # rad
+    proposal.max_correction_xy: 0.06    # m -> Max per-step pose correction applied by the proposal
+    proposal.max_correction_yaw: 0.04   # rad -> Max per-step pose correction applied by the proposal
     proposal.zombie_maha_threshold: 20.0 # Particles with Mahalanobis^2 above this are not moved by the proposal (zombie guard)
     proposal.min_landmark_seen: 8 # Min observations before a landmark is used on the proposal path (below → classic)
     proposal.max_odom_steps: 10 # Cap on accumulated odom steps used to scale pose prior uncertainty in proposal
  
     # Template soft prior (weight update per landmark)
-    template_prior.enable: true
+    template_prior.enable: false
     template_prior.sigma_s: 0.4
-    template_prior.sigma_d: 0.20
+    template_prior.sigma_d: 0.15
     template_prior.decay_k: 6.0
     template_prior.max_seen: 12
-    template_prior.w: 0.5
+    template_prior.w: 0.05
  
-    origin_recal.enable: false
+    origin_recal.enable: true
     origin_recal.min_seen: 8
-    origin_recal.alpha: 0.03
-    origin_recal.interval: 20
+    origin_recal.alpha: 0.02
+    origin_recal.interval: 15
 
     # Inter-landmark spacing propagation
     spacing_propagation.enable: false
-    spacing_propagation.min_seen: 18     # detections before propagating FROM this slot
+    spacing_propagation.min_seen: 8     # detections before propagating FROM this slot
     spacing_propagation.max_unseen: 5   # detections before stop nudging TO this slot
     spacing_propagation.alpha: 0.05      # nudge strength per hop [0,1]
     spacing_propagation.n_hops: 1       # how many neighbours each direction
@@ -177,8 +178,8 @@ row_fast_slam:
     publish.odom_min_interval: 0.05      # s  (20 Hz)
  
     # Message lag
-    meas_max_lag_sec: 1.0
-    odom_history_sec: 1.0
+    meas_max_lag_sec: 2.0
+    odom_history_sec: 2.0
  
     # Debugging
     debug.csv_enable: true
@@ -186,6 +187,7 @@ row_fast_slam:
     # debug.csv_path: /ros2_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
     debug.csv_flush_every_n: 1
     debug.print_measurement_stamp: false
+
 
 odom_reframer:
   ros__parameters:
@@ -210,6 +212,7 @@ odom_reframer:
 
     initial_odom_samples: 25
     initial_gps_samples: 5
+
 
 slam_odom_correction_tf:
   ros__parameters:
@@ -259,3 +262,14 @@ save_best_particle_map:
     final_gps_samples: 5
 
     service_name: save_slam_results
+
+
+trellis_from_rgbd_extraction:
+  ros__parameters:
+    extraction_dir: /home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_w_base_cam
+    anchor_tree_id: -1
+    trellis_side: far
+    registry_topic: fastslam_registry
+    shift_whole_map: false
+    max_correction_m: 1.0
+    measurement_timeout: 5.0

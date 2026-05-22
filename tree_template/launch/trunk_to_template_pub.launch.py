@@ -133,4 +133,13 @@ def generate_launch_description():
             output="screen",
             parameters=[params_file, {"use_sim_time": use_sim_time}],
         ),
+
+        # Place trellis template map from RGBD extraction (FastSLAM results map)
+        Node(
+            package="tree_template",
+            executable="trellis_from_rgbd_extraction",
+            name="trellis_from_rgbd_extraction",
+            output="screen",
+            parameters=[params_file, {"use_sim_time": use_sim_time}],
+        ),
     ])
