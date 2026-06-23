@@ -3,10 +3,11 @@
 fast_slam_rgbd_extraction.py
 
 Post-processing script: given a SLAM output YAML (with committed tree locations
-and robot poses+timestamps) and a ROS2 bag file containing RealSense RGB-D data,
-this script finds — for each committed tree — the robot pose where the tree is
-perpendicularly in front of the robot (broadside), then extracts and saves the
-nearest RGB-D frame pair (color + depth) from the bag at that timestamp.
+and robot poses+timestamps) and a ROS2 bag (sqlite3 storage) containing
+RealSense RGB-D data, this script finds — for each committed tree — the robot
+pose where the tree is perpendicularly in front of the robot (broadside), then
+extracts and saves the nearest RGB-D frame pair (color + depth) from the bag at
+that timestamp.
 
 Supports TWO camera streams simultaneously.  Each camera's frames are saved
 into a named subdirectory under the tree folder.
@@ -14,75 +15,93 @@ into a named subdirectory under the tree folder.
 Output structure:
     output_dir/
         tree_000/
-            meta.yaml          (tree id, world pos, robot pose, timestamp,
-                                 per-camera topics and timing deltas)
-            cam1/              (name set by --cam1_name, default "cam1")
+            meta.yaml
+            cam1/                        (single frame, buffer_radius=0)
                 color.png
-                depth.png          (16-bit, millimeters)
+                depth.png                (16-bit, millimeters)
                 depth_colormap.png
-            cam2/              (name set by --cam2_name, default "cam2")
+            cam2/                        (single frame, buffer_radius=0)
                 color.png
                 depth.png
                 depth_colormap.png
+            cam2/                        (5-frame buffer, --cam2_buffer_radius 2)
+                frame_-2/color.png, depth.png, depth_colormap.png
+                frame_-1/color.png, depth.png, depth_colormap.png
+                frame_0/ color.png, depth.png, depth_colormap.png
+                frame_1/ color.png, depth.png, depth_colormap.png
+                frame_2/ color.png, depth.png, depth_colormap.png
         tree_001/
             ...
 
+MEMORY MODEL
+------------
+This script queries the rosbag2 sqlite3 database DIRECTLY, one tree at a time.
+For each tree and each (color/depth) topic, it runs a single SQL query
+restricted to a small time window around the broadside timestamp, then STREAMS
+the matching rows ONE AT A TIME from sqlite:
+
+    for t_ns, data in cursor:        # one row fetched at a time, not buffered
+        msg = deserialize_message(data, msg_type)
+        ...keep only the single best-so-far candidate, discard the rest...
+
+Only the single best-matching message per topic is ever converted to an image
+array, and that array is written to disk and discarded before moving on to the
+next camera/tree. Peak memory is therefore a small, constant number of images,
+independent of bag size -- there is no "build a cache of all frames" step.
+
 Clock mismatch handling:
-    If the image topics were stamped with Unix wall-clock time (e.g. ~1.697e9 s)
-    but the odometry used ROS sim-time (e.g. seconds-since-bag-start ~2300 s),
-    use one of:
+    Image topics may carry header.stamp values in a different epoch than the
+    SLAM YAML's robot_path timestamps (e.g. the bag was replayed/re-recorded
+    later, so the bag's *receive* timestamps are in a different epoch than the
+    image *header* timestamps, which retain the original recording's clock).
 
-      --image_time_offset_s <value>
-            Manually supply the offset to SUBTRACT from image timestamps.
-            Compute as: first_image_unix_stamp - first_odom_sim_stamp
-            Example: --image_time_offset_s 1697583500.0
+    --image_time_offset_s <value>
+        The raw image header stamp expected at SLAM timestamp T is
+        (T + image_time_offset_s). If image headers and SLAM timestamps are
+        already in the same clock (common for re-processed bags), use 0.0.
 
-      --auto_detect_clock_offset
-            Automatically compute the offset from the first message of each
-            topic in the bag (requires --odom_topic to also be in the bag).
-            Prints the detected value so you can hard-code it for future runs.
+    --auto_detect_clock_offset
+        Computes offset = first_image_header_stamp - first_odom_header_stamp.
+        Only useful when both topics share a clock domain at the start of the
+        bag; for re-processed bags prefer --image_time_offset_s 0.0.
 
 Usage:
     python fast_slam_rgbd_extraction.py \\
         --yaml slam_trunks_20260331_174636.yaml \\
-        --bag  /path/to/your.bag \\
+        --bag  /path/to/bag_dir/ \\
         --output_dir rgbd_at_trees \\
         --cam1_color_topic /camera/mast_camera/color/image_raw \\
         --cam1_depth_topic /camera/mast_camera/recovered_depth/image_raw \\
         --cam2_color_topic /camera/base_camera/color/image_raw \\
         --cam2_depth_topic /camera/base_camera/depth/image_rect_raw \\
-        [--cam1_name mast_cam] \\
-        [--cam2_name base_cam] \\
-        [--odom_topic  /odometry/filtered] \\
-        [--max_time_delta_s 0.5] \\
-        [--perpendicular_window_m 0.5] \\
-        [--image_time_offset_s 1697583500.0 | --auto_detect_clock_offset]
+        --image_time_offset_s 0.0 --max_time_delta_s 5.0
 """
 
 import argparse
 import os
 import math
+import sqlite3
 import numpy as np
 import yaml
 import cv2
 
-# ROS2 bag reading
-from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 
 # ---------------------------------------------------------------------------
-# Camera config dataclass (plain dict-style, no dataclasses dependency needed)
+# Camera config
 # ---------------------------------------------------------------------------
 
 class CameraConfig:
     """Holds topic names and output directory name for one camera."""
 
-    def __init__(self, name: str, color_topic: str, depth_topic: str):
-        self.name        = name          # subdirectory name, e.g. "cam1"
-        self.color_topic = color_topic
-        self.depth_topic = depth_topic
+    def __init__(self, name: str, color_topic: str, depth_topic: str,
+                 buffer_radius: int = 0):
+        self.name          = name
+        self.color_topic   = color_topic
+        self.depth_topic   = depth_topic
+        self.buffer_radius = buffer_radius  # 0 = single frame; N = save 2N+1 frames
 
     @property
     def topics(self):
@@ -120,7 +139,7 @@ def perpendicular_distance_along_path(robot_pos, robot_yaw, tree_pos):
 
 def find_broadside_pose_index(robot_poses, tree_xy):
     """
-    Find the index in robot_poses where |fwd_dist| is minimised —
+    Find the index in robot_poses where |fwd_dist| is minimised --
     i.e. the tree is most nearly perpendicular (broadside) to the robot.
 
     robot_poses: (N, 4) array [x, y, yaw, t]
@@ -137,142 +156,164 @@ def find_broadside_pose_index(robot_poses, tree_xy):
 
 
 # ---------------------------------------------------------------------------
-# Bag reading helpers
+# SQLite bag helpers
 # ---------------------------------------------------------------------------
 
-def build_topic_message_cache(bag_path, topics):
+def _find_sqlite3_db(bag_path: str):
+    """Return path to the .db3 file inside bag_path, or None if not found."""
+    import glob
+    if bag_path.endswith(".db3") and os.path.isfile(bag_path):
+        return bag_path
+    candidates = glob.glob(os.path.join(bag_path, "*.db3"))
+    return candidates[0] if candidates else None
+
+
+def _header_stamp_s(msg):
+    """Return msg.header.stamp as float seconds."""
+    s = msg.header.stamp
+    return float(s.sec) + float(s.nanosec) * 1e-9
+
+
+def _topic_id_and_type_maps(con, topics):
     """
-    Read the bag and return:
-        { topic: [(timestamp_s, msg), ...] }
-
-    Timestamps come from header.stamp when available (more accurate than the
-    bag receive timestamp), otherwise fall back to bag receive time.
+    Returns (topic_id_map, type_map) for the given topic name list.
+    Topics not present in the bag are omitted (with a warning printed).
     """
-    storage_options = StorageOptions(uri=bag_path, storage_id="sqlite3")
-    converter_options = ConverterOptions(
-        input_serialization_format="cdr",
-        output_serialization_format="cdr",
-    )
-    reader = SequentialReader()
-    reader.open(storage_options, converter_options)
+    cur = con.cursor()
+    cur.execute("SELECT id, name, type FROM topics")
+    rows = cur.fetchall()
+    name_to_id   = {name: tid for tid, name, _ in rows}
+    name_to_type = {name: typ for _, name, typ in rows}
 
-    topic_types = {t.name: t.type for t in reader.get_all_topics_and_types()}
-
-    cache = {t: [] for t in topics}
+    topic_id_map = {}
     type_map = {}
-    for topic in topics:
-        if topic not in topic_types:
-            print(f"[WARN] Topic '{topic}' not found in bag. "
-                  f"Available: {sorted(topic_types.keys())}")
+    for t in topics:
+        if t not in name_to_id:
+            print(f"  [WARN] Topic '{t}' not found in bag.")
             continue
-        type_map[topic] = get_message(topic_types[topic])
-
-    print("Reading bag (this may take a moment)...")
-    count = 0
-    while reader.has_next():
-        topic, data, t_ns = reader.read_next()
-        if topic in type_map:
-            msg = deserialize_message(data, type_map[topic])
-            # Prefer header.stamp — reflects when data was captured, not
-            # when the bag recorder received it.
-            if hasattr(msg, "header") and hasattr(msg.header, "stamp"):
-                s = msg.header.stamp
-                t_s = float(s.sec) + float(s.nanosec) * 1e-9
-            else:
-                t_s = t_ns * 1e-9
-            cache[topic].append((t_s, msg))
-        count += 1
-        if count % 5000 == 0:
-            print(f"  ... read {count} messages")
-
-    for topic, msgs in cache.items():
-        if msgs:
-            print(f"  '{topic}': {len(msgs)} msgs  "
-                  f"t=[{msgs[0][0]:.3f}, {msgs[-1][0]:.3f}] s")
-        else:
-            print(f"  '{topic}': 0 messages")
-
-    return cache
+        topic_id_map[t] = name_to_id[t]
+        type_map[t] = get_message(name_to_type[t])
+    return topic_id_map, type_map
 
 
-def detect_clock_offset(cache, image_topic, odom_topic):
+def _first_last_header_stamp(con, topic_id, msg_type):
     """
-    Compute the offset to subtract from image timestamps to align them with
-    odom timestamps:
-
-        offset = first_image_stamp - first_odom_stamp
-
-    Handles the common recording issue where the RealSense driver stamped with
-    Unix wall-clock time (~1.697e9 s) while odom used ROS sim-time (~2300 s).
-
-    Returns offset in seconds.  Apply as: corrected_t = raw_image_t - offset
+    Return ((h0_s, t0_ns), (h1_s, t1_ns)) for the first and last message of
+    topic_id, where h is the image header.stamp (seconds) and t is the bag
+    receive timestamp (ns). Returns None if the topic has < 2 distinct rows.
     """
-    img_msgs  = cache.get(image_topic, [])
-    odom_msgs = cache.get(odom_topic,  [])
+    cur = con.cursor()
+    cur.execute("SELECT timestamp, data FROM messages WHERE topic_id=? "
+                "ORDER BY timestamp ASC LIMIT 1", (topic_id,))
+    row0 = cur.fetchone()
+    cur.execute("SELECT timestamp, data FROM messages WHERE topic_id=? "
+                "ORDER BY timestamp DESC LIMIT 1", (topic_id,))
+    row1 = cur.fetchone()
+    if not row0 or not row1 or row0[0] == row1[0]:
+        return None
 
-    if not img_msgs:
-        raise RuntimeError(
-            f"No messages cached for image topic '{image_topic}'. "
-            "Cannot auto-detect clock offset."
-        )
-    if not odom_msgs:
-        raise RuntimeError(
-            f"No messages cached for odom topic '{odom_topic}'. "
-            "Cannot auto-detect clock offset. "
-            "Ensure --odom_topic is correct, or use --image_time_offset_s instead."
-        )
-
-    t_img  = img_msgs[0][0]
-    t_odom = odom_msgs[0][0]
-    offset = t_img - t_odom
-
-    print(f"\n[Clock offset detection]")
-    print(f"  First image stamp : {t_img:.6f} s")
-    print(f"  First odom stamp  : {t_odom:.6f} s")
-    print(f"  Detected offset   : {offset:.6f} s")
-    print(f"  → subtracting {offset:.3f} s from all image timestamps")
-    print(f"  Tip: hard-code with --image_time_offset_s {offset:.3f}\n")
-
-    return offset
+    h0 = _header_stamp_s(deserialize_message(bytes(row0[1]), msg_type))
+    h1 = _header_stamp_s(deserialize_message(bytes(row1[1]), msg_type))
+    return (h0, row0[0]), (h1, row1[0])
 
 
-def apply_time_offset(cache, topics, offset):
-    """Subtract offset (seconds) from all timestamps for the given topics."""
-    for topic in topics:
-        if topic in cache and cache[topic]:
-            cache[topic] = [(t - offset, msg) for t, msg in cache[topic]]
-    print(f"[Clock correction] Subtracted {offset:.3f} s from image timestamps.")
-
-
-def find_nearest_message(msg_list, target_t, max_delta_s=0.5):
+def calibrate_header_to_receive(con, topic_id, msg_type):
     """
-    Binary-search the sorted msg_list for the message closest to target_t.
-    Returns (msg, dt) or (None, None) if nothing is within max_delta_s.
+    Compute the linear mapping from image header.stamp (seconds) to bag
+    receive timestamp (ns):
+
+        t_receive_ns ~= t0_ns + (h_s - h0_s) * slope_ns_per_s
+
+    slope ~= 1e9 for a real-time bag, < 1e9 for a slowed-down replay.
+    Returns (h0_s, t0_ns, slope) or None if calibration isn't possible.
     """
-    if not msg_list:
-        return None, None
+    ends = _first_last_header_stamp(con, topic_id, msg_type)
+    if ends is None:
+        return None
+    (h0, t0_ns), (h1, t1_ns) = ends
+    if h1 == h0:
+        return None
+    slope = (t1_ns - t0_ns) / (h1 - h0)
+    return h0, t0_ns, slope
 
-    times = np.array([m[0] for m in msg_list])
-    idx = int(np.searchsorted(times, target_t))
 
-    candidates = []
-    for i in [idx - 1, idx]:
-        if 0 <= i < len(msg_list):
-            dt = abs(msg_list[i][0] - target_t)
-            candidates.append((dt, i))
+def find_nearest_in_window(con, topic_id, msg_type,
+                            t_min_ns, t_max_ns,
+                            target_header_t, max_delta_s):
+    """
+    Stream rows of `topic_id` whose receive-timestamp is in
+    [t_min_ns, t_max_ns], deserializing ONE AT A TIME and keeping only the
+    single best-so-far candidate (smallest |header_stamp - target_header_t|).
+    Every non-best candidate is dropped immediately -- it is never appended
+    to any list, so it becomes garbage-collectable before the next row is
+    even fetched from sqlite.
 
-    if not candidates:
-        return None, None
+    Returns (best_msg, best_dt, best_t_ns, n_considered):
+        best_msg  : the winning deserialized message, or None if nothing in
+                    the window was within max_delta_s
+        best_dt   : |header_stamp - target_header_t| for the winner (or for
+                    the closest candidate found, even if outside tolerance),
+                    or None if the window contained zero rows
+        best_t_ns : bag receive timestamp (ns) of the best candidate, or None
+        n_considered : number of rows streamed from sqlite for this query
+    """
+    cur = con.cursor()
+    cur.execute(
+        "SELECT timestamp, data FROM messages "
+        "WHERE topic_id = ? AND timestamp >= ? AND timestamp <= ? "
+        "ORDER BY timestamp",
+        (topic_id, t_min_ns, t_max_ns),
+    )
 
-    dt, best_i = min(candidates)
-    if dt > max_delta_s:
-        return None, None
+    best_msg, best_dt, best_t_ns, n = None, None, None, 0
+    for t_ns, data in cur:  # one row at a time from the sqlite3 C API
+        n += 1
+        msg = deserialize_message(bytes(data), msg_type)
+        dt = abs(_header_stamp_s(msg) - target_header_t)
+        if best_dt is None or dt < best_dt:
+            best_msg, best_dt, best_t_ns = msg, dt, t_ns
+        # else: `msg` falls out of scope here and is discarded immediately.
 
-    return msg_list[best_i][1], dt
+    if best_msg is None or best_dt > max_delta_s:
+        return None, best_dt, best_t_ns, n
+    return best_msg, best_dt, best_t_ns, n
+
+
+def fetch_adjacent_frames(con, topic_id, msg_type, center_receive_ns,
+                           n_before, n_after):
+    """
+    Fetch up to n_before frames immediately before and n_after frames
+    immediately after center_receive_ns in bag receive-time order.
+
+    Returns (before, after):
+        before : list of deserialized msgs, oldest-first (len <= n_before)
+        after  : list of deserialized msgs, chronologically (len <= n_after)
+    """
+    cur = con.cursor()
+
+    cur.execute(
+        "SELECT timestamp, data FROM messages "
+        "WHERE topic_id=? AND timestamp < ? "
+        "ORDER BY timestamp DESC LIMIT ?",
+        (topic_id, center_receive_ns, n_before),
+    )
+    rows_before = cur.fetchall()
+    rows_before.reverse()  # oldest-first
+    before = [deserialize_message(bytes(data), msg_type) for _, data in rows_before]
+
+    cur.execute(
+        "SELECT timestamp, data FROM messages "
+        "WHERE topic_id=? AND timestamp > ? "
+        "ORDER BY timestamp ASC LIMIT ?",
+        (topic_id, center_receive_ns, n_after),
+    )
+    after = [deserialize_message(bytes(data), msg_type) for _, data in cur.fetchall()]
+
+    return before, after
 
 
 # ---------------------------------------------------------------------------
-# Image conversion helpers
+# Image conversion / saving
 # ---------------------------------------------------------------------------
 
 def ros_image_to_cv2(msg):
@@ -296,45 +337,8 @@ def ros_image_to_cv2(msg):
         raise ValueError(f"Unsupported image encoding: {enc}")
 
 
-# ---------------------------------------------------------------------------
-# Per-camera extraction helper
-# ---------------------------------------------------------------------------
-
-def extract_camera_frames(cam_cfg, cache, target_t, max_time_delta_s):
-    """
-    Find the nearest color and depth messages for a single camera.
-
-    Returns:
-        color_img  : numpy array or None
-        depth_img  : numpy array or None
-        dt_color   : float or None
-        dt_depth   : float or None
-        error      : str description if something failed, else None
-    """
-    color_msg, dt_c = find_nearest_message(
-        cache[cam_cfg.color_topic], target_t, max_time_delta_s)
-    depth_msg, dt_d = find_nearest_message(
-        cache[cam_cfg.depth_topic], target_t, max_time_delta_s)
-
-    if color_msg is None or depth_msg is None:
-        return None, None, dt_c, dt_d, (
-            f"no frame within {max_time_delta_s}s  "
-            f"(dt_color={dt_c}, dt_depth={dt_d})"
-        )
-
-    try:
-        color_img = ros_image_to_cv2(color_msg)
-        depth_img = ros_image_to_cv2(depth_msg)
-    except Exception as e:
-        return None, None, dt_c, dt_d, f"image conversion error: {e}"
-
-    return color_img, depth_img, dt_c, dt_d, None
-
-
 def save_camera_images(cam_dir, color_img, depth_img):
-    """
-    Write color.png, depth.png (16-bit), and depth_colormap.png into cam_dir.
-    """
+    """Write color.png, depth.png (16-bit), and depth_colormap.png into cam_dir."""
     os.makedirs(cam_dir, exist_ok=True)
     cv2.imwrite(os.path.join(cam_dir, "color.png"), color_img)
     cv2.imwrite(os.path.join(cam_dir, "depth.png"), depth_img)  # 16-bit PNG
@@ -354,10 +358,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--yaml",       required=True,  help="SLAM output YAML file")
-    parser.add_argument("--bag",        required=True,  help="ROS2 bag file path")
+    parser.add_argument("--bag",        required=True,  help="ROS2 bag directory (sqlite3 storage)")
     parser.add_argument("--output_dir", default="/home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_v3")
 
-    # ── Camera 1 ──────────────────────────────────────────────────────────────
+    # -- Camera 1 --------------------------------------------------------------
     cam1_grp = parser.add_argument_group("Camera 1")
     cam1_grp.add_argument(
         "--cam1_name",        default="mast_cam",
@@ -369,7 +373,7 @@ def main():
         "--cam1_depth_topic", default="/camera/mast_camera/recovered_depth/image_raw",
         help="Depth image topic for camera 1")
 
-    # ── Camera 2 ──────────────────────────────────────────────────────────────
+    # -- Camera 2 --------------------------------------------------------------
     cam2_grp = parser.add_argument_group("Camera 2")
     cam2_grp.add_argument(
         "--cam2_name",        default="base_cam",
@@ -380,8 +384,14 @@ def main():
     cam2_grp.add_argument(
         "--cam2_depth_topic", default="/camera/base_camera/depth/image_rect_raw",
         help="Depth image topic for camera 2")
+    cam2_grp.add_argument(
+        "--cam2_buffer_radius", type=int, default=0,
+        help="Number of frames to extract on each side of the broadside frame "
+             "for camera 2 (0 = single frame, 2 = 5-frame buffer). "
+             "Frames are saved into frame_-N/ ... frame_0/ ... frame_N/ "
+             "subdirectories under the camera folder.")
 
-    # ── Timing / filtering ────────────────────────────────────────────────────
+    # -- Timing / filtering ------------------------------------------------------
     parser.add_argument(
         "--odom_topic", default="/filter/state",
         help="Odometry topic (only needed with --auto_detect_clock_offset)")
@@ -389,27 +399,34 @@ def main():
         "--max_time_delta_s", type=float, default=1.0,
         help="Max allowed time gap (s) between broadside pose and image frame")
     parser.add_argument(
+        "--filter_pad_s", type=float, default=None,
+        help="Half-width (s, in image-header-stamp space) of the SQL query "
+             "window around each broadside time. Must be >= "
+             "--max_time_delta_s (auto-bumped with a warning if not). "
+             "Default: max_time_delta_s + 0.5")
+    parser.add_argument(
         "--perpendicular_window_m", type=float, default=None,
         help="Skip trees whose lateral distance exceeds this (metres)")
 
     clock_grp = parser.add_mutually_exclusive_group()
     clock_grp.add_argument(
         "--image_time_offset_s", type=float, default=None,
-        help="Subtract this value (s) from ALL image timestamps. "
-             "Compute as: first_image_stamp - first_odom_stamp",
+        help="Raw image header stamp expected at SLAM time T is "
+             "(T + this value). Use 0.0 if image headers and SLAM "
+             "timestamps already share a clock.",
     )
     clock_grp.add_argument(
         "--auto_detect_clock_offset", action="store_true",
-        help="Auto-compute the clock offset from the first messages on the "
-             "image and odom topics. Prints the value for future hard-coding.",
+        help="Compute offset = first_image_header_stamp - "
+             "first_odom_header_stamp.",
     )
 
     args = parser.parse_args()
 
-    # Build camera config objects
     cameras = [
         CameraConfig(args.cam1_name, args.cam1_color_topic, args.cam1_depth_topic),
-        CameraConfig(args.cam2_name, args.cam2_color_topic, args.cam2_depth_topic),
+        CameraConfig(args.cam2_name, args.cam2_color_topic, args.cam2_depth_topic,
+                     buffer_radius=args.cam2_buffer_radius),
     ]
 
     print("Camera configuration:")
@@ -418,24 +435,19 @@ def main():
         print(f"  [{cam.name}]  depth: {cam.depth_topic}")
 
     # ------------------------------------------------------------------
-    # 1. Load YAML
+    # 1. Load YAML, find broadside pose per tree
     # ------------------------------------------------------------------
     print(f"\nLoading YAML: {args.yaml}")
     with open(args.yaml, "r") as f:
         data = yaml.safe_load(f)
 
-    trees       = data["trees"]       # dict: {id: [x, y]}
-    robot_path  = data["robot_path"]  # list of [x, y, yaw, timestamp]
-    robot_poses = np.array(robot_path, dtype=np.float64)  # (N, 4)
+    trees       = data["trees"]
+    robot_poses = np.array(data["robot_path"], dtype=np.float64)  # (N, 4): x,y,yaw,t
 
     print(f"  {len(trees)} committed trees, {len(robot_poses)} robot poses")
     print(f"  Robot path time range: [{robot_poses[0, 3]:.3f}, {robot_poses[-1, 3]:.3f}] s")
 
-    # ------------------------------------------------------------------
-    # 2. Find broadside pose per tree
-    # ------------------------------------------------------------------
     broadside_info = {}
-
     for tree_id, tree_xy in trees.items():
         tree_xy = np.array(tree_xy, dtype=np.float64)
         idx, fwd, lat = find_broadside_pose_index(robot_poses, tree_xy)
@@ -445,118 +457,262 @@ def main():
             continue
 
         pose = robot_poses[idx]
-        ts   = float(pose[3])
         broadside_info[tree_id] = {
             "pose_idx":    idx,
             "pose":        pose.tolist(),
             "fwd_dist_m":  float(fwd),
             "lat_dist_m":  float(lat),
-            "timestamp_s": ts,
+            "timestamp_s": float(pose[3]),
             "tree_xy":     tree_xy.tolist(),
         }
-        print(f"  Tree {tree_id:>3}: broadside t={ts:.3f}s  "
+        print(f"  Tree {tree_id:>3}: broadside t={pose[3]:.3f}s  "
               f"fwd={fwd:+.3f}m  lat={lat:+.3f}m  (idx={idx})")
 
     # ------------------------------------------------------------------
-    # 3. Read bag — collect all camera topics + odom if needed
+    # 2. Open the bag's sqlite3 database directly
     # ------------------------------------------------------------------
+    db_path = _find_sqlite3_db(args.bag)
+    if db_path is None:
+        raise FileNotFoundError(
+            f"No .db3 file found under '{args.bag}'. This script reads "
+            f"rosbag2 sqlite3 storage directly; mcap bags are not supported."
+        )
+    print(f"\nOpening bag database: {db_path}")
+    con = sqlite3.connect(db_path)
+
     all_image_topics = []
     for cam in cameras:
         all_image_topics.extend(cam.topics)
+    all_image_topics = list(dict.fromkeys(all_image_topics))  # dedup, order kept
 
-    topics_to_read = list(dict.fromkeys(all_image_topics))  # deduplicated, order preserved
+    topics_for_lookup = list(all_image_topics)
     if args.auto_detect_clock_offset:
-        topics_to_read.append(args.odom_topic)
+        topics_for_lookup.append(args.odom_topic)
 
-    cache = build_topic_message_cache(args.bag, topics_to_read)
+    topic_id_map, type_map = _topic_id_and_type_maps(con, topics_for_lookup)
 
     # ------------------------------------------------------------------
-    # 4. Apply clock offset to ALL image topics
+    # 3. Determine the clock offset
+    #
+    #    raw_image_header_stamp_at_broadside = broadside_t + image_time_offset_s
     # ------------------------------------------------------------------
-    if args.auto_detect_clock_offset:
-        # Use cam1 color as the reference image topic for offset detection
-        offset = detect_clock_offset(cache, cameras[0].color_topic, args.odom_topic)
-        apply_time_offset(cache, all_image_topics, offset)
-
-    elif args.image_time_offset_s is not None:
-        print(f"\n[Clock correction] Applying manual offset: -{args.image_time_offset_s:.3f} s")
-        apply_time_offset(cache, all_image_topics, args.image_time_offset_s)
-        for topic in all_image_topics:
-            msgs = cache[topic]
-            if msgs:
-                print(f"  '{topic}' corrected range: [{msgs[0][0]:.3f}, {msgs[-1][0]:.3f}] s")
-
+    if args.image_time_offset_s is not None:
+        offset = args.image_time_offset_s
+        print(f"\n[Clock] Using manual offset: {offset:.3f} s")
+    elif args.auto_detect_clock_offset:
+        if args.odom_topic not in topic_id_map or all_image_topics[0] not in topic_id_map:
+            raise RuntimeError("--auto_detect_clock_offset requires both the "
+                                "odom topic and at least one image topic to be present in the bag.")
+        img_ends  = _first_last_header_stamp(con, topic_id_map[all_image_topics[0]], type_map[all_image_topics[0]])
+        odom_ends = _first_last_header_stamp(con, topic_id_map[args.odom_topic],     type_map[args.odom_topic])
+        if img_ends is None or odom_ends is None:
+            raise RuntimeError("Not enough messages to auto-detect clock offset.")
+        t_img0  = img_ends[0][0]
+        t_odom0 = odom_ends[0][0]
+        offset = t_img0 - t_odom0
+        print(f"\n[Clock] Auto-detected offset: {offset:.3f} s "
+              f"(first image header={t_img0:.3f}s, first odom header={t_odom0:.3f}s)")
     else:
-        print("\n[Clock] No offset applied. If no frames are matched, try "
-              "--auto_detect_clock_offset or --image_time_offset_s.")
+        offset = 0.0
+        print("\n[Clock] No offset specified; assuming image headers and SLAM "
+              "timestamps share a clock (offset=0.0).")
 
     # ------------------------------------------------------------------
-    # 5. Extract and save
+    # 4. Calibrate header-stamp -> bag receive-time mapping
+    #
+    #    Needed because the SQL `timestamp` column is bag RECEIVE time, which
+    #    may be in a completely different epoch than image header.stamp for
+    #    replayed/reprocessed bags.
+    # ------------------------------------------------------------------
+    calibration = None
+    cal_topic = None
+    for t in all_image_topics:
+        if t not in topic_id_map:
+            continue
+        calibration = calibrate_header_to_receive(con, topic_id_map[t], type_map[t])
+        if calibration:
+            cal_topic = t
+            break
+
+    if calibration is None:
+        print("[WARN] Could not calibrate header-stamp -> receive-time mapping "
+              "(need >=2 messages on at least one image topic). Falling back "
+              "to scanning each topic's full timestamp range per query -- "
+              "this will be slower.")
+        h0_cal, t0_cal_ns, slope_cal = 0.0, 0, 1e9
+        full_range = True
+    else:
+        h0_cal, t0_cal_ns, slope_cal = calibration
+        full_range = False
+        print(f"[time-map] Calibrated from '{cal_topic}':")
+        print(f"  header t0={h0_cal:.3f}s  receive t0={t0_cal_ns*1e-9:.3f}s  "
+              f"speed factor={slope_cal/1e9:.4f}x  "
+              f"(1.0 = real-time, <1 = slower than real-time)")
+
+    # ------------------------------------------------------------------
+    # 5. SQL query window half-width, in image-header-stamp seconds
+    # ------------------------------------------------------------------
+    pad_s = args.filter_pad_s
+    if pad_s is None:
+        pad_s = args.max_time_delta_s + 0.5
+    if pad_s < args.max_time_delta_s:
+        print(f"[WARN] --filter_pad_s ({pad_s:.2f}s) < --max_time_delta_s "
+              f"({args.max_time_delta_s:.2f}s); bumping pad to match.")
+        pad_s = args.max_time_delta_s
+
+    buffer_ns = int(2e9)  # extra slack (receive-time ns) for linearisation error
+
+    # ------------------------------------------------------------------
+    # 6. Per-tree: query -> find nearest -> convert -> save -> discard
     # ------------------------------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
-    saved   = 0
-    skipped = 0
+    saved, skipped = 0, 0
+    total_rows_considered = 0
+    total_queries = 0
 
-    applied_offset = (
-        args.image_time_offset_s if args.image_time_offset_s is not None
-        else ("auto-detected" if args.auto_detect_clock_offset else 0.0)
-    )
+    print(f"\nExtracting {len(broadside_info)} trees "
+          f"(query window: +/-{pad_s:.1f}s, max match delta: {args.max_time_delta_s:.1f}s)...")
 
     for tree_id, info in broadside_info.items():
-        target_t = info["timestamp_s"]
-        tree_dir = os.path.join(args.output_dir, f"tree_{int(tree_id):03d}")
+        target_t   = info["timestamp_s"]
+        raw_target = target_t + offset
+        tree_dir   = os.path.join(args.output_dir, f"tree_{int(tree_id):03d}")
 
-        # -- Try to extract frames from every camera -----------------------
-        cam_results   = {}   # cam.name -> {color_img, depth_img, dt_c, dt_d, error}
-        any_cam_ok    = False
+        if full_range:
+            t_min_ns, t_max_ns = 0, 2**63 - 1
+        else:
+            center_ns = t0_cal_ns + (raw_target - h0_cal) * slope_cal
+            pad_ns    = pad_s * abs(slope_cal)
+            t_min_ns  = int(center_ns - pad_ns - buffer_ns)
+            t_max_ns  = int(center_ns + pad_ns + buffer_ns)
+
+        cam_meta   = {}
+        any_cam_ok = False
 
         for cam in cameras:
-            color_img, depth_img, dt_c, dt_d, error = extract_camera_frames(
-                cam, cache, target_t, args.max_time_delta_s)
+            results = {}  # role -> (msg_or_None, dt_or_None, t_ns_or_None, error_or_None)
 
-            cam_results[cam.name] = {
-                "color_img":   color_img,
-                "depth_img":   depth_img,
-                "dt_color_s":  float(dt_c) if dt_c is not None else None,
-                "dt_depth_s":  float(dt_d) if dt_d is not None else None,
-                "error":       error,
-                "color_topic": cam.color_topic,
-                "depth_topic": cam.depth_topic,
-            }
+            for role, topic in (("color", cam.color_topic), ("depth", cam.depth_topic)):
+                if topic not in topic_id_map:
+                    results[role] = (None, None, None, f"topic '{topic}' not in bag")
+                    continue
 
-            if error is None:
-                any_cam_ok = True
-            else:
+                msg, dt, t_ns, n = find_nearest_in_window(
+                    con, topic_id_map[topic], type_map[topic],
+                    t_min_ns, t_max_ns, raw_target, args.max_time_delta_s,
+                )
+                total_rows_considered += n
+                total_queries += 1
+
+                if msg is None:
+                    dt_str = f"{dt:.3f}s" if dt is not None else "n/a"
+                    results[role] = (None, dt, None,
+                        f"no frame within {args.max_time_delta_s}s "
+                        f"(nearest dt={dt_str}, {n} candidates in window)")
+                else:
+                    results[role] = (msg, dt, t_ns, None)
+
+            color_msg, dt_c, t_ns_color, err_c = results["color"]
+            depth_msg, dt_d, t_ns_depth, err_d = results["depth"]
+            error = err_c or err_d
+
+            if error is not None:
                 print(f"  [WARN] Tree {tree_id} / {cam.name}: {error}")
+                cam_meta[cam.name] = {
+                    "color_topic":   cam.color_topic,
+                    "depth_topic":   cam.depth_topic,
+                    "buffer_radius": cam.buffer_radius,
+                    "saved":         False,
+                    "skip_reason":   error,
+                }
+                continue
+
+            any_cam_ok = True
+            cam_dir = os.path.join(tree_dir, cam.name)
+
+            if cam.buffer_radius == 0:
+                # Single-frame mode (default, existing behavior)
+                color_img = ros_image_to_cv2(color_msg)
+                depth_img = ros_image_to_cv2(depth_msg)
+                del color_msg, depth_msg
+                save_camera_images(cam_dir, color_img, depth_img)
+                del color_img, depth_img
+                print(f"  [OK]   Tree {tree_id} / {cam.name}: "
+                      f"dt_color={dt_c:.3f}s  dt_depth={dt_d:.3f}s")
+                cam_meta[cam.name] = {
+                    "color_topic": cam.color_topic,
+                    "depth_topic": cam.depth_topic,
+                    "buffer_radius": 0,
+                    "dt_color_s":  float(dt_c),
+                    "dt_depth_s":  float(dt_d),
+                    "saved":       True,
+                }
+            else:
+                # Multi-frame buffer mode: fetch radius frames on each side
+                r = cam.buffer_radius
+                before_colors, after_colors = fetch_adjacent_frames(
+                    con, topic_id_map[cam.color_topic], type_map[cam.color_topic],
+                    t_ns_color, r, r,
+                )
+                before_depths, after_depths = fetch_adjacent_frames(
+                    con, topic_id_map[cam.depth_topic], type_map[cam.depth_topic],
+                    t_ns_depth, r, r,
+                )
+
+                # Pad with None where the bag doesn't have enough adjacent frames
+                before_colors = [None] * (r - len(before_colors)) + before_colors
+                after_colors  = after_colors  + [None] * (r - len(after_colors))
+                before_depths = [None] * (r - len(before_depths)) + before_depths
+                after_depths  = after_depths  + [None] * (r - len(after_depths))
+
+                all_colors = before_colors + [color_msg] + after_colors
+                all_depths = before_depths + [depth_msg] + after_depths
+                del color_msg, depth_msg, before_colors, after_colors
+                del before_depths, after_depths
+
+                frame_meta = {}
+                n_buf_saved = 0
+                for i, (c_msg, d_msg) in enumerate(zip(all_colors, all_depths)):
+                    offset     = i - r
+                    frame_name = f"frame_{offset}"
+                    frame_dir  = os.path.join(cam_dir, frame_name)
+                    if c_msg is not None and d_msg is not None:
+                        color_img = ros_image_to_cv2(c_msg)
+                        depth_img = ros_image_to_cv2(d_msg)
+                        del c_msg, d_msg
+                        save_camera_images(frame_dir, color_img, depth_img)
+                        del color_img, depth_img
+                        frame_meta[frame_name] = {"saved": True}
+                        n_buf_saved += 1
+                    else:
+                        frame_meta[frame_name] = {
+                            "saved": False,
+                            "skip_reason": "insufficient adjacent frames in bag",
+                        }
+                        print(f"  [WARN] Tree {tree_id} / {cam.name}/{frame_name}: "
+                              f"missing frame at this position")
+                del all_colors, all_depths
+
+                frame_meta["frame_0"]["dt_color_s"] = float(dt_c)
+                frame_meta["frame_0"]["dt_depth_s"] = float(dt_d)
+
+                print(f"  [OK]   Tree {tree_id} / {cam.name}: "
+                      f"{n_buf_saved}/{2*r+1} buffer frames saved  "
+                      f"(center dt_color={dt_c:.3f}s  dt_depth={dt_d:.3f}s)")
+                cam_meta[cam.name] = {
+                    "color_topic":   cam.color_topic,
+                    "depth_topic":   cam.depth_topic,
+                    "buffer_radius": r,
+                    "saved":         n_buf_saved > 0,
+                    "frames":        frame_meta,
+                }
 
         if not any_cam_ok:
             print(f"  [SKIP] Tree {tree_id}: no camera produced valid frames at t={target_t:.3f}s")
             skipped += 1
             continue
 
-        # -- Create tree_### directory and save each camera's images -------
         os.makedirs(tree_dir, exist_ok=True)
-
-        cam_meta = {}
-        for cam in cameras:
-            r = cam_results[cam.name]
-            cam_meta[cam.name] = {
-                "color_topic":  r["color_topic"],
-                "depth_topic":  r["depth_topic"],
-                "dt_color_s":   r["dt_color_s"],
-                "dt_depth_s":   r["dt_depth_s"],
-                "saved":        r["error"] is None,
-                "skip_reason":  r["error"],
-            }
-
-            if r["error"] is None:
-                cam_dir = os.path.join(tree_dir, cam.name)
-                save_camera_images(cam_dir, r["color_img"], r["depth_img"])
-                print(f"  [OK]   Tree {tree_id} / {cam.name}: "
-                      f"saved  dt_color={r['dt_color_s']:.3f}s  "
-                      f"dt_depth={r['dt_depth_s']:.3f}s")
-
-        # -- Write meta.yaml in tree_### -----------------------------------
         meta = {
             "tree_id":                     int(tree_id),
             "tree_world_xy_m":             info["tree_xy"],
@@ -564,7 +720,7 @@ def main():
             "broadside_timestamp_s":       info["timestamp_s"],
             "fwd_dist_to_tree_m":          info["fwd_dist_m"],
             "lat_dist_to_tree_m":          info["lat_dist_m"],
-            "image_time_offset_applied_s": applied_offset,
+            "image_time_offset_applied_s": offset,
             "cameras":                     cam_meta,
         }
         with open(os.path.join(tree_dir, "meta.yaml"), "w") as f:
@@ -572,6 +728,9 @@ def main():
 
         saved += 1
 
+    con.close()
+    print(f"\n[stats] {total_queries} queries, "
+          f"{total_rows_considered} candidate rows streamed+discarded in total.")
     print(f"\nDone. Saved {saved} trees, skipped {skipped}.")
     print(f"Output: {os.path.abspath(args.output_dir)}/")
 

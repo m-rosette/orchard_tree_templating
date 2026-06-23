@@ -23,6 +23,15 @@ registry_topic          (str)   – topic name for the TrunkRegistry message (de
 shift_whole_map         (bool)  – if True, correction shifts all trunks; if False, anchor only (default False).
 max_correction_m        (float) – reject corrections larger than this magnitude in metres (default 1.0).
 measurement_timeout_sec (float) – seconds to wait for a trunk measurement after triggering (default 5.0).
+slam_results_yaml       (str)   – path to the yaml written by save_best_particle_map.py for this run.
+                                  When set and it contains a non-null row_yaw_rad, that run-wide,
+                                  odom-locked estimate is used to de-rotate ALL tree positions
+                                  (instead of the anchor tree's single broadside-sample yaw), so
+                                  the row lies along local +X. Trunk orientation is always identity:
+                                  the planning frame is defined by the robot's current pose, so
+                                  trellis side branches end up perpendicular to the row everywhere.
+                                  If unset/unreadable, falls back to the anchor's broadside-sample
+                                  yaw for de-rotation.
 
 Workflow
 --------
@@ -114,9 +123,36 @@ def _extract_world_z(meta: dict) -> float:
     return 0.0
 
 
+def _load_global_row_yaw(slam_results_yaml: str) -> Optional[float]:
+    """
+    Pull row_yaw_rad out of the yaml written by save_best_particle_map.py.
+    Returns None if the path is empty, missing, or the field is absent/null —
+    callers fall back to the per-anchor broadside sample in that case.
+    """
+    if not slam_results_yaml:
+        return None
+    p = Path(slam_results_yaml).expanduser()
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return None
+    val = data.get("row_yaw_rad")
+    if val is None:
+        return None
+    try:
+        v = float(val)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
 def _anchor_transform(
     tree_data: Dict[int, dict],
     anchor_id: int,
+    global_row_yaw: Optional[float] = None,
 ) -> Tuple[np.ndarray, float, float]:
     """
     Compute the 2-D rigid transform that re-centers the row so that:
@@ -127,10 +163,22 @@ def _anchor_transform(
       - All other trees are positioned relative to the anchor in the
         same rotated frame.
 
+    row_yaw is the angle used to de-rotate ALL tree positions into the
+    local frame, making the row lie along local +X. When global_row_yaw
+    is provided (the locked, run-wide estimate saved by
+    save_best_particle_map.py) it is used instead of the anchor's own
+    single broadside sample, since it's averaged over the whole run
+    rather than one odom reading.
+
+    Trunk orientation downstream is identity — the planning frame is
+    defined by the robot's current pose, so "row direction" is local +X
+    by construction and the trellis side branches are perpendicular to
+    it everywhere along the row.
+
     Returns
     -------
     robot_origin_xy : (2,) world-frame robot position when anchor was broadside
-    row_yaw         : yaw (rad) of the row direction at that moment
+    row_yaw         : yaw (rad) used to de-rotate tree positions into the local frame
     anchor_fwd      : along-row distance of the anchor tree from its broadside robot pose
     """
     if anchor_id not in tree_data:
@@ -142,7 +190,9 @@ def _anchor_transform(
     anchor_meta = tree_data[anchor_id]
     xyt = anchor_meta.get("broadside_robot_pose_xyt", [0.0, 0.0, 0.0])
     robot_origin_xy = np.array([float(xyt[0]), float(xyt[1])], dtype=np.float64)
-    row_yaw = float(xyt[2]) if len(xyt) >= 3 else 0.0
+    anchor_broadside_yaw = float(xyt[2]) if len(xyt) >= 3 else 0.0
+
+    row_yaw = float(global_row_yaw) if global_row_yaw is not None else anchor_broadside_yaw
     anchor_fwd = float(anchor_meta.get("fwd_dist_to_tree_m", 0.0))
 
     return robot_origin_xy, row_yaw, anchor_fwd
@@ -195,6 +245,7 @@ class TrellisFromExtractionNode(Node):
         self.declare_parameter("shift_whole_map", False)
         self.declare_parameter("max_correction_m", 1.0)
         self.declare_parameter("measurement_timeout_sec", 5.0)
+        self.declare_parameter("slam_results_yaml", "")  # output of save_best_particle_map.py
 
         self.extraction_dir = self.get_parameter("extraction_dir").value
         self.trellis_side = self.get_parameter("trellis_side").value
@@ -203,6 +254,20 @@ class TrellisFromExtractionNode(Node):
         self.shift_whole_map = bool(self.get_parameter("shift_whole_map").value)
         self.max_correction_m = float(self.get_parameter("max_correction_m").value)
         self.measurement_timeout_sec = float(self.get_parameter("measurement_timeout_sec").value)
+        self.slam_results_yaml = str(self.get_parameter("slam_results_yaml").value)
+
+        self._global_row_yaw: Optional[float] = _load_global_row_yaw(self.slam_results_yaml)
+        if self.slam_results_yaml:
+            if self._global_row_yaw is not None:
+                self.get_logger().info(
+                    f"Loaded global row_yaw_rad={self._global_row_yaw:.6f} "
+                    f"({np.degrees(self._global_row_yaw):.2f} deg) from {self.slam_results_yaml}"
+                )
+            else:
+                self.get_logger().warn(
+                    f"slam_results_yaml set ({self.slam_results_yaml}) but row_yaw_rad "
+                    "missing/null/unreadable — falling back to per-anchor broadside yaw."
+                )
 
         if not self.extraction_dir:
             self.get_logger().fatal("Parameter 'extraction_dir' must be set.")
@@ -244,34 +309,32 @@ class TrellisFromExtractionNode(Node):
             callback_group=self._service_cbg,
         )
 
-        # ── Startup timer ────────────────────────────────────────────────────
-        self._started = False
-        self.create_timer(0.1, self._startup_once)
+        self._do_startup()
 
     # =========================================================================
     #  Startup
     # =========================================================================
 
-    def _startup_once(self):
-        if self._started:
-            return
-        self._started = True
-
+    def _do_startup(self):
         try:
             self._tree_data = _load_meta_yamls(self.extraction_dir)
         except FileNotFoundError as e:
             self.get_logger().fatal(str(e))
-            return
+            raise RuntimeError(str(e))
 
         self.get_logger().info(
             f"Loaded {len(self._tree_data)} trees from {self.extraction_dir}\n"
             f"  Available tree ids: {sorted(self._tree_data.keys())}\n"
-            f"  Waiting for anchor — run:\n"
-            f"    ros2 param set /{self.get_name()} anchor_tree_id <id>"
+            f"  Waiting for anchor — set anchor_tree_id parameter to trigger publish."
         )
 
+        # Register the parameter change callback now that data is loaded.
+        # This must happen before the node starts spinning so that any
+        # anchor_tree_id set at launch time or via ros2 param set is caught.
         self.add_on_set_parameters_callback(self._on_parameter_change)
 
+        # If anchor_tree_id was provided at launch (e.g. from launch_config.yaml),
+        # publish immediately.
         anchor_id = int(self.get_parameter("anchor_tree_id").value)
         if anchor_id >= 0:
             self._try_publish(anchor_id)
@@ -310,7 +373,7 @@ class TrellisFromExtractionNode(Node):
     def _try_publish(self, anchor_id: int):
         try:
             robot_origin_xy, row_yaw, anchor_fwd = _anchor_transform(
-                self._tree_data, anchor_id
+                self._tree_data, anchor_id, self._global_row_yaw
             )
         except ValueError as e:
             self.get_logger().error(str(e))
@@ -319,7 +382,8 @@ class TrellisFromExtractionNode(Node):
         self.get_logger().info(
             f"Anchoring on tree_{anchor_id:03d}  "
             f"robot_origin=({robot_origin_xy[0]:.3f}, {robot_origin_xy[1]:.3f})  "
-            f"row_yaw={np.degrees(row_yaw):.1f} deg"
+            f"row_yaw={np.degrees(row_yaw):.1f} deg "
+            f"({'global slam estimate' if self._global_row_yaw is not None else 'anchor sample'})"
         )
 
         msg = self._build_trunk_registry(
@@ -328,16 +392,10 @@ class TrellisFromExtractionNode(Node):
         if msg is None:
             return
 
-        if not self._wait_for_registry_subscriber(timeout_sec=10.0):
-            self.get_logger().fatal(
-                f"No subscribers to '{self.registry_topic}' after 10s. "
-                "Is generate_trellis_collision_obj running with matching registry_topic?"
-            )
-            return
-
+        # TRANSIENT_LOCAL durability means the last message is stored and
+        # replayed automatically to any late-joining subscriber — no need
+        # to poll subscription count before publishing.
         self.registry_pub.publish(msg)
-
-        # Cache for the correction service
         self._last_registry_msg = msg
         self._last_anchor_id = anchor_id
 
@@ -379,6 +437,9 @@ class TrellisFromExtractionNode(Node):
             trunk.pose.position.x = float(local_xy[0])
             trunk.pose.position.y = float(local_xy[1])
             trunk.pose.position.z = float(world_z) + float(self.z_offset)
+            # Identity orientation: tree positions are already de-rotated so the
+            # row lies along local +X. Trellis side-branch yaw is supplied
+            # downstream by generate_trellis_collision_obj based on `side`.
             trunk.pose.orientation.w = 1.0
             trunk.width = float(meta.get("width", 0.0))
             trunk.side = side
@@ -393,14 +454,6 @@ class TrellisFromExtractionNode(Node):
             self.get_logger().warn(f"Skipped {skipped} trees due to missing data.")
 
         return msg
-
-    def _wait_for_registry_subscriber(self, timeout_sec: float = 10.0) -> bool:
-        deadline = time.monotonic() + float(timeout_sec)
-        while time.monotonic() < deadline:
-            if self.registry_pub.get_subscription_count() > 0:
-                return True
-            time.sleep(0.1)
-        return False
 
     # =========================================================================
     #  Trunk measurement subscriber
