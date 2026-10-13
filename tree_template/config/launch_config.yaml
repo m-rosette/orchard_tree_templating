@@ -9,8 +9,7 @@ trunk_detection_relay:
 
     use_trunk_width_addition: true
 
-    # min_trunk_width: 0.038 # for prosser 2023
-    min_trunk_width: 0.0 # for prosser 2025
+    min_trunk_width: 0.0
     required_class: 0
     min_depth: 0.3
     max_depth: 3.0
@@ -33,21 +32,21 @@ row_fast_slam:
     odom_best_topic: odom_slam_best
  
     # Slot initialization (map init)
-    slot_spacing: 1.22
-    num_slots: 50
+    slot_spacing: 1.2
+    num_slots: 30
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_s: 0.0
-    slot_s_gate: 0.7
+    slot_s_gate: 0.4
  
     row_origin_x: .nan
     row_origin_y: .nan
-    row_dir_sign: 1
+    row_dir_sign: -1
     row_yaw_init_window: 25
-    min_seen_count_to_publish: 6
+    min_seen_count_to_publish: 5
     use_template_map: true
     template_origin_from_first_measurement: true
-    template_origin_min_hits: 6
+    template_origin_min_hits: 5
     publish_unseen_template_landmarks: false
     use_global_row_yaw: true
  
@@ -147,7 +146,7 @@ row_fast_slam:
     proposal.max_correction_xy: 0.06    # m -> Max per-step pose correction applied by the proposal
     proposal.max_correction_yaw: 0.04   # rad -> Max per-step pose correction applied by the proposal
     proposal.zombie_maha_threshold: 20.0 # Particles with Mahalanobis^2 above this are not moved by the proposal (zombie guard)
-    proposal.min_landmark_seen: 8 # Min observations before a landmark is used on the proposal path (below → classic)
+    proposal.min_landmark_seen: 5 # Min observations before a landmark is used on the proposal path (below → classic)
     proposal.max_odom_steps: 10 # Cap on accumulated odom steps used to scale pose prior uncertainty in proposal
  
     # Template soft prior (weight update per landmark)
@@ -188,31 +187,29 @@ row_fast_slam:
     debug.csv_flush_every_n: 1
     debug.print_measurement_stamp: false
 
-
 odom_reframer:
   ros__parameters:
-    input_odom_topic: /odometry/filtered
+    input_odom_topic: /filter/state # 2025 dataset
     output_odom_topic: /odometry/wheel
     odom_frame: odom
     base_frame: amiga__base
     publish_tf: false
 
-    recenter: false
+    recenter: true
 
-    rotate_pos_deg: 0.0
+    rotate_pos_deg: 180.0
     rotate_yaw_deg: 0.0
     rotate_orientation_only: false
 
     use_now_stamp: true
     copy_twist: true
 
-    gps_topic: /fix
+    gps_topic: /gps/pvt # 2025 dataset
     gps_min_status: 0
     gps_require_finite_cov: false
 
     initial_odom_samples: 25
     initial_gps_samples: 5
-
 
 slam_odom_correction_tf:
   ros__parameters:
@@ -252,7 +249,7 @@ save_best_particle_map:
     trunk_topic: /fastslam_registry
     odom_corr_topic: /initial_odom_correction
     gps_topic: /initial_gps_fix
-    final_gps_navsat_topic: /fix
+    final_gps_navsat_topic: /gps/pvt # 2025 dataset
     out: /home/marcus/trunk_width_ws/pf_localization_package_data/slam_measurements/slam_trunks.yaml
 
     require_odom_correction: true
@@ -266,10 +263,10 @@ save_best_particle_map:
 
 trellis_from_rgbd_extraction:
   ros__parameters:
-    extraction_dir: /home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_w_base_cam
+    extraction_dir: /home/marcus/apple_harvest_ws/data/post_slam_image_processing/test_06262026_full_res
     anchor_tree_id: -1
     trellis_side: far
     registry_topic: fastslam_registry
     shift_whole_map: false
-    max_correction_m: 1.0
-    measurement_timeout: 5.0
+    max_correction_m: 2.0
+    measurement_timeout_sec: 5.0

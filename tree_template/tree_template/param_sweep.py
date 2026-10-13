@@ -759,31 +759,27 @@ def atomic_write_text(path: Path, text: str) -> None:
 def suggest_params(trial) -> Dict[str, Any]:  # "optuna.trial.Trial"
     params: Dict[str, Any] = {}
 
-    params["slot_spacing"] = trial.suggest_float("slot_spacing", 0.9, 1.2)
-    params["slot_s_gate"] = trial.suggest_float("slot_s_gate", 0.35, 0.55)
+    params["motion_noise.a_trans"] = trial.suggest_float("motion_noise.a_trans", 0.05, 0.35, log=True)
+    params["motion_noise.b_trans"] = trial.suggest_float("motion_noise.b_trans", 0.05, 0.35, log=True)
+    params["motion_noise.c_lat"] = trial.suggest_float("motion_noise.c_lat", 0.05, 0.30, log=True)
+    params["motion_noise.a_rot"] = trial.suggest_float("motion_noise.a_rot", 0.03, 0.12, log=True)
+    params["motion_noise.b_rot"] = trial.suggest_float("motion_noise.b_rot", 0.03, 0.15, log=True)
 
-    params["meas_std_x_fwd"] = trial.suggest_float("meas_std_x_fwd", 0.25, 0.70)
-    params["meas_std_y_lat"] = trial.suggest_float("meas_std_y_lat", 0.25, 0.80)
+    params["slot_s_gate"] = trial.suggest_float("slot_s_gate", 0.3, 0.7)
+    
+    params["prior_sigma_s"] = trial.suggest_float("prior_sigma_s", 0.15, 0.90, log=True)
+    params["prior_sigma_d"] = trial.suggest_float("prior_sigma_d", 0.15, 0.90, log=True)
+    
+    params["init_sigma_s"] = trial.suggest_float("init_sigma_s", 0.1, 0.8, log=True)
+    params["init_sigma_d"] = trial.suggest_float("init_sigma_d", 0.05, 0.5, log=True)
 
-    params["motion_noise.a_trans"] = trial.suggest_float("motion_noise.a_trans", 0.05, 0.35)
-    params["motion_noise.b_trans"] = trial.suggest_float("motion_noise.b_trans", 0.05, 0.35)
-    params["motion_noise.c_lat"] = trial.suggest_float("motion_noise.c_lat", 0.05, 0.30)
-    params["motion_noise.a_rot"] = trial.suggest_float("motion_noise.a_rot", 0.03, 0.12)
-    params["motion_noise.b_rot"] = trial.suggest_float("motion_noise.b_rot", 0.03, 0.15)
+    params["meas_noise_model"] = "polar"
+    params["meas_std_range"] = trial.suggest_float("meas_std_range", 0.05, 0.4, log=True)
+    params["meas_std_bearing"] = trial.suggest_float("meas_std_bearing", 0.01, 0.1, log=True)
 
-    params["prior_sigma_s"] = trial.suggest_float("prior_sigma_s", 0.15, 0.90)
-    params["prior_sigma_d"] = trial.suggest_float("prior_sigma_d", 0.15, 0.90)
-
-    params["template_prior.sigma_s"] = trial.suggest_float("template_prior.sigma_s", 0.30, 0.80)
-    params["template_prior.sigma_d"] = trial.suggest_float("template_prior.sigma_d", 0.10, 0.30)
-    params["template_prior.w"] = trial.suggest_float("template_prior.w", 1.0, 5.0)
-    params["template_prior.decay_k"] = trial.suggest_float("template_prior.decay_k", 0.5, 3.0)
-    params["template_prior.max_seen"] = trial.suggest_int("template_prior.max_seen", 4, 16)
-
-    params["max_back_assoc"] = trial.suggest_categorical("max_back_assoc", [0, 1])
-    params["max_fwd_assoc"] = trial.suggest_categorical("max_fwd_assoc", [1, 2, 3])
-
-    params["maha_gate_median"] = trial.suggest_categorical("maha_gate_median", [0.0, 4.0, 6.0, 8.0])
+    params["spacing_propagation.enable"] = False
+    params["template_prior.enable"] = False
+    params["proposal.enable"] = False
 
     return params
 

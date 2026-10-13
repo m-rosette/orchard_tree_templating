@@ -105,32 +105,82 @@ def popen_cmd(
     )
 
 
-def terminate_process_group(p: subprocess.Popen, *, sig=signal.SIGINT, timeout_s: float = 10.0) -> None:
-    if p.poll() is not None:
-        return
+def _descendant_pids(root_pid: int) -> List[int]:
+    """Walk /proc to find all descendant PIDs of root_pid (Linux only)."""
+    children: Dict[int, List[int]] = {}
     try:
-        os.killpg(os.getpgid(p.pid), sig)
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = Path(f"/proc/{entry.name}/stat").read_text().split()
+                pid, ppid = int(stat[0]), int(stat[3])
+                children.setdefault(ppid, []).append(pid)
+            except Exception:
+                pass
     except Exception:
-        pass
+        return []
+    result: List[int] = []
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        for child in children.get(pid, []):
+            result.append(child)
+            stack.append(child)
+    return result
 
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        if p.poll() is not None:
-            break
-        time.sleep(0.1)
 
-    if p.poll() is None:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except Exception:
-            pass
-
+def _close_log(p: subprocess.Popen) -> None:
     f = getattr(p, "_log_file", None)
     if f is not None:
         try:
             f.close()
         except Exception:
             pass
+
+
+def terminate_process_group(p: subprocess.Popen, *, sig=signal.SIGINT, timeout_s: float = 15.0) -> None:
+    if p.poll() is not None:
+        _close_log(p)
+        return
+
+    # Collect all descendant PIDs before signalling (they may exit and PIDs get recycled).
+    descendants = _descendant_pids(p.pid)
+
+    # 1. SIGINT the whole process group (nodes in the same session).
+    try:
+        os.killpg(os.getpgid(p.pid), sig)
+    except Exception:
+        pass
+
+    # 2. Also signal descendants that ros2 launch spawned in their own sessions
+    #    (they call setsid(), so killpg above misses them).
+    for dpid in descendants:
+        try:
+            os.kill(dpid, sig)
+        except Exception:
+            pass
+
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if p.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    # 3. Force-kill anything still alive.
+    if p.poll() is None:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+    for dpid in descendants:
+        try:
+            os.kill(dpid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    _close_log(p)
 
 
 def ros2_node_list(*, env: Optional[Dict[str, str]] = None) -> List[str]:
@@ -158,6 +208,22 @@ def wait_for_service(service: str, timeout_s: float = 30.0, *, env: Optional[Dic
             p = run_cmd(["ros2", "service", "list"], check=True, capture=True, env=env)
             svcs = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
             if service in svcs:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def wait_for_topic(topic: str, timeout_s: float = 60.0, *, env: Optional[Dict[str, str]] = None) -> bool:
+    """Wait until a topic appears in `ros2 topic list`."""
+    topic = topic if topic.startswith("/") else f"/{topic}"
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            p = run_cmd(["ros2", "topic", "list"], check=True, capture=True, env=env)
+            topics = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+            if topic in topics:
                 return True
         except Exception:
             pass
@@ -759,31 +825,27 @@ def atomic_write_text(path: Path, text: str) -> None:
 def suggest_params(trial) -> Dict[str, Any]:  # "optuna.trial.Trial"
     params: Dict[str, Any] = {}
 
-    params["slot_spacing"] = trial.suggest_float("slot_spacing", 0.8, 1.25)
-    params["slot_s_gate"] = trial.suggest_float("slot_s_gate", 0.3, 0.7)
-
-    params["meas_std_x_fwd"] = trial.suggest_float("meas_std_x_fwd", 0.25, 0.70, log=True)
-    params["meas_std_y_lat"] = trial.suggest_float("meas_std_y_lat", 0.2, 1.2, log=True)
-
-    params["motion_noise.a_trans"] = trial.suggest_float("motion_noise.a_trans", 0.05, 0.35, log=True)
-    params["motion_noise.b_trans"] = trial.suggest_float("motion_noise.b_trans", 0.05, 0.35, log=True)
-    params["motion_noise.c_lat"] = trial.suggest_float("motion_noise.c_lat", 0.05, 0.30, log=True)
+    params["motion_noise.a_trans"] = trial.suggest_float("motion_noise.a_trans", 0.02, 0.25, log=True)
+    params["motion_noise.b_trans"] = trial.suggest_float("motion_noise.b_trans", 0.02, 0.25, log=True)
+    params["motion_noise.c_lat"] = trial.suggest_float("motion_noise.c_lat", 0.03, 0.30, log=True)
     params["motion_noise.a_rot"] = trial.suggest_float("motion_noise.a_rot", 0.03, 0.12, log=True)
     params["motion_noise.b_rot"] = trial.suggest_float("motion_noise.b_rot", 0.03, 0.15, log=True)
 
+    params["slot_s_gate"] = trial.suggest_float("slot_s_gate", 0.5, 0.9)
+    
     params["prior_sigma_s"] = trial.suggest_float("prior_sigma_s", 0.15, 0.90, log=True)
     params["prior_sigma_d"] = trial.suggest_float("prior_sigma_d", 0.15, 0.90, log=True)
+    
+    params["init_sigma_s"] = trial.suggest_float("init_sigma_s", 0.1, 0.8, log=True)
+    params["init_sigma_d"] = trial.suggest_float("init_sigma_d", 0.05, 0.5, log=True)
 
-    params["template_prior.sigma_s"] = trial.suggest_float("template_prior.sigma_s", 0.30, 0.80, log=True)
-    params["template_prior.sigma_d"] = trial.suggest_float("template_prior.sigma_d", 0.10, 0.30, log=True)
-    params["template_prior.w"] = trial.suggest_float("template_prior.w", 1.0, 5.0, log=True)
-    params["template_prior.decay_k"] = trial.suggest_float("template_prior.decay_k", 0.5, 3.0)
-    params["template_prior.max_seen"] = trial.suggest_int("template_prior.max_seen", 4, 16)
+    params["meas_noise_model"] = "polar"
+    params["meas_std_range"] = trial.suggest_float("meas_std_range", 0.05, 0.3, log=True)
+    params["meas_std_bearing"] = trial.suggest_float("meas_std_bearing", 0.01, 0.15, log=True)
 
-    params["max_back_assoc"] = trial.suggest_categorical("max_back_assoc", [0, 1])
-    params["max_fwd_assoc"] = trial.suggest_categorical("max_fwd_assoc", [1, 2, 3])
-
-    params["maha_gate_median"] = trial.suggest_categorical("maha_gate_median", [0.0, 4.0, 6.0, 8.0, 10.0, 12.0])
+    params["spacing_propagation.enable"] = False
+    params["template_prior.enable"] = False
+    params["proposal.enable"] = False
 
     return params
 
@@ -823,9 +885,26 @@ def run_one_optuna_trial(
     slam_pkg, slam_launch_file = args_ns.slam_launch.split()
     slam_cmd = ["ros2", "launch", slam_pkg, slam_launch_file] + list(args_ns.slam_launch_args)
 
+    # ── Launch robot_state_publisher sidecar (same domain as this worker) ──
+    rsp_p: Optional[subprocess.Popen] = None
+    rsp_launch_str = getattr(args_ns, "rsp_launch", "").strip()
+    if rsp_launch_str:
+        rsp_log = trial_dir / "rsp_launch.log"
+        rsp_pkg, rsp_launch_file = rsp_launch_str.split(maxsplit=1)
+        rsp_args = list(getattr(args_ns, "rsp_launch_args", []) or [])
+        rsp_cmd = ["ros2", "launch", rsp_pkg, rsp_launch_file] + rsp_args
+        (trial_dir / "rsp_cmd.txt").write_text(" ".join(rsp_cmd) + "\n")
+        rsp_p = popen_cmd(rsp_cmd, log_path=rsp_log, env=env)
+
     slam_p = popen_cmd(slam_cmd, log_path=slam_log, env=env)
 
     try:
+        # Wait for RSP first (needed before SLAM nodes try to read TF)
+        if rsp_p is not None:
+            rsp_node = getattr(args_ns, "rsp_node", "robot_state_publisher")
+            if not wait_for_node(rsp_node, timeout_s=float(args_ns.wait_node_timeout_s), env=env):
+                raise RuntimeError(f"Timed out waiting for RSP node /{rsp_node}. See {trial_dir / 'rsp_launch.log'}")
+
         if not wait_for_node(args_ns.slam_node, timeout_s=float(args_ns.wait_node_timeout_s), env=env):
             raise RuntimeError(f"Timed out waiting for node {args_ns.slam_node}. See {slam_log}")
 
@@ -835,17 +914,38 @@ def run_one_optuna_trial(
             set_log_lines.append(f"{k}={val}")
         (trial_dir / "param_set.txt").write_text("\n".join(set_log_lines) + "\n")
 
+        # Wait for the full pipeline to be ready before playing the bag.
+        # The dump service appearing means row_fast_slam is fully up.
+        # The trunk_measurements_raw topic appearing means trunk_detection_relay
+        # and trunk_width_estimation are subscribed and ready to receive images.
+        if not wait_for_service(args_ns.dump_service, timeout_s=float(args_ns.wait_node_timeout_s), env=env):
+            raise RuntimeError(f"Dump service {args_ns.dump_service} never appeared. See {slam_log}")
+
+        meas_topic = getattr(args_ns, "meas_ready_topic", "/trunk_measurements_raw")
+        if meas_topic:
+            if not wait_for_topic(meas_topic, timeout_s=float(args_ns.wait_node_timeout_s), env=env):
+                raise RuntimeError(
+                    f"Measurement topic {meas_topic} never appeared after "
+                    f"{args_ns.wait_node_timeout_s}s — trunk_detection_relay or "
+                    f"trunk_width_estimation may have failed to start. See {slam_log}"
+                )
+
         replay_cmd = [
-            "ros2", "run", "tree_template", "bag_data_replayer", "--",
-            "--dataset", str(dataset_dir),
-            "--speed", str(args_ns.speed),
+            "ros2", "bag", "play", str(dataset_dir),
+            "--topics",
+            "/cam_2/color/image_raw",
+            "/camera/aligned_depth_to_color/image_raw",
+            "/camera/color/image_raw",
+            "/fix",
+            "/imu/data",
+            "/odometry/filtered",
+            "--rate", str(args_ns.speed),
+            "--clock"
         ]
         (trial_dir / "replayer_cmd.txt").write_text(" ".join(replay_cmd) + "\n")
         run_cmd(replay_cmd, check=True, capture=False, timeout_s=None, env=env)
 
-        if not wait_for_service(args_ns.dump_service, timeout_s=float(args_ns.dump_timeout_s), env=env):
-            raise RuntimeError(f"Dump service not found: {args_ns.dump_service}")
-
+        # Bag finished — dump service was already confirmed above, call it directly.
         trial_yaml_base = trial_dir / "slam_trunks.yaml"
         append_ts = "true" if bool(args_ns.dump_append_timestamp) else "false"
         payload = "{output_path: '" + str(trial_yaml_base) + "', append_timestamp: " + append_ts + "}"
@@ -934,6 +1034,11 @@ def run_one_optuna_trial(
 
     finally:
         terminate_process_group(slam_p)
+        if rsp_p is not None:
+            terminate_process_group(rsp_p)
+        # Give the ROS middleware a moment to fully deregister nodes/topics
+        # before the next trial starts (avoids stale discovery in the same domain).
+        time.sleep(2.0)
 
 
 # ============================================================
@@ -1195,25 +1300,56 @@ def main() -> None:
 
     ap.add_argument("--slam_launch", default="tree_template trunk_to_template_pub.launch.py",
                     help='Launch target as "package launch_file.py"')
-    ap.add_argument("--slam_launch_args", nargs="*", default=["use_sim_time:=true", "replay:=true"])
+    ap.add_argument("--slam_launch_args", nargs="*", default=["use_sim_time:=true", "replay:=true",
+                                                               "use_gps_fusion:=true"])
+
+    # robot_state_publisher sidecar — launched per-worker in the same domain
+    ap.add_argument("--rsp_launch", default="harvest_hardware_description robot_state_publisher.launch.py",
+                    help='RSP launch target as "package launch_file.py" (empty string to skip)')
+    ap.add_argument("--rsp_launch_args", nargs="*",
+                    default=["use_sim_time:=true", "use_fake_hardware:=true"],
+                    help="Extra args forwarded to the RSP launch")
+    ap.add_argument("--rsp_node", default="robot_state_publisher",
+                    help="Node name to wait for after launching RSP")
+
+    # row_fast_slam sidecar — launched separately since it is commented out of the main launch file
+    ap.add_argument("--fastslam_launch", default="",
+                    help='row_fast_slam launch target as "package launch_file.py" (empty string to skip). '
+                         'Use this when row_fast_slam is not included in --slam_launch.')
+    ap.add_argument("--fastslam_launch_args", nargs="*",
+                    default=["use_sim_time:=true"],
+                    help="Extra args forwarded to the row_fast_slam launch")
 
     ap.add_argument("--settle_s", type=float, default=1.0,
         help="Seconds to wait after dump service returns before reading/scoring the written YAML.")
+    ap.add_argument("--dump_poll_interval_s", type=float, default=2.0,
+        help="How often to retry the dump service if node returns 'No TrunkRegistry received yet'.")
+    ap.add_argument("--dump_poll_max_s", type=float, default=30.0,
+        help="How long to keep polling the dump service after the bag finishes before giving up.")
 
     ap.add_argument("--dump_service", default="/save_slam_results")
     ap.add_argument("--dump_service_type", default="tree_template_interfaces/srv/SaveSlamResults")
     ap.add_argument("--dump_append_timestamp", action="store_true")
     ap.add_argument("--dump_timeout_s", type=float, default=30.0)
+    ap.add_argument("--per_trial_timeout_s", type=float, default=600.0,
+                    help="Maximum wall-clock seconds allowed for a single trial (bag play + scoring). "
+                         "The main process uses this to compute an overall worker deadline and force-kill "
+                         "any worker that exceeds it. Default: 600s (10 min).")
 
     ap.add_argument("--slam_node", default="row_fast_slam")
-    ap.add_argument("--wait_node_timeout_s", type=float, default=40.0)
+    ap.add_argument("--wait_node_timeout_s", type=float, default=60.0,
+                    help="Seconds to wait for each node/service/topic to appear before aborting a trial.")
+    ap.add_argument("--meas_ready_topic", default="/trunk_measurements_raw",
+                    help="Topic to wait for before starting bag playback, confirming the full "
+                         "detection pipeline (trunk_width_estimation + trunk_detection_relay) is live. "
+                         "Pass empty string to skip this check.")
 
     ap.add_argument("--gt_json", required=True)
     ap.add_argument("--anchor_object_number", type=int, default=572)
     ap.add_argument("--anchor_local_tree_id", type=int, default=None)
     ap.add_argument("--use_initial_odom_correction", action="store_true")
     ap.add_argument("--local_frame", choices=["EN", "NE", "WN"], default="EN")
-    ap.add_argument("--yaw_source", choices=["auto", "yaml", "gps", "gps_plus_yaml"], default="auto")
+    ap.add_argument("--yaw_source", choices=["auto", "yaml", "gps", "gps_plus_yaml"], default="gps_plus_yaml")
     ap.add_argument("--ignore_yaml_yaw", action="store_true")
     ap.add_argument("--manual_yaw_rad", type=float, default=None)
 
@@ -1341,11 +1477,39 @@ def main() -> None:
             processes.append(p)
 
         # Monitor and keep writing partial results even if some workers crash.
+        # Per-trial timeout: each trial = bag_duration / speed + startup + teardown.
+        # We give a generous ceiling; if a worker exceeds this it is stuck.
+        per_trial_timeout_s = float(getattr(args, "per_trial_timeout_s", 600.0))
+        n_trials_per_worker = max(counts) if counts else 1
+        worker_timeout_s = per_trial_timeout_s * n_trials_per_worker + 120.0
+
+        deadline = time.time() + worker_timeout_s
         while True:
             do_incremental_aggregate(force=False)
-            if not any(p.is_alive() for p in processes):
+            alive = [p for p in processes if p.is_alive()]
+            if not alive:
+                break
+            if time.time() > deadline:
+                print(f"[WARN] Worker timeout ({worker_timeout_s:.0f}s) exceeded — force-killing {len(alive)} stuck worker(s).")
+                for p in alive:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                # Give them a moment to die then move on.
+                for p in alive:
+                    p.join(timeout=5.0)
                 break
             time.sleep(0.5)
+
+        # Ensure all workers are fully joined before we read scores.
+        for p in processes:
+            p.join(timeout=10.0)
+            if p.is_alive():
+                try:
+                    p.kill()
+                except Exception:
+                    pass
 
         do_incremental_aggregate(force=True)
 
@@ -1366,14 +1530,17 @@ def main() -> None:
                 p.terminate()
             except Exception:
                 pass
+        for p in processes:
+            p.join(timeout=5.0)
         raise
     finally:
         for p in processes:
             if p.is_alive():
                 try:
-                    p.terminate()
+                    p.kill()
                 except Exception:
                     pass
+            p.join(timeout=5.0)
 
     # Final aggregate / print
     scores, scores_by_trial = aggregate_scores(out_root)

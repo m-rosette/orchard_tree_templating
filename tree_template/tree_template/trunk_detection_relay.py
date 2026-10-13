@@ -181,7 +181,8 @@ class TrunkDetectionRelay(Node):
             z_depth = z_depth + radii
 
         # --- Lateral in your message convention ---
-        x = pts[:, 0].astype(np.float64)
+        # x = pts[:, 0].astype(np.float64)
+        x = bottom_pts[:, 0].astype(np.float64)
 
         # Build point in camera OPTICAL frame for TF:
         # Optical: X=RIGHT, Y=DOWN, Z=FORWARD(depth)
@@ -220,6 +221,9 @@ class TrunkDetectionRelay(Node):
                 ti.width = float("nan")
             else:
                 ti.width = float(widths[i])
+
+            ti.cam_lateral = float(x[i])
+            ti.cam_depth = float(z_depth[i])
 
             # --- Side classification (near vs far) based on top vs bottom position in image ---
             # In image coordinates (y increases downward), if top_y < bottom_y, top is higher in image,

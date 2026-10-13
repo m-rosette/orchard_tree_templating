@@ -297,6 +297,11 @@ class SaveBestParticleMap(Node):
             p = t.pose.position
             trees[i] = [float(p.x), float(p.y)]
 
+        # row_fast_slam stamps the locked (or best-effort PCA) row yaw estimate
+        # into every published trunk's orientation when use_global_row_yaw is
+        # enabled — all trunks carry the same value, so the first is enough.
+        row_yaw_rad = _pose_yaw_rad(trunks[0].pose) if trunks else None
+
         init_odom_list = _pose_position_to_list(self._latest_odom_corr_pose)
         init_yaw = _pose_yaw_rad(self._latest_odom_corr_pose)
         robot_path = list(self._robot_path)
@@ -304,6 +309,7 @@ class SaveBestParticleMap(Node):
         data = {
             "initial_odom_correction": init_odom_list,
             "initial_yaw_correction_rad": init_yaw,
+            "row_yaw_rad": row_yaw_rad,
             "initial_gps_fix": _point_to_list(self._latest_gps_fix),
             "final_gps_fix": self._latest_final_gps_list,
             "raw_gps_coords": list(self._raw_gps_readings),
@@ -326,7 +332,8 @@ class SaveBestParticleMap(Node):
             f"Wrote YAML: {out_path} ({len(trees)} trunks, {len(robot_path)} robot poses). "
             f"odom_corr={'yes' if self._latest_odom_corr_pose else 'no'}, "
             f"gps_fix={'yes' if self._latest_gps_fix else 'no'}, "
-            f"final_gps={'yes' if self._latest_final_gps_list else 'no'}."
+            f"final_gps={'yes' if self._latest_final_gps_list else 'no'}, "
+            f"row_yaw={'yes' if row_yaw_rad is not None else 'no'}."
         )
         return res
 
@@ -342,6 +349,7 @@ class SaveBestParticleMap(Node):
         with open(tmp, "w") as f:
             corr = data.get("initial_odom_correction")
             yaw = data.get("initial_yaw_correction_rad")
+            row_yaw = data.get("row_yaw_rad")
             gps = data.get("initial_gps_fix")
             final_gps = data.get("final_gps_fix")
             raw_gps = data.get("raw_gps_coords", [])
@@ -350,6 +358,7 @@ class SaveBestParticleMap(Node):
 
             f.write("initial_odom_correction: " + ("null\n" if corr is None else f"[{corr[0]:.6f}, {corr[1]:.6f}, {corr[2]:.6f}]\n"))
             f.write("initial_yaw_correction_rad: " + ("null\n" if yaw is None else f"{yaw:.8f}\n"))
+            f.write("row_yaw_rad: " + ("null\n" if row_yaw is None else f"{row_yaw:.8f}\n"))
             f.write("initial_gps_fix: " + ("null\n" if gps is None else f"[{gps[0]}, {gps[1]}, {gps[2]}]\n"))
             f.write("final_gps_fix: " + ("null\n" if final_gps is None else f"[{final_gps[0]}, {final_gps[1]}, {final_gps[2]}]\n"))
 
