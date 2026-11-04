@@ -25,7 +25,7 @@ def generate_launch_description():
 
     robot_localization_sensor_fusion_launch = os.path.join(
         get_package_share_directory('tree_template'),
-        'launch', 'gps_fusion.launch.py'
+        'launch', 'gps_fusion_2025.launch.py'
     )
 
     return LaunchDescription([

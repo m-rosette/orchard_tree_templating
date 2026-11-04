@@ -1,0 +1,8 @@
+python3 src/orchard_tree_templating/tree_template/tree_template/fast_slam_rgbd_extraction.py \
+    --yaml /home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_v3/slam_trunks_20260411_102851.yaml \
+    --bag /home/marcus/apple_harvest_ws/data/prosser_depth_recovery/rosbag2_2026_04_10-17_47_36 \
+    --output_dir /home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_w_base_cam \
+    --odom_topic /filter/state \
+    --image_time_offset_s -14027814.013
+
+ros2 run tree_template trellis_from_rgbd_extraction --ros-args -p extraction_dir:=/home/marcus/apple_harvest_ws/data/rgbd_at_trees_oct_2025_w_base_cam
