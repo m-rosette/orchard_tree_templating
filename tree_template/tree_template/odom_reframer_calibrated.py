@@ -35,6 +35,21 @@ class OdomReframer(Node):
         self.declare_parameter("use_now_stamp", False)
         self.declare_parameter("copy_twist", True)
 
+        # --- Sensor model for downstream EKFs (all off by default = previous behaviour) ---
+        # The 2023 Warthog odometry/filtered reports zero pose covariance and its twist disagrees with its own
+        # pose by ~8%. twist_from_pose replaces the output twist with the body-frame velocity of the (pose)
+        # channel over a short window, and twist_cov_* attaches an explicit error model, so an EKF can fuse
+        # velocities only and other sensors (IMU, GPS speed) can actually pull the estimate.
+        self.declare_parameter("twist_from_pose", False)
+        self.declare_parameter("twist_from_pose_window", 5)     # messages (5 @ 50 Hz = 0.1 s)
+        self.declare_parameter("set_twist_cov", False)          # implied by twist_from_pose
+        self.declare_parameter("twist_cov_frac_v", 0.03)        # sigma_v = frac * |v| + floor
+        self.declare_parameter("twist_cov_floor_v", 0.005)      # m/s
+        self.declare_parameter("twist_cov_frac_w", 0.03)        # sigma_w = frac * |w| + floor
+        self.declare_parameter("twist_cov_floor_w", 0.005)      # rad/s
+        self.declare_parameter("pose_cov_xy", -1.0)             # >0: replace pose x,y variance [m^2]
+        self.declare_parameter("pose_cov_yaw", -1.0)            # >0: replace pose yaw variance [rad^2]
+
         # --- GPS additions ---
         self.declare_parameter("gps_topic", "/fix")
         self.declare_parameter("gps_min_status", 0)         # 0=STATUS_FIX, 1=SBAS, 2=GBAS (NavSatStatus)
@@ -58,6 +73,17 @@ class OdomReframer(Node):
 
         self.use_now_stamp = bool(self.get_parameter("use_now_stamp").value)
         self.copy_twist = bool(self.get_parameter("copy_twist").value)
+
+        self.twist_from_pose = bool(self.get_parameter("twist_from_pose").value)
+        self.twist_window = max(1, int(self.get_parameter("twist_from_pose_window").value))
+        self.set_twist_cov = bool(self.get_parameter("set_twist_cov").value) or self.twist_from_pose
+        self.tc_frac_v = float(self.get_parameter("twist_cov_frac_v").value)
+        self.tc_floor_v = float(self.get_parameter("twist_cov_floor_v").value)
+        self.tc_frac_w = float(self.get_parameter("twist_cov_frac_w").value)
+        self.tc_floor_w = float(self.get_parameter("twist_cov_floor_w").value)
+        self.pose_cov_xy = float(self.get_parameter("pose_cov_xy").value)
+        self.pose_cov_yaw = float(self.get_parameter("pose_cov_yaw").value)
+        self._pose_hist: list[tuple[float, float, float, float]] = []  # (t, x, y, yaw) of output poses
 
         # --- GPS state ---
         self.gps_topic = str(self.get_parameter("gps_topic").value)
@@ -116,6 +142,9 @@ class OdomReframer(Node):
             f"  rotate_orientation_only={self.rotate_orientation_only}\n"
             f"  gps_topic={self.gps_topic}\n"
             f"  use_now_stamp={self.use_now_stamp}\n"
+            f"  twist_from_pose={self.twist_from_pose} (window {self.twist_window}), set_twist_cov={self.set_twist_cov} "
+            f"(v: {self.tc_frac_v}*|v|+{self.tc_floor_v}, w: {self.tc_frac_w}*|w|+{self.tc_floor_w}), "
+            f"pose_cov_xy={self.pose_cov_xy}, pose_cov_yaw={self.pose_cov_yaw}\n"
             f"  initial_odom_samples={self.initial_odom_samples}\n"
             f"  initial_gps_samples={self.initial_gps_samples}\n"
             "  initials: publishing once with TRANSIENT_LOCAL durability"
@@ -298,6 +327,47 @@ class OdomReframer(Node):
                 v.y = self._sin_yaw * vx + self._cos_yaw * vy
                 # v.z unchanged for a pure yaw rotation
                 # angular velocity is unaffected by a pure Z rotation
+
+        if self.pose_cov_xy > 0.0 or self.pose_cov_yaw > 0.0:
+            pc = list(out.pose.covariance)
+            if self.pose_cov_xy > 0.0:
+                pc[0] = pc[7] = self.pose_cov_xy
+            if self.pose_cov_yaw > 0.0:
+                pc[35] = self.pose_cov_yaw
+            out.pose.covariance = pc
+
+        if self.twist_from_pose:
+            # difference over the INPUT header stamps (sensor time): with use_now_stamp the output stamp is the
+            # receive time, which jitters with transport/bag-playback bunching and biases v = dp/dt upward
+            t_now = float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
+            yaw_now = self._quat_to_yaw(q_out)
+            self._pose_hist.append((t_now, float(pos_out[0]), float(pos_out[1]), yaw_now))
+            if len(self._pose_hist) > self.twist_window + 1:
+                self._pose_hist.pop(0)
+            t0, x0, y0, yaw0 = self._pose_hist[0]
+            dt = t_now - t0
+            if dt > 1e-4:
+                dyaw = math.atan2(math.sin(yaw_now - yaw0), math.cos(yaw_now - yaw0))
+                ym = yaw0 + 0.5 * dyaw
+                dxw, dyw = float(pos_out[0]) - x0, float(pos_out[1]) - y0
+                vx = (math.cos(ym) * dxw + math.sin(ym) * dyw) / dt
+                vy = (-math.sin(ym) * dxw + math.cos(ym) * dyw) / dt
+                w = dyaw / dt
+            else:
+                vx = vy = w = 0.0
+            out.twist.twist.linear.x, out.twist.twist.linear.y, out.twist.twist.linear.z = vx, vy, 0.0
+            out.twist.twist.angular.x, out.twist.twist.angular.y, out.twist.twist.angular.z = 0.0, 0.0, w
+
+        if self.set_twist_cov:
+            vx = float(out.twist.twist.linear.x)
+            w = float(out.twist.twist.angular.z)
+            sv = self.tc_frac_v * abs(vx) + self.tc_floor_v
+            sw = self.tc_frac_w * abs(w) + self.tc_floor_w
+            tc = [0.0] * 36
+            tc[0] = tc[7] = sv * sv
+            tc[14] = tc[21] = tc[28] = 1e-6
+            tc[35] = sw * sw
+            out.twist.covariance = tc
 
         self.pub.publish(out)
 

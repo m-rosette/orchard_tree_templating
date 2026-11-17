@@ -1,0 +1,13 @@
+# navsat_transform for mode gps_heading: heading comes from /gps/course_imu (GPS course, already ENU, 0 = east),
+# odometry input is /odometry/global, fix input /fix_rtk (remaps in gps_fusion.launch.py). No dataset-specific yaw_offset.
+navsat_transform:
+  ros__parameters:
+    frequency: 10.0
+    delay: 0.0
+    gps_topic: /fix_rtk            # informational: actual topics are set by remaps in gps_fusion.launch.py
+    imu_topic: /gps/course_imu
+    odom_topic: /odometry/global
+    output_topic: /odometry/gps
+    use_odometry_yaw: false
+    magnetic_declination_radians: 0.0
+    yaw_offset: 0.0

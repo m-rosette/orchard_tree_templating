@@ -43,6 +43,10 @@ class TrunkDetectionRelay(Node):
 
         # Optional measurement tweak
         self.declare_parameter("use_trunk_width_addition", True)
+        # Which detector point is the trunk position:
+        #   bottom: bottom-most mask row (bottom_xs / bottom_ys) - one pixel row, noisier
+        #   mask:   whole mask (xs / ys) - median mask column at the trunk-body depth percentile
+        self.declare_parameter("position_source", "bottom")
 
         # Filtering
         self.declare_parameter("min_trunk_width", 0.03)     # meters; 0 disables
@@ -69,6 +73,9 @@ class TrunkDetectionRelay(Node):
         self.output_topic = str(self.get_parameter("output_topic").value)
 
         self.use_trunk_width_addition = bool(self.get_parameter("use_trunk_width_addition").value)
+        self.position_source = str(self.get_parameter("position_source").value).strip().lower()
+        if self.position_source not in ("bottom", "mask"):
+            raise ValueError(f"position_source must be 'bottom' or 'mask', got {self.position_source!r}")
 
         self.min_trunk_width = float(self.get_parameter("min_trunk_width").value)
         self.required_class = int(self.get_parameter("required_class").value)
@@ -174,15 +181,16 @@ class TrunkDetectionRelay(Node):
 
         n = int(pts.shape[0])
 
+        pos_pts = pts if self.position_source == "mask" else bottom_pts
+
         # --- Depth/radius tweak on DEPTH ---
-        z_depth = bottom_pts[:, 1].astype(np.float64)
+        z_depth = pos_pts[:, 1].astype(np.float64)
         if self.use_trunk_width_addition and widths is not None:
             radii = widths.astype(np.float64) * 0.5
             z_depth = z_depth + radii
 
         # --- Lateral in your message convention ---
-        # x = pts[:, 0].astype(np.float64)
-        x = bottom_pts[:, 0].astype(np.float64)
+        x = pos_pts[:, 0].astype(np.float64)
 
         # Build point in camera OPTICAL frame for TF:
         # Optical: X=RIGHT, Y=DOWN, Z=FORWARD(depth)
@@ -203,6 +211,14 @@ class TrunkDetectionRelay(Node):
 
         lat_sign = -1.0 if self.base_x_is_right else 1.0
 
+        # Stamp measurements with the image time, not the time detection finished. The detector
+        # lags the camera by ~1.2 s (more under CPU load, and the lag can grow during a run); with a
+        # now() stamp SLAM looks up the odom pose that much later and the row gets compressed.
+        if msg.header.stamp.sec != 0 or msg.header.stamp.nanosec != 0:
+            meas_stamp = msg.header.stamp
+        else:
+            meas_stamp = self.get_clock().now().to_msg()
+
         for i in range(n):
             ti = TrunkInfo()
             ti.pose = Pose()
@@ -210,7 +226,7 @@ class TrunkDetectionRelay(Node):
             bx = float(p_base[i, 0])
             by = float(p_base[i, 1])
 
-            ti.stamp = self.get_clock().now().to_msg()
+            ti.stamp = meas_stamp
 
             ti.pose.position.x = bx
             ti.pose.position.y = lat_sign * by

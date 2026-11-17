@@ -38,6 +38,8 @@ setup(
             'save_best_particle_map = tree_template.save_best_particle_map:main',
             'fast_slam_rgbd_extraction = tree_template.fast_slam_rgbd_extraction:main',
             'trellis_from_rgbd_extraction = tree_template.trellis_from_rgbd_extraction:main',
+            'fix_cov_relay = tree_template.fix_cov_relay:main',
+            'gps_course_heading = tree_template.gps_course_heading:main',
         ],
     },
 )

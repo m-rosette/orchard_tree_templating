@@ -1,0 +1,20 @@
+# Parameters for the helper nodes of gps_fusion.launch.py mode:=gps_heading
+fix_cov_relay:
+  ros__parameters:
+    input_topic: /fix
+    output_topic: /fix_rtk
+    sigma_m: 0.05          # measured RTK noise ~2-3 cm; Reach publishes a ~1 m placeholder
+    min_status: 0
+    stamp_shift_s: 0.0     # GPS latency / clock offset (0 with synchronised clocks)
+gps_course_heading:
+  ros__parameters:
+    fix_topic: /fix_rtk
+    odom_topic: /odometry/wheel
+    output_topic: /gps/course_imu
+    frame_id: amiga__base
+    baseline_m: 1.5
+    max_dt_s: 12.0
+    sigma_pos_m: 0.025
+    floor_deg: 0.5
+    max_turn_deg: 3.0
+    min_speed: 0.05

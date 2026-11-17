@@ -25,7 +25,7 @@ def generate_launch_description():
 
     robot_localization_sensor_fusion_launch = os.path.join(
         get_package_share_directory('tree_template'),
-        'launch', 'gps_fusion_2025.launch.py'
+        'launch', 'gps_fusion.launch.py'
     )
 
     return LaunchDescription([
@@ -39,6 +39,13 @@ def generate_launch_description():
             "use_gps_fusion",
             default_value="false",
             description="Use robot localization package to fuse IMU and GPS signals",
+        ),
+
+        DeclareLaunchArgument(
+            "gps_fusion_mode",
+            default_value="legacy",
+            description="gps_fusion.launch.py mode: legacy | gps_heading (GPS course heading + GPS position in "
+                        "ekf_global; needs odom_reframer twist_from_pose: true, use_now_stamp: false)",
         ),
 
         DeclareLaunchArgument(
@@ -79,6 +86,7 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(robot_localization_sensor_fusion_launch),
             launch_arguments={
                 'use_sim_time': use_sim_time,
+                'mode': LaunchConfiguration("gps_fusion_mode"),
             }.items(),
             condition=IfCondition(use_gps_fusion),
         ),

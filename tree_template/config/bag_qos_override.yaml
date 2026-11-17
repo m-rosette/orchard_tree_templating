@@ -1,0 +1,6 @@
+# QoS overrides for replaying ROS1-converted bags (no offered_qos_profiles recorded).
+# Usage: ros2 bag play <bag> --clock --qos-profile-overrides-path <this file>
+/tf_static:
+  history: keep_all
+  reliability: reliable
+  durability: transient_local

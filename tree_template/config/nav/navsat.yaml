@@ -17,7 +17,7 @@ navsat_transform:
 
     # Set these if you have a magnetometer / know declination & offsets.
     magnetic_declination_radians: 0.0
-    yaw_offset: 0.0
+    yaw_offset: 2.53   # aligns /odometry/gps with /odometry/local on the 2023 bag (was 145 deg off); IMU yaw is not north-referenced, re-check per dataset
 
     # In ROS 2 you may also see/need this depending on distro/version:
     # broadcast_utm_transform: false
