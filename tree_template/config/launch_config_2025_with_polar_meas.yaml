@@ -25,28 +25,28 @@ trunk_detection_relay:
 
 row_fast_slam:
   ros__parameters:
-    num_particles: 3000
+    num_particles: 1500
     measurement_topic: /trunk_measurements_raw
-    odom_topic: /odometry/global   # trunk_to_template_pub.launch.py overrides this (launch arg slam_odom_topic)
+    odom_topic: /odometry/local   # trunk_to_template_pub.launch.py overrides this (launch arg slam_odom_topic)
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
  
     # Slot initialization (map init)
-    slot_spacing: 1.42
-    num_slots: 30
+    slot_spacing: 0.5842
+    num_slots: 50
     exceed_slot_num: true
     max_extra_slots: 20  
     row_origin_s: 0.0
-    slot_s_gate: 0.4
+    slot_s_gate: 0.3
  
     row_origin_x: .nan
     row_origin_y: .nan
     row_dir_sign: -1
     row_yaw_init_window: 25
-    min_seen_count_to_publish: 5
+    min_seen_count_to_publish: 6   # detections a landmark needs before the registry includes it
     use_template_map: true
     template_origin_from_first_measurement: true
-    template_origin_min_hits: 5
+    template_origin_min_hits: 6
     publish_unseen_template_landmarks: false
     use_global_row_yaw: true
  
@@ -66,6 +66,23 @@ row_fast_slam:
     max_back_assoc: 0
     max_fwd_assoc: 2
     widen_init_assoc: false
+
+    # Short-term track layer: one identity per tree. A second, different tree in a used slot gets its own landmark.
+    assoc.track_layer.enable: true
+    assoc.track_layer.link_gate_m: 0.20        # [m] odom-frame gate to link a detection to a track
+    assoc.track_layer.max_gap_sec: 1.0         # [s] a track ends after this time with no detection
+    assoc.track_layer.width_break_m: 0.015     # [m] no link if the width is different from the track width by more
+    assoc.track_layer.width_min_samples: 3     # widths a track needs before the width check applies
+    assoc.track_layer.min_tree_sep_m: 0.30     # [m] tracks this far apart or more are different trees
+    assoc.track_layer.width_sep_m: 0.15        # [m] or this far apart or more, if the widths are different
+    assoc.track_layer.width_distinct_m: 0.010  # [m] width difference that counts as different
+    assoc.track_layer.split_min_hits: 3        # detections a track needs before it gets its own landmark
+    # Trunk-width term in the particle weights: a penalty when the detection width and the landmark width are different
+    assoc.width_lik.enable: false
+    assoc.width_lik.sigma_m: 0.004       # [m] width noise
+    assoc.width_lik.weight: 1.0
+    assoc.width_lik.max_pen: 4.0         # cap on 0.5*(dw/sigma)^2, so one bad width cannot remove a particle
+    assoc.width_lik.min_samples: 3       # widths a landmark needs before the term applies
  
     # Trunk row side classification
     start_side: near
@@ -83,8 +100,8 @@ row_fast_slam:
     meas_std_x_fwd: 0.6
  
     # Used when meas_noise_model: polar
-    meas_std_range:   0.10   # [m] range standard deviation
-    meas_std_bearing: 0.1   # [rad] bearing standard deviation
+    meas_std_range:   0.20   # [m] range standard deviation
+    meas_std_bearing: 0.20   # [rad] bearing standard deviation
  
     meas_fwd_gate: 1.2
 
@@ -140,13 +157,13 @@ row_fast_slam:
  
     # FastSLAM 2.0: pose proposal from the measurement
     proposal.enable: true
-    proposal.min_pose_std_range:   0.003   # [m] range floor (limits along-row drift)
+    proposal.min_pose_std_range:   0.003    # [m] range floor (limits along-row drift)
     proposal.min_pose_std_bearing: 0.003   # [rad] bearing floor (lateral correction)
     proposal.min_pose_std_yaw: 0.001   # [rad]
     proposal.max_correction_xy: 0.06    # [m] maximum pose correction per step
     proposal.max_correction_yaw: 0.04   # [rad] maximum pose correction per step
     proposal.zombie_maha_threshold: 20.0 # the proposal does not move particles with Mahalanobis^2 above this
-    proposal.min_landmark_seen: 5 # observations a landmark needs for the proposal (below: standard update)
+    proposal.min_landmark_seen: 8 # observations a landmark needs for the proposal (below: standard update)
     proposal.max_odom_steps: 10 # cap on the odom steps that scale the pose prior uncertainty
  
     # Template soft prior (weight update per landmark)
@@ -178,14 +195,14 @@ row_fast_slam:
  
     # Message lag
     meas_max_lag_sec: 2.0
-    odom_history_sec: 2.0
+    odom_history_sec: 5.0   # [s] odometry kept for late measurements (they carry the image time, 1-3 s old)
  
     # Debugging
     debug.csv_enable: true
     debug.log_every_n_meas: 0
     # Debug CSVs (+ _landmarks.csv, _tracks.csv), rewritten each run. Default: tree_template/debug_data/ in the
     # package source folder. Remove the # to set a different path (a robot config value wins over this file):
-    # debug.csv_path: /path/to/debug_data/fastslam_debug.csv
+    debug.csv_path: /home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
     debug.csv_flush_every_n: 1
     debug.print_measurement_stamp: false
 
@@ -195,7 +212,7 @@ odom_reframer:
     odom_frame: odom
     publish_tf: false
 
-    recenter: true
+    recenter: false
 
     rotate_pos_deg: 180.0
     rotate_yaw_deg: 0.0
@@ -203,12 +220,22 @@ odom_reframer:
 
     use_now_stamp: true
     copy_twist: true
+    # twist_from_pose: publish the body velocity of the pose, with sigma = frac * |v| + floor. The Warthog odometry
+    # has zero pose covariance, and its twist does not agree with its pose. The gps_heading global EKF fuses this
+    # velocity. trunk_to_template_pub.launch.py sets twist_from_pose (true only while that EKF runs).
+    twist_from_pose: true
+    twist_from_pose_window: 5
+    twist_cov_frac_v: 0.03
+    twist_cov_floor_v: 0.005
+    twist_cov_frac_w: 0.03
+    twist_cov_floor_w: 0.005
 
     gps_min_status: 0
     gps_require_finite_cov: false
 
     initial_odom_samples: 25
     initial_gps_samples: 5
+
 
 slam_odom_correction_tf:
   ros__parameters:
@@ -262,12 +289,12 @@ trellis_from_rgbd_extraction:
     anchor_tree_id: -1
     trellis_side: far
     registry_topic: fastslam_registry
-    max_correction_m: 2.0        # [m] max anchor shift of a correction
-    # /correct_template_anchor (see trellis_from_rgbd_extraction.py)
-    frame_offsets: [-2, -1, 0, 1, 2]          # base-camera buffer frames
+    max_correction_m: 2.0                 # [m] max anchor shift of a correction
+    # /correct_template_anchor
+    frame_offsets: [-2, -1, 0, 1, 2]      # base-camera frames
     frame_select_service: /apple_prediction/set_parameters
     frame_select_param: presaved_images.base_cam_frame_index
     trigger_service: /trigger_estimation
-    cluster_eps_m: 0.10                       # [m] one object in several frames
-    association_gate_m: 0.35                  # [m] object <-> map trunk
+    cluster_eps_m: 0.10                   # [m] max distance between detections of one object
+    association_gate_m: 0.35              # [m] max distance object -> map trunk
     max_yaw_correction_deg: 5.0

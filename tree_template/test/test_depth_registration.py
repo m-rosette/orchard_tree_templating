@@ -1,5 +1,5 @@
 """
-Checks for depth_registration and the extraction pose helpers (no ROS, no bag).
+Checks for depth_registration and the extraction pose helpers (no bag).
 
 Run: python3 -m pytest test/test_depth_registration.py -v
 """
@@ -71,24 +71,26 @@ def test_rotvec():
     np.testing.assert_allclose(rotation_from_rotvec([0, 0, 0]), np.eye(3))
 
 
-rclpy = pytest.importorskip("rclpy")       # fast_slam_rgbd_extraction imports the ROS serialization
+def test_interp_pose_unwraps_yaw():
+    from tree_template.odom_alignment import interp_pose
+    path = np.array([[0.0, 0.0, 0.0, 10.0], [6.0, 0.0, 3.1, 12.0], [7.0, 0.0, -3.1, 13.0]])
+    assert interp_pose(path, 11.0)[0, 0] == pytest.approx(3.0)
+    assert abs(abs(interp_pose(path, 12.5)[0, 2]) - np.pi) < 0.05     # through pi, not through 0
+    np.testing.assert_allclose(interp_pose(path, 9.0)[0], path[0, :3])  # before the path: first pose
 
 
-def test_last_pose_per_stamp_and_interp():
-    from tree_template.fast_slam_rgbd_extraction import interp_robot_pose, last_pose_per_stamp
-    path = np.array([
-        [0.0, 0.0, 0.0, 10.0],
-        [1.0, 0.0, 0.0, 11.0],
-        [5.0, 0.0, 0.0, 11.0],      # best particle changed at t=11: this pose wins
-        [6.0, 0.0, 3.1, 12.0],
-        [7.0, 0.0, -3.1, 13.0],     # yaw crosses +-pi
-    ])
+rclpy = pytest.importorskip("rclpy")       # fast_slam_rgbd_extraction imports ROS modules
+
+
+def test_last_pose_per_stamp():
+    from tree_template.fast_slam_rgbd_extraction import last_pose_per_stamp
+    path = np.array([[0.0, 0, 0, 10.0], [1.0, 0, 0, 11.0], [5.0, 0, 0, 11.0], [6.0, 0, 0, 12.0]])
     clean = last_pose_per_stamp(path)
-    assert clean[:, 3].tolist() == [10.0, 11.0, 12.0, 13.0]
-    assert clean[1, 0] == 5.0
-    pose, ok = interp_robot_pose(clean, 11.5)
-    assert ok and pose[0] == pytest.approx(5.5)
-    pose, ok = interp_robot_pose(clean, 12.5)
-    assert abs(abs(pose[2]) - np.pi) < 0.05          # through pi, not through 0
-    _, ok = interp_robot_pose(clean, 9.0)
-    assert not ok
+    assert clean[:, 3].tolist() == [10.0, 11.0, 12.0] and clean[1, 0] == 5.0   # last pose of a stamp
+
+
+def test_tree_in_robot_frames():
+    from tree_template.fast_slam_rgbd_extraction import tree_in_robot_frames
+    poses = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.pi / 2]])
+    np.testing.assert_allclose(tree_in_robot_frames(poses, np.array([1.0, 2.0])), [[1.0, 2.0], [2.0, -1.0]],
+                               atol=1e-12)

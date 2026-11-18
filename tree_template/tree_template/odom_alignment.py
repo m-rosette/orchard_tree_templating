@@ -1,27 +1,23 @@
 """
 odom_alignment.py
 
-Puts the robot odometry into the SLAM world frame, near one time, so the broadside pose of a tree comes from a
-smooth trajectory. This module does not import ROS.
+Puts the robot odometry into the SLAM world frame near one time, so the broadside pose of a tree comes from a
+smooth trajectory. No ROS imports.
 
-Why: save_best_particle_map records /odom_slam_best, the pose of the best particle at each moment. When a different
-particle becomes the best one, the pose jumps (more than 1 m in the saved runs). The odometry is smooth but drifts
-and is in its own frame. Near one time, a rigid 2-D transform (rotation + translation) maps the odometry onto the
-SLAM path. A trimmed fit ignores the jumps.
+The SLAM robot_path (/odom_slam_best) is the pose of the best particle at each time and jumps when the best particle
+changes. Near one time, a trimmed rigid 2-D fit maps the odometry onto the path and ignores the jumps.
 
-Arrays:
-    path   (N, 4) [x, y, yaw, t]  SLAM robot_path (world frame, SLAM clock)
-    odom   (M, 4) [x, y, yaw, t]  odometry (odometry frame, odometry clock: t_odom = t_slam + time_offset)
-
-time_offset cannot be found from the path: the path scatter (about 0.5 m RMS in the saved runs) is larger than the
-motion in the offset range. When SLAM ran on a bag replay with the bag clock, /odom_slam_best has the stamps of the
-odometry it used, and with the odometry time = bag receive time the offset is 0.
+Arrays (rows [x, y, yaw, t]):
+    path  SLAM robot_path: world frame, SLAM clock
+    odom  odometry: odometry frame, odometry clock (t_odom = t_slam + time_offset; 0 for SLAM on a replay of the
+          same bag with the bag clock)
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from scipy.interpolate import interp1d
 from skimage.transform import EuclideanTransform
 
 from tree_template.trellis_geometry import pose_tf
@@ -31,13 +27,16 @@ def _wrap(a):
     return (np.asarray(a) + np.pi) % (2 * np.pi) - np.pi
 
 
-def interp_xy(odom: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Odometry x, y at times t (linear)."""
-    return np.stack([np.interp(t, odom[:, 3], odom[:, 0]), np.interp(t, odom[:, 3], odom[:, 1])], axis=1)
-
-
-def interp_yaw(odom: np.ndarray, t) -> np.ndarray:
-    return _wrap(np.interp(t, odom[:, 3], np.unwrap(odom[:, 2])))
+def interp_pose(poses: np.ndarray, t) -> np.ndarray:
+    """
+    (K, 3) [x, y, yaw] of poses (rows [x, y, yaw, t], t increasing) at times t: linear, yaw unwrapped.
+    Outside the time range: the first or last pose.
+    """
+    v = np.column_stack([poses[:, 0], poses[:, 1], np.unwrap(poses[:, 2])])
+    f = interp1d(poses[:, 3], v, axis=0, bounds_error=False, fill_value=(v[0], v[-1]), assume_sorted=True)
+    out = np.atleast_2d(f(np.atleast_1d(t)))
+    out[:, 2] = _wrap(out[:, 2])
+    return out
 
 
 @dataclass
@@ -46,7 +45,7 @@ class LocalFit:
     rms_inlier_m: float        # RMS residual of the inliers
     n_used: int
     n_inliers: int
-    span_m: float              # travel distance inside the window (a short span makes the rotation weak)
+    span_m: float              # odometry travel in the window
 
     @property
     def theta(self) -> float:
@@ -68,10 +67,9 @@ def robust_local_fit(
     iters: int = 4,
 ) -> Optional[LocalFit]:
     """
-    Fit odometry -> world from the SLAM path poses in [t_center - window_s, t_center + window_s].
-    If theta is given, fit only the translation (with that rotation).
-    Trimmed: after each fit, drop the poses with residual > max(3 * median residual, 5 cm).
-    Return None if there are too few path poses, or the odometry does not cover the window.
+    Fit odometry -> world to the path poses within window_s of t_center. With theta: translation only.
+    After each fit, poses with residual > max(3 * median residual, 5 cm) are dropped (iters times).
+    Return None if fewer than min_points path poses have odometry.
     """
     m = np.abs(path[:, 3] - t_center) <= window_s
     t_odom = path[m, 3] + time_offset
@@ -80,7 +78,7 @@ def robust_local_fit(
     m_idx, t_odom = m_idx[cover], t_odom[cover]
     if m_idx.size < min_points:
         return None
-    A = interp_xy(odom, t_odom)
+    A = interp_pose(odom, t_odom)[:, :2]
     B = path[m_idx, :2]
 
     def fit(k) -> EuclideanTransform:
@@ -107,11 +105,10 @@ def robust_local_fit(
 def world_poses(fit: LocalFit, odom: np.ndarray, t_odom: np.ndarray, odom_to_base_yaw: float) -> np.ndarray:
     """
     (K, 3) world [x, y, yaw] of the robot base at odometry times t_odom.
-    yaw = odometry yaw + fit.theta + odom_to_base_yaw (the base frame yaw from the odometry child frame).
+    odom_to_base_yaw: yaw of the base frame in the odometry child frame.
     """
-    xy = fit.tf(interp_xy(odom, t_odom))
-    yaw = _wrap(interp_yaw(odom, t_odom) + fit.theta + odom_to_base_yaw)
-    return np.column_stack([xy, yaw])
+    p = interp_pose(odom, t_odom)
+    return np.column_stack([fit.tf(p[:, :2]), _wrap(p[:, 2] + fit.theta + odom_to_base_yaw)])
 
 
 def broadside_from_odom(
@@ -126,14 +123,11 @@ def broadside_from_odom(
     search_s: float = 5.0,
 ):
     """
-    Broadside pose of one tree from the odometry, then the time in [t_guess - search_s, t_guess + search_s]
-    (SLAM clock) where the tree is straight to the side of the robot (fwd = 0).
-
-    Two-stage fit around t_guess: the rotation from +/- rotation_window_s (the odometry yaw drifts slowly, and a
-    short window has too little travel for a good rotation against the path noise), then the translation from
+    Broadside pose of one tree: the world pose (from the odometry) at the time within search_s of t_guess (SLAM
+    clock) where the tree is straight to the side of the robot (fwd = 0).
+    The fit has two stages: the rotation from +/- rotation_window_s (more travel), then the translation from
     +/- window_s.
-
-    Return dict(pose_xyt, t_slam, fwd, lat, fit, theta_fit) or None if a fit fails.
+    Return dict(pose_xyt, t_slam, fwd, lat, fit, theta_fit), or None if a fit fails.
     """
     rot = robust_local_fit(path, odom, time_offset, t_guess, rotation_window_s)
     if rot is None:
@@ -145,15 +139,14 @@ def broadside_from_odom(
     t_odom = odom[sel, 3]
     if t_odom.size < 2:
         return None
-    P = world_poses(fit, odom, t_odom, odom_to_base_yaw)
-    # Tree in the robot base frame at each odometry sample: x = fwd, y = lat
-    fwd = np.array([pose_tf(*p).inverse([tree_xy])[0, 0] for p in P])
-    # fwd crosses 0 between two odometry samples: interpolate the time of the crossing
+    # fwd: x of the tree in the robot base frame at each odometry sample
+    fwd = np.array([pose_tf(*p).inverse([tree_xy])[0, 0] for p in world_poses(fit, odom, t_odom, odom_to_base_yaw)])
+    # Time of the sign change of fwd next to the smallest |fwd| (linear between the two samples)
     k = int(np.argmin(np.abs(fwd)))
     t_best = t_odom[k]
     for j in (k - 1, k):
         if 0 <= j < len(fwd) - 1 and fwd[j] * fwd[j + 1] <= 0 and fwd[j] != fwd[j + 1]:
-            t_best = float(np.interp(0.0, sorted(fwd[j:j + 2]), t_odom[j:j + 2][np.argsort(fwd[j:j + 2])]))
+            t_best = t_odom[j] + fwd[j] / (fwd[j] - fwd[j + 1]) * (t_odom[j + 1] - t_odom[j])
             break
     pose = world_poses(fit, odom, np.array([t_best]), odom_to_base_yaw)[0]
     fwd_b, lat_b = pose_tf(*pose).inverse([tree_xy])[0]

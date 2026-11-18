@@ -1,18 +1,13 @@
 """
 trellis_geometry.py
 
-Pure functions that put the trunks of a saved SLAM map into the local frame of one anchor tree.
-This module does not import ROS, so tests and offline tools can use it. 2-D poses and rigid transforms are
-skimage.transform.EuclideanTransform objects (pose_tf).
+Functions that put the trunks of a saved SLAM map into the local frame of one anchor tree, and correct the map
+from trunk detections. No ROS imports. 2-D poses are skimage EuclideanTransform objects (pose_tf).
 
 Local frame:
-    origin  the robot pose when the anchor tree was broadside (broadside_robot_pose_xyt)
-    +X      along the row (the world positions are de-rotated by row_yaw)
-    +Y      to the left of the robot
-
-The anchor trunk is at (fwd_dist_to_tree_m, lat_dist_to_tree_m) from its meta.yaml when row_yaw is the
-broadside yaw of the anchor. When row_yaw is the run-wide SLAM row yaw, the anchor is at that point rotated
-by (broadside_yaw - row_yaw).
+    origin  robot position when the anchor tree was broadside (broadside_robot_pose_xyt)
+    +X      along the row (rotation -row_yaw from the world frame)
+    +Y      left of the robot
 """
 
 import glob
@@ -47,33 +42,18 @@ def load_meta_yamls(extraction_dir: str) -> Dict[int, dict]:
 
 
 def extract_world_xy(meta: dict) -> np.ndarray:
-    """Return the trunk [x, y] in the SLAM world frame (key tree_world_xy_m)."""
-    wp = meta.get("tree_world_xy_m")
-    if wp is None:
-        raise KeyError(f"meta.yaml for tree {meta.get('tree_id')} missing 'tree_world_xy_m'")
-    return np.array([float(wp[0]), float(wp[1])], dtype=np.float64)
-
-
-def extract_world_z(meta: dict) -> float:
-    """fast_slam_rgbd_extraction does not save a trunk z. All trunks are at ground level."""
-    return 0.0
+    """Trunk [x, y] in the SLAM world frame (tree_world_xy_m)."""
+    return np.asarray(meta["tree_world_xy_m"][:2], dtype=np.float64)
 
 
 def find_slam_results_yaml(extraction_dir: str) -> str:
-    """
-    Return the slam_trunks_*.yaml file in extraction_dir (save_best_particle_map.py writes it).
-    If there are more than one, return the newest name (the names contain the date and time).
-    Return "" if there is none.
-    """
+    """The slam_trunks_*.yaml file in extraction_dir with the latest name (date and time), or ""."""
     paths = sorted(glob.glob(os.path.join(extraction_dir, "slam_trunks_*.yaml")))
     return paths[-1] if paths else ""
 
 
 def load_global_row_yaw(slam_results_yaml: str) -> Optional[float]:
-    """
-    Return row_yaw_rad from the yaml that save_best_particle_map.py writes.
-    Return None if the path is empty or missing, or the field is missing, null or not finite.
-    """
+    """row_yaw_rad from a save_best_particle_map.py yaml, or None if the file or a finite value is missing."""
     if not slam_results_yaml:
         return None
     p = Path(slam_results_yaml).expanduser()
@@ -94,12 +74,8 @@ def anchor_transform(
     global_row_yaw: Optional[float] = None,
 ) -> Tuple[np.ndarray, float]:
     """
-    Return the local frame of the anchor tree:
-
-    robot_origin_xy  (2,) world-frame robot position when the anchor tree was broadside
-    row_yaw          yaw (rad) that de-rotates the world positions, so the row is along local +X.
-                     global_row_yaw (the run-wide SLAM estimate) if it is set, otherwise the broadside yaw
-                     of the anchor tree.
+    Local frame of the anchor tree: (robot_origin_xy, row_yaw).
+    row_yaw is global_row_yaw (SLAM row yaw of the run) if it is set, otherwise the broadside yaw of the anchor.
     """
     if anchor_id not in tree_data:
         raise ValueError(
@@ -127,13 +103,7 @@ def local_positions(
     anchor_id: int,
     global_row_yaw: Optional[float] = None,
 ) -> Tuple[List[int], np.ndarray, List[int]]:
-    """
-    Return the local (x, y) of all trees that have a world position, in tree_id order.
-
-    ids      tree ids, one for each row of xy
-    xy       (N, 2) local positions
-    skipped  tree ids without tree_world_xy_m
-    """
+    """(ids, (N, 2) local xy, skipped ids) of the trees, in tree id order. Skipped: no tree_world_xy_m."""
     robot_origin_xy, row_yaw = anchor_transform(tree_data, anchor_id, global_row_yaw)
     ids = [t for t in sorted(tree_data) if "tree_world_xy_m" in tree_data[t]]
     skipped = [t for t in sorted(tree_data) if t not in ids]
@@ -142,10 +112,7 @@ def local_positions(
 
 
 def expected_anchor_local(meta: dict, row_yaw: float) -> np.ndarray:
-    """
-    Return the local (x, y) that the anchor trunk must have, from its meta.yaml:
-    R(broadside_yaw - row_yaw) @ (fwd_dist_to_tree_m, lat_dist_to_tree_m).
-    """
+    """Local (x, y) of the anchor from its meta.yaml: (fwd, lat) rotated by broadside_yaw - row_yaw."""
     broadside_yaw = float(meta["broadside_robot_pose_xyt"][2])
     fl = [[float(meta["fwd_dist_to_tree_m"]), float(meta["lat_dist_to_tree_m"])]]
     return EuclideanTransform(rotation=broadside_yaw - row_yaw)(fl)[0]
@@ -162,11 +129,10 @@ def frame_poses_local(
     row_yaw: float,
 ) -> Dict[int, Tuple[EuclideanTransform, str]]:
     """
-    For each saved frame of camera cam (buffer frames, or the single frame as index 0): (transform robot base
-    frame of that image -> local frame, source).
-
-    source "world_pose": from world_pose_xyt (fast_slam_rgbd_extraction --broadside_source odom).
-    source "broadside":  the frame has no world pose (older extraction); the broadside pose is used.
+    {frame index: (transform robot base frame of that image -> local frame, source)} for the saved frames of
+    camera cam (a single-frame camera has index 0).
+    source "world_pose": world_pose_xyt of the frame. "broadside": the frame has no world_pose_xyt, so the
+    broadside pose is used.
     """
     bs = meta.get("broadside_robot_pose_xyt", [robot_origin_xy[0], robot_origin_xy[1], row_yaw])
     cam_meta = (meta.get("cameras") or {}).get(cam) or {}
@@ -186,11 +152,7 @@ def frame_poses_local(
 
 
 def cluster_detections(meas_local: np.ndarray, eps_m: float = 0.10) -> List[List[int]]:
-    """
-    Group the detections of one object over several images (complete linkage: every two detections of a group
-    are within eps_m). After the motion compensation, the detections of one trunk agree to a few cm.
-    Return the groups as lists of detection indices.
-    """
+    """Groups (lists of indices) of detections of one object: complete linkage, all pairs within eps_m."""
     meas_local = np.atleast_2d(meas_local)
     if len(meas_local) == 1:
         return [[0]]
@@ -207,7 +169,7 @@ def associate_groups(
 ) -> List[Tuple[List[int], int, float]]:
     """
     One-to-one match of detection groups to predicted trunks with the smallest total centroid distance
-    (linear_sum_assignment), only for pairs inside gate_m and on the same side of the robot (sign of y).
+    (linear_sum_assignment). Only pairs within gate_m and on the same side (sign of y) match.
     Return [(group, tree id, distance)].
     """
     meas_local = np.atleast_2d(meas_local)
@@ -225,13 +187,9 @@ def fit_map_correction(
     max_yaw_rad: float,
 ) -> Tuple[EuclideanTransform, bool]:
     """
-    Rigid 2-D correction T with meas ~ T(pred), for matched pairs (pred[i], meas[i]) of the trunks tree_ids[i].
-    Each trunk has the same weight: the fit uses the mean detection of each trunk.
-
-    One distinct trunk: translation only. Two or more: least-squares rotation + translation
-    (EuclideanTransform.estimate). If |yaw| > max_yaw_rad, the yaw is clamped and the translation is fitted
-    again with the clamped yaw.
-
+    Rigid 2-D correction T with meas ~ T(pred) for the pairs (pred[i], meas[i]) of trunk tree_ids[i].
+    The fit uses the mean detection of each trunk, so each trunk has the same weight. One trunk: translation only.
+    Two or more: EuclideanTransform.estimate; the yaw is clamped to max_yaw_rad and the translation fitted again.
     Return (T, clamped).
     """
     ids = np.asarray(tree_ids)

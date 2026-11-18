@@ -291,12 +291,12 @@ trellis_from_rgbd_extraction:
     anchor_tree_id: -1
     trellis_side: far
     registry_topic: fastslam_registry
-    max_correction_m: 2.0        # [m] max anchor shift of a correction
-    # /correct_template_anchor (see trellis_from_rgbd_extraction.py)
-    frame_offsets: [-2, -1, 0, 1, 2]          # base-camera buffer frames
+    max_correction_m: 2.0                 # [m] max anchor shift of a correction
+    # /correct_template_anchor
+    frame_offsets: [-2, -1, 0, 1, 2]      # base-camera frames
     frame_select_service: /apple_prediction/set_parameters
     frame_select_param: presaved_images.base_cam_frame_index
     trigger_service: /trigger_estimation
-    cluster_eps_m: 0.10                       # [m] one object in several frames
-    association_gate_m: 0.35                  # [m] object <-> map trunk
+    cluster_eps_m: 0.10                   # [m] max distance between detections of one object
+    association_gate_m: 0.35              # [m] max distance object -> map trunk
     max_yaw_correction_deg: 5.0

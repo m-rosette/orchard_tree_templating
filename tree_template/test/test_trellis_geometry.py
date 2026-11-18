@@ -1,5 +1,5 @@
 """
-Offline checks for trellis_geometry (no ROS).
+Checks for trellis_geometry (no ROS).
 
 For each dataset in TRELLIS_DATA_ROOT (default <ws>/data/post_slam_image_processing) and each anchor tree:
   - the anchor local (x, y) agrees with fwd_dist_to_tree_m / lat_dist_to_tree_m from its meta.yaml (1 cm),
@@ -15,12 +15,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from skimage.transform import EuclideanTransform
+
 from tree_template.trellis_geometry import (
+    associate_groups,
+    cluster_detections,
     expected_anchor_local,
     extract_world_xy,
     find_slam_results_yaml,
     load_global_row_yaw,
     load_meta_yamls,
+    fit_map_correction,
+    frame_poses_local,
     local_positions,
 )
 
@@ -133,16 +139,6 @@ def test_dataset_geometry(ds, use_global_yaw):
 #  Map correction
 # -----------------------------------------------------------------------------
 
-from skimage.transform import EuclideanTransform  # noqa: E402
-
-from tree_template.trellis_geometry import (  # noqa: E402
-    associate_groups,
-    cluster_detections,
-    fit_map_correction,
-    frame_poses_local,
-)
-
-
 def _row(n=5, spacing=1.2, lat=1.8):
     return np.column_stack([np.arange(n) * -spacing, np.full(n, lat)])
 
@@ -203,7 +199,7 @@ def test_frame_poses_local():
 
 
 def test_cluster_then_associate_keeps_objects_apart():
-    # Two objects 0.24 m apart (the case of tree 1): A at -0.06 in frames -2,-1,1,2; B at -0.30 in all frames
+    # Two objects 0.24 m apart: A in frames -2, -1, 1, 2; B in all frames
     A = [-0.058, -0.054, -0.075, -0.053]
     B = [-0.299, -0.299, -0.298, -0.309, -0.296]
     dets = np.array([[x, 1.96] for x in A] + [[x, 1.83] for x in B])
