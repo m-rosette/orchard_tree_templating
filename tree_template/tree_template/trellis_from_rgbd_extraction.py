@@ -105,6 +105,7 @@ from tree_template.trellis_geometry import (
     find_slam_results_yaml,
     load_global_row_yaw,
     load_meta_yamls,
+    expected_anchor_local,
     local_positions,
 )
 
@@ -331,6 +332,15 @@ class TrellisFromExtractionNode(Node):
             log(f"Row line fit through {len(ids)} trunks is {slope_deg:+.2f} deg from local +X "
                 f"(row_yaw source: {'slam_results_yaml' if self._global_row_yaw is not None else 'anchor broadside'}).")
 
+        # Geometry check: the anchor must be at its meta.yaml fwd / lat (trellis_geometry.expected_anchor_local)
+        meta = self._tree_data[anchor_id]
+        if "fwd_dist_to_tree_m" in meta and "broadside_robot_pose_xyt" in meta:
+            err = float(np.linalg.norm(local_xy[ids.index(anchor_id)] - expected_anchor_local(meta, row_yaw)))
+            if err > 0.01:
+                self.get_logger().error(
+                    f"Geometry check failed: anchor tree_{anchor_id:03d} is {err:.3f} m from its meta.yaml "
+                    f"fwd/lat position.")
+
         msg = self._build_trunk_registry(self._tree_data, anchor_id, ids, local_xy)
 
         # With TRANSIENT_LOCAL durability, a subscriber that joins late gets the last
@@ -460,6 +470,10 @@ class TrellisFromExtractionNode(Node):
           rms_residual_m       RMS of (corrected prediction - detection) over the matched detections
           yaw_clamped
           frames_used          base-camera frames with at least one matched detection
+          detections           [{frame, local_xy, tree_id (null: no match)}] in the local frame before the correction
+          residual_by_tree_m   {tree id: mean residual of its detections after the correction}
+          anchor_residual_m    mean distance of the anchor detections from the corrected anchor (validation,
+                               target < 0.05 m)
         """
         result = {}
         if self._last_registry_msg is None or self._last_anchor_id is None or self._robot_origin_xy is None:
@@ -525,6 +539,10 @@ class TrellisFromExtractionNode(Node):
         matched_ids = sorted({tid for (_, tid, _) in matches})
         result["matched_tree_ids"] = matched_ids
         result["frames_used"] = sorted({int(meas_frame[k]) for (k, _, _) in matches})
+        tree_of_det = {k: tid for (k, tid, _) in matches}
+        result["detections"] = [
+            {"frame": int(f), "local_xy": [float(m[0]), float(m[1])], "tree_id": tree_of_det.get(k)}
+            for k, (m, f) in enumerate(zip(meas, meas_frame))]
         if anchor_id not in matched_ids:
             return self._fail(
                 response,
@@ -541,9 +559,17 @@ class TrellisFromExtractionNode(Node):
         rms = float(np.sqrt(np.mean(res ** 2)))
         a_old = pred_xy[ids.index(anchor_id)]
         shift = corr([a_old])[0] - a_old
+        result["residual_by_tree_m"] = {}
         for tid in matched_ids:
             r = res[[k for k, x in enumerate(T) if x == tid]]
+            result["residual_by_tree_m"][str(tid)] = float(r.mean())
             self.get_logger().info(f"  residual tree_{tid:03d}: mean {r.mean():.3f} m over {len(r)} detection(s)")
+        # Validation (target < 5 cm): mean distance of the anchor detections (all frames) from the corrected
+        # anchor. With the anchor as the only matched trunk, it shows the spread of the detections over the frames;
+        # with more matched trunks, it also shows how well one rigid correction fits all of them.
+        result["anchor_residual_m"] = result["residual_by_tree_m"][str(anchor_id)]
+        log = self.get_logger().info if result["anchor_residual_m"] < 0.05 else self.get_logger().warn
+        log(f"  anchor detections vs. corrected anchor: mean {result['anchor_residual_m']:.3f} m (target < 0.05 m)")
         self.get_logger().info(
             f"Correction: yaw {math.degrees(dyaw):+.2f} deg{' (clamped)' if clamped else ''}, "
             f"t ({t[0]:+.3f}, {t[1]:+.3f}) m, anchor shift ({shift[0]:+.3f}, {shift[1]:+.3f}) m, "
