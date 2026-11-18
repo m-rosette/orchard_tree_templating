@@ -2,11 +2,9 @@
 """
 trellis_from_rgbd_extraction.py
 
-Reads ALL per-tree meta.yaml files found under extraction_dir at once,
-anchors every trunk position relative to a chosen tree (placing the robot
-at the origin 0,0,0), then publishes the complete set as a single
-TrunkRegistry message so the downstream generate_trellis_collision_obj
-node can spawn all collision objects in one shot.
+Reads all the per-tree meta.yaml files in extraction_dir, puts each trunk position relative to the
+anchor tree (the robot is at the origin 0,0,0), and publishes all of them in one TrunkRegistry message.
+generate_trellis_collision_obj then makes all the collision objects at the same time.
 
 Usage
 -----
@@ -16,7 +14,8 @@ ros2 run <package> trellis_from_rgbd_extraction --ros-args \
 
 Parameters
 ----------
-extraction_dir          (str)   – required. Root directory containing tree_*/meta.yaml files.
+extraction_dir          (str)   – required. Root directory with the tree_*/meta.yaml files.
+anchor_tree_id          (int)   – tree to anchor on; -1 = none yet (set it at runtime, see Workflow).
 trellis_side            (str)   – fallback side when meta.yaml has no 'side' field (default "far").
 z_offset                (float) – vertical offset added to all trunk z-positions (default 0.0).
 registry_topic          (str)   – topic name for the TrunkRegistry message (default "fastslam_registry").
@@ -24,14 +23,12 @@ shift_whole_map         (bool)  – if True, correction shifts all trunks; if Fa
 max_correction_m        (float) – reject corrections larger than this magnitude in metres (default 1.0).
 measurement_timeout_sec (float) – seconds to wait for a trunk measurement after triggering (default 5.0).
 slam_results_yaml       (str)   – path to the yaml written by save_best_particle_map.py for this run.
-                                  When set and it contains a non-null row_yaw_rad, that run-wide,
-                                  odom-locked estimate is used to de-rotate ALL tree positions
-                                  (instead of the anchor tree's single broadside-sample yaw), so
-                                  the row lies along local +X. Trunk orientation is always identity:
-                                  the planning frame is defined by the robot's current pose, so
-                                  trellis side branches end up perpendicular to the row everywhere.
-                                  If unset/unreadable, falls back to the anchor's broadside-sample
-                                  yaw for de-rotation.
+                                  If it has a row_yaw_rad value, the node uses this one row yaw for
+                                  the whole run to de-rotate all tree positions, so the row is along
+                                  local +X. If not, the node uses the broadside yaw of the anchor tree.
+                                  The trunk orientation is always identity: the robot pose defines the
+                                  planning frame, so the trellis side branches are perpendicular to
+                                  the row at all trees.
 
 Workflow
 --------
@@ -48,18 +45,17 @@ Directory structure expected (output of fast_slam_rgbd_extraction):
         tree_008/meta.yaml
         ...
 
-Each meta.yaml is expected to have at minimum:
+Each meta.yaml must have at least:
     tree_id: 8
     tree_world_xy_m: [x, y]                  # trunk position in SLAM world frame
     broadside_robot_pose_xyt: [x, y, yaw]    # robot pose when tree was broadside
-    side: near                               # optional, falls back to trellis_side param
+    side: near                               # optional; if missing, the node uses trellis_side
 """
 
 import copy
 import glob
 import os
 import threading
-import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -125,9 +121,9 @@ def _extract_world_z(meta: dict) -> float:
 
 def _load_global_row_yaw(slam_results_yaml: str) -> Optional[float]:
     """
-    Pull row_yaw_rad out of the yaml written by save_best_particle_map.py.
-    Returns None if the path is empty, missing, or the field is absent/null —
-    callers fall back to the per-anchor broadside sample in that case.
+    Return row_yaw_rad from the yaml that save_best_particle_map.py writes.
+    Return None if the path is empty or missing, or the field is missing or null.
+    Then the caller uses the broadside yaw of the anchor tree.
     """
     if not slam_results_yaml:
         return None
@@ -228,12 +224,11 @@ class TrellisFromExtractionNode(Node):
         super().__init__("trellis_from_rgbd_extraction")
 
         # ── Callback groups ───────────────────────────────────────────────────
-        # Service handler and trigger client share one group so the async
-        # service call inside the handler doesn't deadlock.
+        # The service handler and the trigger client use the same group, so the async
+        # service call in the handler does not deadlock.
         self._service_cbg = MutuallyExclusiveCallbackGroup()
-        # Subscriber callbacks run in a separate group so they remain
-        # dispatchable while the service handler thread is blocked on the
-        # threading.Event.
+        # The subscriber callbacks use a different group, so they can run while the
+        # service handler thread waits on the threading.Event.
         self._sub_cbg = MutuallyExclusiveCallbackGroup()
 
         # ── Parameters ───────────────────────────────────────────────────────
@@ -278,7 +273,7 @@ class TrellisFromExtractionNode(Node):
         self._last_anchor_id: Optional[int] = None
         self._last_registry_msg: Optional[TrunkRegistry] = None
 
-        # Trunk measurement state — written by _sub_cbg, read by service handler
+        # Trunk measurement state: _sub_cbg writes it, the service handler reads it
         self._latest_trunk_pose = None
         self._trunk_received_event: Optional[threading.Event] = None
 
@@ -328,13 +323,11 @@ class TrellisFromExtractionNode(Node):
             f"  Waiting for anchor — set anchor_tree_id parameter to trigger publish."
         )
 
-        # Register the parameter change callback now that data is loaded.
-        # This must happen before the node starts spinning so that any
-        # anchor_tree_id set at launch time or via ros2 param set is caught.
+        # Register the parameter change callback after the data loads and before the node
+        # spins, so it gets each anchor_tree_id set at launch or with ros2 param set.
         self.add_on_set_parameters_callback(self._on_parameter_change)
 
-        # If anchor_tree_id was provided at launch (e.g. from launch_config.yaml),
-        # publish immediately.
+        # If the launch set anchor_tree_id (for example, in launch_config.yaml), publish now.
         anchor_id = int(self.get_parameter("anchor_tree_id").value)
         if anchor_id >= 0:
             self._try_publish(anchor_id)
@@ -353,10 +346,9 @@ class TrellisFromExtractionNode(Node):
                             "anchor_tree_id set before yaml data was loaded — ignoring."
                         )
                     else:
-                        # Run _try_publish in a thread so we don't block the
-                        # parameter service callback dispatcher, but join()
-                        # before returning so the registry is guaranteed to be
-                        # published before OrchardTemplating's next service call.
+                        # Run _try_publish in a thread, so the parameter service callback
+                        # is not blocked. join() before the return, so the registry is
+                        # published before the next service call from OrchardTemplating.
                         t = threading.Thread(
                             target=self._try_publish,
                             args=(anchor_id,),
@@ -392,9 +384,8 @@ class TrellisFromExtractionNode(Node):
         if msg is None:
             return
 
-        # TRANSIENT_LOCAL durability means the last message is stored and
-        # replayed automatically to any late-joining subscriber — no need
-        # to poll subscription count before publishing.
+        # With TRANSIENT_LOCAL durability, a subscriber that joins late gets the last
+        # message, so the node does not wait for subscribers before it publishes.
         self.registry_pub.publish(msg)
         self._last_registry_msg = msg
         self._last_anchor_id = anchor_id
@@ -437,9 +428,9 @@ class TrellisFromExtractionNode(Node):
             trunk.pose.position.x = float(local_xy[0])
             trunk.pose.position.y = float(local_xy[1])
             trunk.pose.position.z = float(world_z) + float(self.z_offset)
-            # Identity orientation: tree positions are already de-rotated so the
-            # row lies along local +X. Trellis side-branch yaw is supplied
-            # downstream by generate_trellis_collision_obj based on `side`.
+            # Identity orientation: the tree positions are de-rotated, so the row is
+            # along local +X. generate_trellis_collision_obj sets the side-branch yaw
+            # from `side`.
             trunk.pose.orientation.w = 1.0
             trunk.width = float(meta.get("width", 0.0))
             trunk.side = side
@@ -460,13 +451,13 @@ class TrellisFromExtractionNode(Node):
     # =========================================================================
 
     def _trunk_measurement_callback(self, msg: TrunkInfo):
-        """Runs on _sub_cbg — always free to fire even during service handling."""
+        """Runs on _sub_cbg, so it can run while the service handler runs."""
         self._latest_trunk_pose = msg.pose
         self.get_logger().debug(
             f"Trunk measurement — x={msg.pose.position.x:.3f} m, "
             f"y={msg.pose.position.y:.3f} m, width={msg.width:.3f} m"
         )
-        # Unblock _get_live_trunk_position if it is waiting
+        # Release _get_live_trunk_position if it waits
         if self._trunk_received_event is not None:
             self._trunk_received_event.set()
 
@@ -480,12 +471,12 @@ class TrellisFromExtractionNode(Node):
         """
         Service handler for /correct_template_anchor.
 
-        1. Checks a registry has been published since the last anchor set.
-        2. Identifies the anchor trunk (closest x to 0 in robot frame).
-        3. Triggers a fresh depth estimation and waits for the result.
+        1. Checks that a registry was published after the last anchor set.
+        2. Finds the anchor trunk (x closest to 0 in the robot frame).
+        3. Triggers a new depth estimate and waits for the result.
         4. Computes delta = live_xy - template_xy.
-        5. Validates the delta magnitude.
-        6. Shifts either the anchor trunk only or the whole map and re-publishes.
+        5. Checks the delta magnitude.
+        6. Shifts the anchor trunk only, or the full map, and publishes again.
         """
         self.get_logger().info("Correction service called — starting pipeline.")
 
@@ -596,8 +587,8 @@ class TrellisFromExtractionNode(Node):
 
     def _get_live_trunk_position(self) -> Optional[np.ndarray]:
         """
-        Wait for a fresh TrunkInfo on /trunk_measurements_raw.
-        Clears stale state first so we know the measurement is genuinely fresh.
+        Wait for a new TrunkInfo on /trunk_measurements_raw.
+        Clears the old state first, so the measurement that comes back is new.
         """
         self._latest_trunk_pose = None
         self._trunk_received_event = threading.Event()

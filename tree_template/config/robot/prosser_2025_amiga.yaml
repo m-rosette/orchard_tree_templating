@@ -1,0 +1,39 @@
+# Robot config (prosser_2023_warthog.yaml tells how to use this file).
+# Platform: 2025 Prosser bags, Farm-ng Amiga. robot_platform:=amiga selects this file. It also sets params_file,
+# nav_config:=nav_2025, gps_topic:=/gps/pvt and imu_topic:=/oak0/imu. The harvest URDF (amiga.urdf.xacro)
+# gives the oak0/imu and gps_antenna frames.
+# config/nav_2025 has no gps_heading files. With use_gps_fusion:=true, use gps_fusion_mode:=legacy.
+
+trunk_detection_relay:
+  ros__parameters:
+    input_topic: tree_image_data
+    camera_frame: base_camera_color_optical_frame
+    output_frame: amiga__base
+    base_x_is_right: false
+
+odom_reframer:
+  ros__parameters:
+    input_odom_topic: /filter/state
+    base_frame: amiga__base
+    gps_topic: /gps/pvt
+
+row_fast_slam:
+  ros__parameters:
+    base_frame: amiga__base   # child_frame_id of odom_slam_best
+    # Debug CSVs (+ _landmarks.csv, _tracks.csv), rewritten each run. Default: tree_template/debug_data/ in the
+    # package source folder. Remove the # to set a different path (this value wins over the params file):
+    # debug.csv_path: /path/to/debug_data/fastslam_debug.csv
+
+tree_scene_node:
+  ros__parameters:
+    trellis_frame: amiga__base
+
+save_best_particle_map:
+  ros__parameters:
+    out: /home/marcus/trunk_width_ws/pf_localization_package_data/slam_measurements/slam_trunks.yaml
+    final_gps_navsat_topic: /gps/pvt
+    world_correction.antenna_x: 0.57    # [m] GPS antenna x in amiga__base (gps_antenna in amiga.urdf.xacro)
+
+trellis_from_rgbd_extraction:
+  ros__parameters:
+    extraction_dir: /home/marcus/apple_harvest_ws/data/post_slam_image_processing/test_06232026

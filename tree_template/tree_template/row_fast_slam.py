@@ -26,6 +26,30 @@ from tree_template.trunk_track_layer import TrunkTrackManager, is_extra_key
 
 # ============= Utility / math helpers =============
 
+def _default_debug_dir() -> Path:
+    """Return debug_data/ in the tree_template source folder.
+
+    From src/ (or a colcon --symlink-install build, whose files resolve to src/), this is one directory above this
+    file. From a colcon install (<ws>/install/...), this file is a copy. Then the function finds the folder in
+    <ws>/src whose package.xml has the name tree_template. If it cannot find that folder, it uses the folder next
+    to this file.
+    """
+    here = Path(__file__).resolve()
+    beside = here.parent.parent / "debug_data"
+    parts = here.parts
+    if "install" not in parts:
+        return beside
+    src = Path(*parts[:parts.index("install")]) / "src"
+    for pattern in ("*/package.xml", "*/*/package.xml", "*/*/*/package.xml"):
+        for pkg_xml in src.glob(pattern):
+            try:
+                if "<name>tree_template</name>" in pkg_xml.read_text():
+                    return pkg_xml.parent / "debug_data"
+            except OSError:
+                continue
+    return beside
+
+
 def wrap_angle(theta: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return (theta + np.pi) % (2.0 * np.pi) - np.pi
@@ -233,11 +257,11 @@ class RowFastSLAMNode(Node):
 
         self.declare_parameter("meas_fwd_gate", 1.1)   # m — above this, suppress s-update
 
-        # Stationary measurement skip gate — suppress weight update (not EKF update)
-        # for near-duplicate measurements to prevent neff drain while robot is stopped.
+        # Stationary measurement skip gate: no weight update (the EKF update still occurs) for a measurement that is
+        # almost the same as the last one on its slot. This keeps neff from decreasing while the robot is stopped.
         self.declare_parameter("meas_skip.enable", True)
-        self.declare_parameter("meas_skip.delta_range",   0.02)   # m — skip if range moved less than this
-        self.declare_parameter("meas_skip.delta_bearing",  0.01)   # rad — skip if bearing moved less than this
+        self.declare_parameter("meas_skip.delta_range",   0.02)   # [m] skip if the range changes less than this
+        self.declare_parameter("meas_skip.delta_bearing",  0.01)   # [rad] skip if the bearing changes less than this
 
         # Data association mode:
         #   False (default) — single shared weighted-mean pose used for all particles (original behaviour)
@@ -245,24 +269,24 @@ class RowFastSLAMNode(Node):
         #                     different slots and only update their individually-assigned landmark
         self.declare_parameter("assoc.per_particle", True)
 
-        # Short-term track layer: links detections into per-tree tracks in the odom frame so that a second,
-        # distinct tree landing in an already-owned slot gets its own (measurement-driven) landmark instead
-        # of being merged. Width is a secondary cue for linking and for telling close trees apart.
+        # Short-term track layer: links detections into per-tree tracks in the odom frame. A second, different tree
+        # in a slot that another tree owns gets its own landmark (from its measurements). The trunk width is a
+        # second cue: it can stop a link and it can show that two close tracks are different trees.
         self.declare_parameter("assoc.track_layer.enable", False)
-        self.declare_parameter("assoc.track_layer.link_gate_m", 0.20)        # odom-frame link gate
-        self.declare_parameter("assoc.track_layer.max_gap_sec", 1.0)         # track expires after this gap
-        self.declare_parameter("assoc.track_layer.width_break_m", 0.015)     # refuse link if width differs by more
-        self.declare_parameter("assoc.track_layer.width_min_samples", 3)     # widths needed before width is used
-        self.declare_parameter("assoc.track_layer.min_tree_sep_m", 0.30)     # tracks farther apart = different trees
-        self.declare_parameter("assoc.track_layer.width_sep_m", 0.15)        # ...or this far apart with distinct widths
-        self.declare_parameter("assoc.track_layer.width_distinct_m", 0.010)  # width difference that counts as distinct
-        self.declare_parameter("assoc.track_layer.split_min_hits", 3)        # detections before a split is allowed
+        self.declare_parameter("assoc.track_layer.link_gate_m", 0.20)        # [m] odom-frame link gate
+        self.declare_parameter("assoc.track_layer.max_gap_sec", 1.0)         # [s] a track ends after this gap
+        self.declare_parameter("assoc.track_layer.width_break_m", 0.015)     # [m] no link if the width difference is more
+        self.declare_parameter("assoc.track_layer.width_min_samples", 3)     # widths a track needs before the width check applies
+        self.declare_parameter("assoc.track_layer.min_tree_sep_m", 0.30)     # [m] tracks this far apart or more are different trees
+        self.declare_parameter("assoc.track_layer.width_sep_m", 0.15)        # [m] or this far apart or more, if the widths are different
+        self.declare_parameter("assoc.track_layer.width_distinct_m", 0.010)  # [m] width difference that counts as different
+        self.declare_parameter("assoc.track_layer.split_min_hits", 3)        # detections a track needs before it gets its own landmark
         # Trunk-width term in the particle weights
         self.declare_parameter("assoc.width_lik.enable", False)
-        self.declare_parameter("assoc.width_lik.sigma_m", 0.004)      # width noise [m] for the likelihood
+        self.declare_parameter("assoc.width_lik.sigma_m", 0.004)      # [m] width noise for the likelihood
         self.declare_parameter("assoc.width_lik.weight", 1.0)         # multiplier on the width log-likelihood
-        self.declare_parameter("assoc.width_lik.max_pen", 4.0)        # cap on 0.5*(dw/sigma)^2 (outlier widths)
-        self.declare_parameter("assoc.width_lik.min_samples", 3)      # landmark widths needed before it is used
+        self.declare_parameter("assoc.width_lik.max_pen", 4.0)        # cap on 0.5*(dw/sigma)^2 (limits the effect of a bad width)
+        self.declare_parameter("assoc.width_lik.min_samples", 3)      # widths a landmark needs before the term applies
 
         # Motion noise parameters (interpreted in body frame)
         self.declare_parameter("motion_noise.a_trans", 0.08)
@@ -278,7 +302,7 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("resample_interval", 30) # 0 disables
         self.declare_parameter("neff_ratio_threshold", 0.25)
         self.declare_parameter("resample_burn_in", 15)
-        self.declare_parameter("resample_neff_floor", 0.05)  # hard floor: resample regardless of slot_committed
+        self.declare_parameter("resample_neff_floor", 0.05)  # resample below this neff ratio, also when no slot is committed
         # Post-resample roughening: applied when neff_ratio falls below these thresholds.
         self.declare_parameter("resample_roughen.neff_moderate",        0.08)  # trigger roughening at all
         self.declare_parameter("resample_roughen.neff_severe",          0.01)  # severe / catastrophic tier
@@ -699,12 +723,13 @@ class RowFastSLAMNode(Node):
         # -----------------------------
         # Debug CSV logging (tuning)
         # -----------------------------
+        self.declare_parameter("base_frame", "amiga__base")   # child_frame_id of odom_slam_best (robot config sets it)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+
         self.declare_parameter("debug.csv_enable", True)
 
-        # Compute default path: one directory above this file, in debug_data/
-        this_file = Path(__file__).resolve()
-        default_debug_dir = this_file.parent.parent / "debug_data"
-        default_debug_path = default_debug_dir / "fastslam_debug.csv"
+        # Default path: debug_data/ in the package's source folder (see _default_debug_dir)
+        default_debug_path = _default_debug_dir() / "fastslam_debug.csv"
 
         self.declare_parameter("debug.csv_path", str(default_debug_path))
         self.declare_parameter("debug.csv_flush_every_n", 1)
@@ -1051,8 +1076,8 @@ class RowFastSLAMNode(Node):
                 self._publish_registry_from_best(force=True)
                 self._publish_odom_from_best(force=True)
 
-            # The hits used to anchor the origin are real observations of the slot-0 tree: credit them,
-            # otherwise the anchor tree can stay below min_seen_count_to_publish and drop out of the map.
+            # The hits that anchor the origin are real observations of the slot-0 tree. Count them. If not, the
+            # anchor tree can stay below min_seen_count_to_publish and not appear in the map.
             n_anchor_hits = int(self._template_origin_hit_count)
             for p in self.particles:
                 lm0 = p.landmarks.get(0)
@@ -1619,9 +1644,9 @@ class RowFastSLAMNode(Node):
                 and self.template_origin_from_first_measurement
                 and not self._template_origin_anchored
             ):
-                # Place the hit with the odom pose at measurement time (the robot may already have moved
-                # since the boot pose was frozen; using the boot pose shifts the origin off the anchor tree).
-                # Same odom frame the particles are initialised in. Fall back to the boot pose.
+                # Place the hit with the odom pose at the measurement time, in the odom frame that the particles
+                # start in. The robot can move after the boot pose is frozen, so the boot pose can put the origin
+                # off the anchor tree. If no odom pose is available for that time, use the boot pose.
                 pose_anchor = self._lookup_odom_pose(t_meas_sec)
                 if pose_anchor is None:
                     pose_anchor = self._boot_odom_pose
@@ -1648,7 +1673,7 @@ class RowFastSLAMNode(Node):
                     )
                     self._anchor_template_origin_to_first_meas(mu_mean)
                     if anchor_trk is not None:
-                        # The anchor tree is slot 0: its later frames must stay there
+                        # The anchor tree is slot 0. Its later detections stay on slot 0.
                         self._track_mgr.claim(anchor_trk, 0)
 
                 return
@@ -1761,7 +1786,7 @@ class RowFastSLAMNode(Node):
                 self.assoc_last_slot = 0
                 slot_j = 0
 
-            # ---- Track layer: keep per-tree identity across frames ----
+            # ---- Track layer: one identity per tree across frames ----
             if self._track_layer_enable and not anchoring_phase:
                 xy_odom = self._world_from_robot(pose_odom_meas, z)
                 trk = self._track_mgr.update(t_meas_sec, xy_odom, w_meas)
@@ -1775,19 +1800,19 @@ class RowFastSLAMNode(Node):
                         "" if key is None else key, action])
                     self._dbg_trk_csv_fp.flush()
                 if key is None:
-                    # Unconfirmed track that would land in another tree's slot: hold it back
+                    # A track that is not confirmed and lands in the slot of another tree: hold it back
                     self._dbg_reject("track_pending")
                     return
                 override = False
                 if is_extra_key(key):
-                    # Second tree in an occupied slot: route every particle to its own landmark
+                    # Second tree in a used slot: send it to its own landmark in every particle
                     if self._ensure_extra_landmark(key, z, d_now_to_meas, held_hits=trk.n - 1):
                         self.get_logger().info(f"Track layer split: {self._track_mgr.describe_split(trk)}")
                     override = True
                 elif key != slot_j and (self._track_mgr.slot_owned_by_other(slot_j, trk)
                                         or self._track_mgr.is_anchor_track(trk)):
-                    # This tree's measurement drifted into another tree's slot (or the anchor tree's
-                    # tail drifted off slot 0): keep it on its own slot
+                    # The measurement of this tree moved into the slot of another tree (or a later detection of
+                    # the anchor tree moved off slot 0): keep it on the slot of its own tree
                     override = True
                 if override:
                     slot_j = int(key)
@@ -1803,8 +1828,8 @@ class RowFastSLAMNode(Node):
             self._update_semantic_side_votes(slot_j, msg.side)
 
             # ---- Stationary measurement skip gate ----
-            # Suppress weight updates (not EKF updates) for near-duplicate measurements.
-            # Prevents neff drain when the robot is stopped and z barely changes between frames.
+            # No weight update (the EKF update still occurs) for a measurement that is almost the same as the last
+            # one. This keeps neff from decreasing when the robot is stopped.
             _skip_weight_update = False
             if self._meas_skip_enable and self._pf_initialized:
                 _bearing = float(np.arctan2(y_lat, x_fwd))
@@ -1814,7 +1839,7 @@ class RowFastSLAMNode(Node):
                     _delta_r = abs(r - _prev_r)
                     _delta_b = abs(float(np.arctan2(
                         np.sin(_bearing - _prev_bearing),
-                        np.cos(_bearing - _prev_bearing))))   # wrapped bearing diff
+                        np.cos(_bearing - _prev_bearing))))   # wrapped bearing difference
                     if _delta_r < self._meas_skip_delta_range and _delta_b < self._meas_skip_delta_bearing:
                         _skip_weight_update = True
                         self._dbg_reject("meas_skip_stationary")
@@ -2035,7 +2060,7 @@ class RowFastSLAMNode(Node):
                     _sb2 = self._proposal_min_std_bearing ** 2
                     floor_fwd = np.sqrt(ca_v*ca_v*_sr2 + r_v*r_v*sa_v*sa_v*_sb2)  # (M,)
                     floor_lat = np.sqrt(sa_v*sa_v*_sr2 + r_v*r_v*ca_v*ca_v*_sb2)  # (M,)
-                    Pf = float(max(float(std_body[0]), float(floor_fwd.max())))**2  # scalar P, floor from worst particle
+                    Pf = float(max(float(std_body[0]), float(floor_fwd.max())))**2  # scalar P; the floor comes from the worst particle
                     Pl = float(max(float(std_body[1]), float(floor_lat.max())))**2
                     std_body[2] = max(float(std_body[2]), float(self.proposal_min_pose_std_yaw))
                     Pth = float(std_body[2]) ** 2
@@ -2151,9 +2176,9 @@ class RowFastSLAMNode(Node):
                             particles[i].pose[:] = xnew_now[ki]
 
             # ---- Trunk-width log-weight ----
-            # Particles that associate this detection with a landmark of a different trunk width are
-            # penalised. Only discriminates where particles chose different landmarks (pose ambiguity
-            # along the row); when all particles share the landmark the term is a constant.
+            # A particle gets a penalty when it associates this detection with a landmark of a different trunk
+            # width. The term only has an effect when the particles chose different landmarks (pose ambiguity along
+            # the row). When all the particles use the same landmark, the term is a constant.
             if self._width_lik_enable and w_meas is not None and np.isfinite(w_meas):
                 pen_w = np.zeros(n_particles, dtype=np.float64)
                 has_w = np.zeros(n_particles, dtype=bool)
@@ -2165,7 +2190,7 @@ class RowFastSLAMNode(Node):
                     pen_w[i] = min(0.5 * dw * dw, self._width_lik_max_pen)
                     has_w[i] = True
                 if has_w.any():
-                    # Particles whose landmark has no width yet get a neutral (median) penalty
+                    # A particle whose landmark has no width gets the median penalty (neutral)
                     pen_w[~has_w] = float(np.median(pen_w[has_w]))
                     logw[:n_particles] -= self._width_lik_weight * pen_w
                     if float(pen_w[has_w].max() - pen_w[has_w].min()) > 0.1:
@@ -2463,8 +2488,8 @@ class RowFastSLAMNode(Node):
                     and self.resample_interval > 0
                     and (self.measurement_count % self.resample_interval) == 0):
                 self._maybe_resample()
-            # Hard neff floor — resample unconditionally if particle diversity collapses,
-            # even when slot_committed=False (e.g. maha_gate blocked all updates for a whole tree).
+            # Neff floor: resample when the particle diversity is very low, also when no slot is committed
+            # (for example, when maha_gate blocked all the updates for one tree).
             elif (past_burn_in
                     and self._resample_neff_floor > 0.0
                     and float(self._effective_sample_size()) / float(self.num_particles)
@@ -2899,9 +2924,9 @@ class RowFastSLAMNode(Node):
 
     def _ensure_extra_landmark(self, key: int, z: np.ndarray, d_now_to_meas: np.ndarray, held_hits: int = 0) -> bool:
         """
-        Create a measurement-initialised landmark under `key` in every particle (track layer split).
-        held_hits: detections of this track that were held back while the split was being confirmed;
-        they count toward seen_count so a confirmed tree is not dropped by min_seen_count_to_publish.
+        Create a landmark under `key` in every particle, from the measurement (track layer split).
+        held_hits: detections of this track that the split held back until the split was confirmed. They count
+        toward seen_count, so that min_seen_count_to_publish does not remove a confirmed tree.
         """
         if not self.particles or key in self.particles[0].landmarks:
             return False
@@ -3318,7 +3343,7 @@ class RowFastSLAMNode(Node):
             odom_out.header.stamp = self.get_clock().now().to_msg()
 
         odom_out.header.frame_id = "map"
-        odom_out.child_frame_id = "amiga__base"
+        odom_out.child_frame_id = self.base_frame
 
         odom_out.pose.pose.position.x = float(p_best.pose[0])
         odom_out.pose.pose.position.y = float(p_best.pose[1])
@@ -3375,8 +3400,8 @@ class RowFastSLAMNode(Node):
         if self.publish_merge_duplicates_enable and len(pub_items) >= 2:
             pub_items = self._merge_publish_duplicates(pub_items)
 
-        # Publish in along-row order (not key order): track-layer extras have keys >= 100000 but sit
-        # between template slots, and downstream tree ids are assigned in publish order.
+        # Publish in along-row order, not in key order. Track-layer extra landmarks have keys >= 100000 but are
+        # between template slots, and the downstream nodes give tree ids in publish order.
         t_hat = np.asarray(self.t_hat_assoc, dtype=float)
         pub_items.sort(key=lambda it: float(np.dot(np.asarray(it[1].mu[:2], dtype=float), t_hat)))
 

@@ -1,6 +1,9 @@
+# Python packages for tree_template. Most are also declared in package.xml (rosdep); utm is pip-only
+# on Ubuntu 22.04.
 numpy
 scipy
-matplotlib
-optuna
-utm
 PyYAML
+utm            # fast_slam_rgbd_extraction, evaluation scripts
+# opencv: use apt python3-opencv (rosdep); a pip opencv-python can clash with the ROS cv2
+matplotlib     # plot_*.py
+pandas         # plot_slam_variance

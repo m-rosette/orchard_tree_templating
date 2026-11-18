@@ -1,10 +1,11 @@
-# tree_template/config/launch_config.yaml
+# tree_template/config/launch_config_2025_with_polar_meas.yaml
+# Algorithm tuning for the 2025 Prosser bags (Amiga).
+# The robot config (config/robot/*.yaml) holds the robot and machine values: frames, sensor topics, output paths.
+# trunk_to_template_pub.launch.py loads the robot config after this file, so the robot config values win.
+# Tools that start nodes directly can give the robot config as a second --params-file.
 
 trunk_detection_relay:
   ros__parameters:
-    input_topic: tree_image_data
-    camera_frame: base_camera_color_optical_frame
-    output_frame: amiga__base
     output_topic: trunk_measurements_raw
 
     use_trunk_width_addition: true
@@ -20,14 +21,13 @@ trunk_detection_relay:
     debug_marker_topic: trunk_measurements_raw_markers
     debug_marker_scale: 0.20
 
-    base_x_is_right: false
 
 
 row_fast_slam:
   ros__parameters:
     num_particles: 3000
     measurement_topic: /trunk_measurements_raw
-    odom_topic: /odometry/global
+    odom_topic: /odometry/global   # trunk_to_template_pub.launch.py overrides this (launch arg slam_odom_topic)
     registry_topic: fastslam_registry
     odom_best_topic: odom_slam_best
  
@@ -59,7 +59,7 @@ row_fast_slam:
     init_sigma_d: 0.20
     init_sigma_yaw: 0.1
  
-    landmark_init.include_pose_uncertainty: false   # default — pure FastSLAM (correct) | true — adds cloud spread to init Sigma
+    landmark_init.include_pose_uncertainty: false   # false: pure FastSLAM. true: add the particle spread to the initial Sigma.
  
     # Local trunk associations
     assoc.per_particle: true
@@ -83,41 +83,41 @@ row_fast_slam:
     meas_std_x_fwd: 0.6
  
     # Used when meas_noise_model: polar
-    meas_std_range:   0.10   # [m]    — depth / range std dev
-    meas_std_bearing: 0.1   # [rad]  — bearing std dev
+    meas_std_range:   0.10   # [m] range standard deviation
+    meas_std_bearing: 0.1   # [rad] bearing standard deviation
  
     meas_fwd_gate: 1.2
 
     # Stationary measurement skip gate
     meas_skip.enable: false
-    meas_skip.delta_range:   0.01   # m  — range must change by this much to trigger weight update
-    meas_skip.delta_bearing: 0.005   # rad — bearing must change by this much (~0.57°)
+    meas_skip.delta_range:   0.01   # [m] minimum range change for a weight update
+    meas_skip.delta_bearing: 0.005   # [rad] minimum bearing change for a weight update
  
     # Motion distribution (robot frame)
-    motion_noise.a_trans: 0.1   # meters of std per meter traveled
-    motion_noise.b_trans: 0.08   # meters of std per radian of rotation
-    motion_noise.c_lat: 0.08     # meters of std for lateral motion (e.g. slip)
-    motion_noise.a_rot: 0.05    # radians of std per radian of rotation
-    motion_noise.b_rot: 0.08     # radians of std per meter traveled
-    motion_noise.x_floor: 0.005 # minimum motion noise in x to prevent particle deprivation
-    motion_noise.y_floor: 0.005 # minimum motion noise in y to prevent particle deprivation
-    motion_noise.yaw_floor: 0.001 # minimum motion noise in yaw to prevent particle deprivation
+    motion_noise.a_trans: 0.1   # [m] std per meter of travel
+    motion_noise.b_trans: 0.08   # [m] std per radian of rotation
+    motion_noise.c_lat: 0.08     # [m] std of lateral motion (slip)
+    motion_noise.a_rot: 0.05    # [rad] std per radian of rotation
+    motion_noise.b_rot: 0.08     # [rad] std per meter of travel
+    motion_noise.x_floor: 0.005 # [m] minimum x noise (keeps the particles spread)
+    motion_noise.y_floor: 0.005 # [m] minimum y noise (keeps the particles spread)
+    motion_noise.yaw_floor: 0.001 # [rad] minimum yaw noise (keeps the particles spread)
  
     # Resampling
     resample_interval: 20
     neff_ratio_threshold: 0.35
     resample_burn_in: 20
-    resample_neff_floor: 0.05   # hard floor — resample even if slot_committed=False
+    resample_neff_floor: 0.05   # resample below this neff ratio, also when no slot is committed
 
-    # Post-resample roughening tiers (applied when neff_ratio falls below threshold)
-    resample_roughen.neff_moderate: 0.15        # trigger roughening at all
-    resample_roughen.neff_severe: 0.05          # severe / catastrophic tier
-    resample_roughen.maha_catastrophic: 8.0    # Mahalanobis^2 to escalate to catastrophic
+    # Roughening tiers after a resample (they apply when the neff ratio is below the threshold)
+    resample_roughen.neff_moderate: 0.15        # neff ratio below which roughening starts
+    resample_roughen.neff_severe: 0.05          # neff ratio for the severe / catastrophic tier
+    resample_roughen.maha_catastrophic: 8.0    # Mahalanobis^2 above which the catastrophic tier applies
     resample_roughen.scale_moderate_xy: 3.0     # multiplier on motion noise std (moderate tier)
     resample_roughen.scale_severe_xy: 5.0       # multiplier on motion noise std (severe tier)
     resample_roughen.scale_severe_yaw: 3.0
     resample_roughen.catastrophic_xy_slots: 3.0 # xy spread = slot_spacing * this
-    resample_roughen.catastrophic_yaw: 0.15     # rad (~8.6 deg)
+    resample_roughen.catastrophic_yaw: 0.15     # [rad]
  
     # Median-particle innovation gate (Mahalanobis^2). Set <= 0 to disable.
     maha_gate_median: 6.0
@@ -138,16 +138,16 @@ row_fast_slam:
     publish_merge_duplicates.dist_m: 0.1
     publish_merge_duplicates.only_adjacent: true
  
-    # FASTSLAM 2.0 - measurement-informed pose proposal
+    # FastSLAM 2.0: pose proposal from the measurement
     proposal.enable: true
-    proposal.min_pose_std_range:   0.003   # m  — range floor (suppresses along-row drift)
-    proposal.min_pose_std_bearing: 0.003   # rad — bearing floor (lateral correction)
-    proposal.min_pose_std_yaw: 0.001   # rad
-    proposal.max_correction_xy: 0.06    # m -> Max per-step pose correction applied by the proposal
-    proposal.max_correction_yaw: 0.04   # rad -> Max per-step pose correction applied by the proposal
-    proposal.zombie_maha_threshold: 20.0 # Particles with Mahalanobis^2 above this are not moved by the proposal (zombie guard)
-    proposal.min_landmark_seen: 5 # Min observations before a landmark is used on the proposal path (below → classic)
-    proposal.max_odom_steps: 10 # Cap on accumulated odom steps used to scale pose prior uncertainty in proposal
+    proposal.min_pose_std_range:   0.003   # [m] range floor (limits along-row drift)
+    proposal.min_pose_std_bearing: 0.003   # [rad] bearing floor (lateral correction)
+    proposal.min_pose_std_yaw: 0.001   # [rad]
+    proposal.max_correction_xy: 0.06    # [m] maximum pose correction per step
+    proposal.max_correction_yaw: 0.04   # [rad] maximum pose correction per step
+    proposal.zombie_maha_threshold: 20.0 # the proposal does not move particles with Mahalanobis^2 above this
+    proposal.min_landmark_seen: 5 # observations a landmark needs for the proposal (below: standard update)
+    proposal.max_odom_steps: 10 # cap on the odom steps that scale the pose prior uncertainty
  
     # Template soft prior (weight update per landmark)
     template_prior.enable: false
@@ -164,17 +164,17 @@ row_fast_slam:
 
     # Inter-landmark spacing propagation
     spacing_propagation.enable: false
-    spacing_propagation.min_seen: 8     # detections before propagating FROM this slot
-    spacing_propagation.max_unseen: 5   # detections before stop nudging TO this slot
-    spacing_propagation.alpha: 0.05      # nudge strength per hop [0,1]
-    spacing_propagation.n_hops: 1       # how many neighbours each direction
-    spacing_propagation.consistency_sigma_frac: 0.3 # Consistency scoring: sigma as fraction of slot_spacing (0.2 = ±22 cm at 1.12 m spacing)
-    spacing_propagation.consistency_min_seen: 8 # Neighbour must have this many real observations before it counts as evidence
-    spacing_propagation.forward_only: true # Only propagate forward (down the row), not both directions
+    spacing_propagation.min_seen: 8     # detections a slot needs before it pushes to its neighbours
+    spacing_propagation.max_unseen: 5   # a slot with more detections gets no push
+    spacing_propagation.alpha: 0.05      # push strength per hop [0, 1]
+    spacing_propagation.n_hops: 1       # neighbours in each direction
+    spacing_propagation.consistency_sigma_frac: 0.3 # consistency sigma as a fraction of slot_spacing
+    spacing_propagation.consistency_min_seen: 8 # observations a neighbour needs before it counts
+    spacing_propagation.forward_only: true # push only forward (down the row)
  
     # Publish throttle
-    publish.registry_min_interval: 0.1   # s  (10 Hz)
-    publish.odom_min_interval: 0.05      # s  (20 Hz)
+    publish.registry_min_interval: 0.1   # [s] (10 Hz)
+    publish.odom_min_interval: 0.05      # [s] (20 Hz)
  
     # Message lag
     meas_max_lag_sec: 2.0
@@ -183,16 +183,16 @@ row_fast_slam:
     # Debugging
     debug.csv_enable: true
     debug.log_every_n_meas: 0
-    # debug.csv_path: /ros2_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv
+    # Debug CSVs (+ _landmarks.csv, _tracks.csv), rewritten each run. Default: tree_template/debug_data/ in the
+    # package source folder. Remove the # to set a different path (a robot config value wins over this file):
+    # debug.csv_path: /path/to/debug_data/fastslam_debug.csv
     debug.csv_flush_every_n: 1
     debug.print_measurement_stamp: false
 
 odom_reframer:
   ros__parameters:
-    input_odom_topic: /filter/state # 2025 dataset
     output_odom_topic: /odometry/wheel
     odom_frame: odom
-    base_frame: amiga__base
     publish_tf: false
 
     recenter: true
@@ -204,7 +204,6 @@ odom_reframer:
     use_now_stamp: true
     copy_twist: true
 
-    gps_topic: /gps/pvt # 2025 dataset
     gps_min_status: 0
     gps_require_finite_cov: false
 
@@ -238,7 +237,6 @@ tree_scene_node:
 
     trellis_angle: -18.435
     branch_spacing: 0.5
-    trellis_frame: amiga__base
     trellis_prefix: v_trellis_tree_
 
     registry_topic: fastslam_registry
@@ -249,8 +247,6 @@ save_best_particle_map:
     trunk_topic: /fastslam_registry
     odom_corr_topic: /initial_odom_correction
     gps_topic: /initial_gps_fix
-    final_gps_navsat_topic: /gps/pvt # 2025 dataset
-    out: /home/marcus/trunk_width_ws/pf_localization_package_data/slam_measurements/slam_trunks.yaml
 
     require_odom_correction: true
     require_gps_fix: true
@@ -263,7 +259,6 @@ save_best_particle_map:
 
 trellis_from_rgbd_extraction:
   ros__parameters:
-    extraction_dir: /home/marcus/apple_harvest_ws/data/post_slam_image_processing/test_06232026
     anchor_tree_id: -1
     trellis_side: far
     registry_topic: fastslam_registry

@@ -3,7 +3,7 @@
 <package format="3">
   <name>tree_template</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Row-specialised FastSLAM trunk mapping and trellis template placement for orchard rows</description>
   <maintainer email="rosettem@oregonstate.edu">marcus</maintainer>
   <license>TODO: License declaration</license>
 
@@ -14,7 +14,39 @@
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
 
+  <!-- Messages / services -->
   <exec_depend>tree_template_interfaces</exec_depend>
+  <exec_depend>pf_orchard_interfaces</exec_depend>   <!-- TreeImageData from the trunk detector (build from source) -->
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>shape_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+
+  <!-- ROS runtime -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>tf2_ros_py</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
+  <exec_depend>rosbag2_py</exec_depend>            <!-- fast_slam_rgbd_extraction (offline bag reading) -->
+  <exec_depend>ament_index_python</exec_depend>
+
+  <!-- Launch files -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_localization</exec_depend>    <!-- ekf_fusion.launch.py -->
+
+  <!-- Python libraries. utm has no rosdep key on Ubuntu 22.04: pip install -r requirements.txt -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>        <!-- fast_slam_rgbd_extraction -->
+  <exec_depend>python3-matplotlib</exec_depend>    <!-- plot_*.py -->
+  <exec_depend>python3-pandas</exec_depend>        <!-- plot_slam_variance -->
 
   <export>
     <build_type>ament_python</build_type>

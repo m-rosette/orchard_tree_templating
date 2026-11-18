@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
+"""Plot the row_fast_slam debug CSV.
+
+Usage: python3 plot_fastslam_debug.py [--csv PATH] [--out_dir DIR] [--show]
+Default CSV: debug_data/fastslam_debug.csv in the tree_template source folder (the row_fast_slam default).
+Default output: the folder of the CSV.
+"""
+import argparse
 import csv
 import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-CSV_PATH = "/home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug.csv"
-
-# 🔧 choose your output directory here
-OUTPUT_DIR = Path(
-    "/home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data"
-)
+DEFAULT_CSV = Path(__file__).resolve().parent.parent / "debug_data" / "fastslam_debug.csv"
 
 SAVE_DPI = 150
-SHOW_PLOTS = False   # set True if you also want interactive windows
+OUTPUT_DIR = DEFAULT_CSV.parent   # main() sets it from the arguments
+SHOW_PLOTS = False                # main() sets it from --show
 
 
 def read_csv(path):
@@ -52,9 +55,18 @@ def save_fig(name):
 
 
 def main():
-    p = Path(CSV_PATH)
-    if not p.exists():
+    global OUTPUT_DIR, SHOW_PLOTS
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--csv", type=Path, default=DEFAULT_CSV, help="debug CSV (default: %(default)s)")
+    ap.add_argument("--out_dir", type=Path, default=None, help="PNG output folder (default: the CSV folder)")
+    ap.add_argument("--show", action="store_true", help="also show the plots in windows")
+    args = ap.parse_args()
+
+    CSV_PATH = args.csv
+    if not CSV_PATH.exists():
         raise SystemExit(f"CSV not found: {CSV_PATH}")
+    OUTPUT_DIR = args.out_dir or CSV_PATH.parent
+    SHOW_PLOTS = args.show
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

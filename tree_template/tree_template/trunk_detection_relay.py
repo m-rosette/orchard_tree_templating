@@ -43,9 +43,9 @@ class TrunkDetectionRelay(Node):
 
         # Optional measurement tweak
         self.declare_parameter("use_trunk_width_addition", True)
-        # Which detector point is the trunk position:
-        #   bottom: bottom-most mask row (bottom_xs / bottom_ys) - one pixel row, noisier
-        #   mask:   whole mask (xs / ys) - median mask column at the trunk-body depth percentile
+        # The detector point that gives the trunk position:
+        #   bottom: the bottom mask row (bottom_xs / bottom_ys); one pixel row, more noise
+        #   mask:   all mask pixels (xs / ys); median mask column at the trunk-body depth percentile
         self.declare_parameter("position_source", "bottom")
 
         # Filtering
@@ -211,9 +211,9 @@ class TrunkDetectionRelay(Node):
 
         lat_sign = -1.0 if self.base_x_is_right else 1.0
 
-        # Stamp measurements with the image time, not the time detection finished. The detector
-        # lags the camera by ~1.2 s (more under CPU load, and the lag can grow during a run); with a
-        # now() stamp SLAM looks up the odom pose that much later and the row gets compressed.
+        # Stamp each measurement with the image time, not with the time the detection finished. The detector
+        # output comes 1-3 s after the image. With the finish time, SLAM would use an odom pose that is too late
+        # and the mapped row would be too short.
         if msg.header.stamp.sec != 0 or msg.header.stamp.nanosec != 0:
             meas_stamp = msg.header.stamp
         else:

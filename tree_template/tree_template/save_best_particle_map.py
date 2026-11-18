@@ -7,7 +7,6 @@ import math
 from collections import deque
 
 import numpy as np
-import yaml
 
 import rclpy
 from rclpy.node import Node
@@ -63,13 +62,13 @@ def _odom_xy_yaw_t(msg: Odometry) -> Optional[List[float]]:
 def world_correct(trees_xy: np.ndarray, slam_path: np.ndarray, global_path: np.ndarray, t_valid: float,
                   window_s: float, cam_fwd_m: float):
     """
-    Post-SLAM world correction with the GPS-fused global EKF (robot_localization), no extra filter.
+    World correction of the SLAM map with the GPS-fused global EKF (robot_localization). No other filter.
 
-    SLAM's map lives in its own frame and inherits the slow scale/heading drift of local odometry. For each tree:
-      t_obs = time the SLAM robot pose had the tree ~cam_fwd_m ahead (camera centred on it)
-      C     = G(t) * P(t)^-1 (world <- SLAM frame), G = /odometry/global, P = SLAM best pose, averaged over
-              t_obs +- window_s, using only global poses after t_valid (global heading aligned)
-      tree  = C * tree_slam (tree keeps its SLAM position relative to the robot; the robot is placed by GPS)
+    The SLAM map is in its own frame and has the slow scale and heading drift of the local odometry. For each tree:
+      t_obs = time when the SLAM robot pose had the tree cam_fwd_m ahead (camera centered on the tree)
+      C     = G(t) * P(t)^-1 (world <- SLAM frame), G = /odometry/global, P = SLAM best pose. The mean is over
+              t_obs +- window_s, with only the global poses after t_valid (global heading aligned)
+      tree  = C * tree_slam (the tree keeps its SLAM position relative to the robot; GPS places the robot)
     slam_path / global_path rows: [x, y, yaw, t]. Returns (trees_world (N,2), robot_path_world (M,4), t_obs (N,)).
     """
     pt = slam_path[:, 3]
@@ -114,7 +113,7 @@ def world_correct_gps(trees_xy: np.ndarray, slam_path: np.ndarray, fixes: np.nda
                       t_valid: float, window_s: float, cam_fwd_m: float, antenna_x: float = -0.5,
                       yaw_window_s: Optional[float] = None):
     """
-    Post-SLAM world correction from raw RTK GPS (no EKF dependence).
+    World correction of the SLAM map from the raw RTK GPS fixes (no EKF).
 
     For each tree (t_obs as in world_correct):
       heading h(t) = SLAM yaw(t) + mean(course - SLAM yaw) over GPS course headings within t_obs +- yaw_window_s
@@ -206,17 +205,17 @@ class SaveBestParticleMap(Node):
         self.declare_parameter("initials_yaml", "")
         self.declare_parameter("use_initials_yaml_fallback", False)
 
-        # World correction with the GPS-fused global EKF (gps_fusion_mode:=gps_heading). Adds trees_world /
-        # robot_path_world (global "map" frame) to the YAML and optionally writes <name>_world.yaml with them as
-        # trees / robot_path. Skipped (with a warning) when no global odometry was received.
+        # World correction (needs the gps_heading GPS fusion). Adds trees_world / robot_path_world to the YAML and,
+        # with write_separate_file, writes <name>_world.yaml with them as trees / robot_path. If the input data is
+        # missing, the node logs a warning and saves only the SLAM map.
         self.declare_parameter("world_correction.enable", True)
-        # source: gps = robot pose from raw RTK fixes + GPS course heading (robust to global-EKF quality/CPU load;
-        # world frame = ENU metres from the first fix, gps_origin saved); global = /odometry/global pose
+        # source: gps = robot pose from the raw RTK fixes and the GPS course heading (world frame: ENU meters from
+        # the first fix; the YAML saves that origin). global = robot pose from /odometry/global.
         self.declare_parameter("world_correction.source", "gps")
         self.declare_parameter("world_correction.gps_fix_topic", "/fix_rtk")
-        self.declare_parameter("world_correction.antenna_x", -0.5)        # GPS antenna x in the robot frame
+        self.declare_parameter("world_correction.antenna_x", -0.5)        # [m] GPS antenna x in the robot frame
         self.declare_parameter("world_correction.global_odom_topic", "/odometry/global")
-        self.declare_parameter("world_correction.valid_from_topic", "/gps/course_imu")  # first msg = heading aligned
+        self.declare_parameter("world_correction.valid_from_topic", "/gps/course_imu")  # first message: global heading is aligned
         self.declare_parameter("world_correction.settle_s", 5.0)
         self.declare_parameter("world_correction.window_s", 10.0)
         self.declare_parameter("world_correction.cam_fwd_m", 0.73)
@@ -498,9 +497,8 @@ class SaveBestParticleMap(Node):
             p = t.pose.position
             trees[i] = [float(p.x), float(p.y)]
 
-        # row_fast_slam stamps the locked (or best-effort PCA) row yaw estimate
-        # into every published trunk's orientation when use_global_row_yaw is
-        # enabled — all trunks carry the same value, so the first is enough.
+        # With use_global_row_yaw, row_fast_slam puts the locked (or PCA) row yaw estimate in the orientation of
+        # each published trunk. All trunks have the same value, so the first trunk is sufficient.
         row_yaw_rad = _pose_yaw_rad(trunks[0].pose) if trunks else None
 
         init_odom_list = _pose_position_to_list(self._latest_odom_corr_pose)
@@ -520,7 +518,7 @@ class SaveBestParticleMap(Node):
 
         try:
             trees_w, path_w, wc_info = self._world_correction(trees, robot_path)
-        except Exception as e:  # never lose the SLAM map because of the correction
+        except Exception as e:  # a correction error must not stop the save of the SLAM map
             trees_w, path_w, wc_info = None, None, f"failed: {e}"
         if trees_w is not None:
             data["trees_world"] = trees_w
@@ -607,12 +605,12 @@ class SaveBestParticleMap(Node):
                     xy = trees[i]
                     f.write(f"  {i}: [{xy[0]:.6f}, {xy[1]:.6f}]\n")
 
-            # World frame origin (source gps: trees_world / *_world.yaml are ENU metres from this lat/lon)
+            # World frame origin (source gps: trees_world / *_world.yaml are ENU meters from this lat/lon)
             if data.get("world_gps_origin") is not None:
                 o = data["world_gps_origin"]
                 f.write(f"world_gps_origin: [{o[0]:.10f}, {o[1]:.10f}]\n")
 
-            # World-corrected map, when available
+            # World-corrected map, if available
             if "trees_world" in data:
                 f.write("robot_path_world:\n")
                 for r in data.get("robot_path_world") or []:

@@ -1,3 +1,11 @@
+"""Plot the landmark covariance from the row_fast_slam landmark debug CSV.
+
+Usage: python3 plot_slam_variance.py [--csv PATH]
+Default CSV: debug_data/fastslam_debug_landmarks.csv in the tree_template source folder.
+"""
+import argparse
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -31,7 +39,10 @@ def plot_cov_ellipse(ax, mean, cov, color):
     ax.add_patch(ellipse)
 
 
-df = pd.read_csv('/home/marcus/apple_harvest_ws/src/orchard_tree_templating/tree_template/debug_data/fastslam_debug_landmarks.csv')
+DEFAULT_CSV = Path(__file__).resolve().parent.parent / "debug_data" / "fastslam_debug_landmarks.csv"
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("--csv", type=Path, default=DEFAULT_CSV, help="landmark debug CSV (default: %(default)s)")
+df = pd.read_csv(ap.parse_args().csv)
 
 # compute convergence metric
 areas = []

@@ -1,0 +1,47 @@
+# Robot config: the parameters for one robot and one computer (frames, sensor topics, output paths).
+# config/launch_config*.yaml holds the algorithm tuning.
+#
+# This is a ROS params file. trunk_to_template_pub.launch.py loads it after params_file (robot_config:=<path>),
+# so its values win. You can also give it directly to a node:
+#   ros2 run tree_template odom_reframer_calibrated --ros-args -r __node:=odom_reframer \
+#       --params-file launch_config.yaml --params-file prosser_2023_warthog.yaml
+#
+# Launch arguments hold the robot settings that a params file cannot hold. robot_platform:=warthog sets their
+# defaults: nav_config (robot_localization config dir), gps_topic / imu_topic (navsat inputs in legacy mode),
+# publish_robot_description, detector_* / width_estimation_* (external trunk detector).
+#
+# Platform: 2023 Prosser bags, Clearpath Warthog. harvest_hardware_description/urdf/warthog_2023.urdf.xacro
+# (launch/warthog_state_publisher.launch.py) gives the TF tree. Its root is warthog_base_footprint (ground level).
+
+trunk_detection_relay:
+  ros__parameters:
+    input_topic: tree_image_data                    # TreeImageData from the trunk detector
+    # Frame of the bag's base-camera images (/camera/color/image_raw). The RealSense D435i (name camera) in
+    # warthog_2023.urdf.xacro publishes it.
+    camera_frame: camera_color_optical_frame
+    output_frame: warthog_base_footprint            # robot base frame
+    base_x_is_right: false                          # lateral sign convention of the base frame
+
+odom_reframer:
+  ros__parameters:
+    input_odom_topic: /odometry/filtered   # the robot's own odometry
+    base_frame: warthog_base_footprint
+    gps_topic: /fix
+
+row_fast_slam:
+  ros__parameters:
+    base_frame: warthog_base_footprint   # child_frame_id of odom_slam_best
+    # Debug CSVs (+ _landmarks.csv, _tracks.csv), rewritten each run. Default: tree_template/debug_data/ in the
+    # package source folder. Remove the # to set a different path (this value wins over the params file):
+    # debug.csv_path: /path/to/debug_data/fastslam_debug.csv
+
+tree_scene_node:
+  ros__parameters:
+    trellis_frame: warthog_base_footprint   # frame for the MoveIt trellis collision objects
+
+save_best_particle_map:
+  ros__parameters:
+    out: /home/marcus/trunk_width_ws/pf_localization_package_data/slam_measurements/slam_trunks.yaml
+    final_gps_navsat_topic: /fix
+    world_correction.antenna_x: -0.5   # [m] GPS antenna x in the base frame (the reach_rs joint in the xacro)
+    world_correction.cam_fwd_m: 0.80   # [m] camera x in the base frame (camera_color_optical_frame in the xacro)

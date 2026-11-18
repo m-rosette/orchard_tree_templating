@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-GPS course-over-ground as an absolute ENU heading, published as sensor_msgs/Imu orientation.
+GPS course over ground as an absolute ENU heading, published as a sensor_msgs/Imu orientation.
 
-The robot's IMU yaw is not north-referenced, so navsat_transform and the global EKF have no true heading. With
-RTK GPS (~2 cm), the direction between two fixes >= `baseline_m` apart is a good heading (< 1 deg jitter over 1.5 m)
-while the robot drives straight. This node is a conversion, not a filter:
+The IMU yaw of the robot is not north-referenced, so navsat_transform and the global EKF have no true heading.
+With RTK GPS (approximately 2 cm), the direction between two fixes at least `baseline_m` apart is a good heading
+(less than 1 deg jitter over 1.5 m) while the robot drives straight. This node converts; it does not filter:
 
-  for each fix: take the latest earlier fix >= baseline_m away (within max_dt_s); publish
-  yaw = atan2(dN, dE) (+pi when reversing) only if the wheel odometry turned < max_turn_deg over that interval and
-  |v| > min_speed. Stamped at the middle of the interval (consumers need smooth_lagged_data / history_length).
-  yaw sigma = sqrt(2) * sigma_pos_m / baseline + floor_deg; roll/pitch covariance huge.
+  For each fix, find the latest earlier fix that is at least baseline_m away (within max_dt_s). Publish
+  yaw = atan2(dN, dE) (+pi when the robot reverses) only if the wheel odometry turned less than max_turn_deg in
+  that interval and |v| > min_speed. The stamp is the middle of the interval, so the users need
+  smooth_lagged_data / history_length. yaw sigma = sqrt(2) * sigma_pos_m / baseline + floor_deg. The roll and
+  pitch covariance are very large.
 
-Consumers: navsat_transform (imu input, use_odometry_yaw false, yaw_offset 0) and ekf_global (imuN, yaw only).
+Users: navsat_transform (imu input, use_odometry_yaw false, yaw_offset 0) and ekf_global (imuN, yaw only).
 """
 import math
 from collections import deque

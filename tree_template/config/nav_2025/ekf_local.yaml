@@ -14,7 +14,7 @@ ekf_local:
     publish_tf: false
     publish_acceleration: false
 
-    # Wheel odometry — consume odom_reframer's recentered output, not the raw bag topic
+    # Wheel odometry: the odom_reframer output (/odometry/wheel), not the raw bag topic
     odom0: /odometry/wheel
     odom0_queue_size: 10
     odom0_differential: false

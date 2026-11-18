@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Short-term trunk track layer used by RowFastSLAM data association.
+Short-term trunk track layer for the RowFastSLAM data association.
 
-Detections are placed in the odometry frame (locally accurate over a few seconds) and linked into
-per-tree tracks. Each track is bound to one landmark key:
-  - a template slot index j (the normal case), or
-  - an "extra" landmark key (>= EXTRA_KEY_BASE) when a second, distinct tree lands in a slot that
-    another tree already owns (closely spaced trees that would otherwise be merged).
+The layer puts detections in the odometry frame (accurate over a few seconds) and links them into one track per
+tree. Each track has one landmark key:
+  - a template slot index j (the usual case), or
+  - an "extra" landmark key (>= EXTRA_KEY_BASE) when a second, different tree is in a slot that another tree
+    owns (two trees close together that one slot would merge).
 
-Width is a secondary cue: it can break a link inside the position gate, and it can confirm that two
-close tracks are different trees.
+The trunk width is a second cue: it can stop a link in the position gate, and it can show that two close tracks
+are different trees.
 """
 
 from dataclasses import dataclass, field
@@ -86,7 +86,7 @@ class TrunkTrackManager:
     # ---------------- linking ----------------
 
     def update(self, t: float, xy: np.ndarray, width: Optional[float]) -> TrunkTrack:
-        """Link one detection (odom-frame position) to a track, creating one if needed."""
+        """Link one detection (odom-frame position) to a track. Make a new track if no track is in the gate."""
         xy = np.asarray(xy, dtype=float).reshape(2)
         self._active = [k for k in self._active if (t - self.tracks[k].last_t) <= self.max_gap_sec]
 
@@ -132,12 +132,12 @@ class TrunkTrackManager:
 
     def bind(self, tr: TrunkTrack, slot_j: int) -> Optional[int]:
         """
-        Return the landmark key for this track, deciding it on first call:
-          1. a fragment of an already-bound tree inherits that tree's key,
-          2. otherwise the track owns slot_j if the slot is free,
-          3. otherwise it is a second tree in an occupied slot -> new extra key, but only once the
-             track has split_min_hits detections. Until then None is returned (caller holds the
-             measurement back) so a single stray detection cannot create a landmark.
+        Return the landmark key for this track. The first call sets the key:
+          1. a part of a tree that already has a key gets that key,
+          2. if not, the track owns slot_j if the slot is free,
+          3. if not, the track is a second tree in a used slot and gets a new extra key, but only after
+             split_min_hits detections. Until then the function returns None and the caller holds the
+             measurement back, so one stray detection cannot make a landmark.
         """
         if tr.landmark_key is not None:
             return tr.landmark_key
@@ -170,7 +170,7 @@ class TrunkTrackManager:
         return key
 
     def claim(self, tr: TrunkTrack, slot_j: int) -> None:
-        """Force-bind a track to a template slot (used for the tree the template origin was anchored on)."""
+        """Bind a track to a template slot (for the tree that the template origin is anchored on)."""
         slot_j = int(slot_j)
         self.slot_owner[slot_j] = tr.track_id
         tr.landmark_key = slot_j
@@ -186,7 +186,7 @@ class TrunkTrackManager:
         return self.tracks[owner].landmark_key != tr.landmark_key
 
     def describe_split(self, tr: TrunkTrack) -> str:
-        """One-line summary of an extra-landmark split decision (for logging)."""
+        """Return a one-line summary of an extra-landmark split (for the log)."""
         slot_j = self.extra_base_slot.get(tr.landmark_key)
         owner = self.tracks.get(self.slot_owner.get(slot_j, -1))
         if owner is None:

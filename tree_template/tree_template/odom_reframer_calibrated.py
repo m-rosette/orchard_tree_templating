@@ -35,14 +35,14 @@ class OdomReframer(Node):
         self.declare_parameter("use_now_stamp", False)
         self.declare_parameter("copy_twist", True)
 
-        # --- Sensor model for downstream EKFs (all off by default = previous behaviour) ---
-        # The 2023 Warthog odometry/filtered reports zero pose covariance and its twist disagrees with its own
-        # pose by ~8%. twist_from_pose replaces the output twist with the body-frame velocity of the (pose)
-        # channel over a short window, and twist_cov_* attaches an explicit error model, so an EKF can fuse
-        # velocities only and other sensors (IMU, GPS speed) can actually pull the estimate.
+        # --- Sensor model for the EKFs after this node (all off by default) ---
+        # The 2023 Warthog odometry/filtered has zero pose covariance, and its twist does not agree with its pose.
+        # twist_from_pose replaces the output twist with the body-frame velocity of the pose over a short window.
+        # twist_cov_* adds an error model. Then an EKF can fuse only the velocities, and other sensors (IMU, GPS)
+        # can correct the estimate.
         self.declare_parameter("twist_from_pose", False)
         self.declare_parameter("twist_from_pose_window", 5)     # messages (5 @ 50 Hz = 0.1 s)
-        self.declare_parameter("set_twist_cov", False)          # implied by twist_from_pose
+        self.declare_parameter("set_twist_cov", False)          # always on when twist_from_pose is on
         self.declare_parameter("twist_cov_frac_v", 0.03)        # sigma_v = frac * |v| + floor
         self.declare_parameter("twist_cov_floor_v", 0.005)      # m/s
         self.declare_parameter("twist_cov_frac_w", 0.03)        # sigma_w = frac * |w| + floor
@@ -337,8 +337,8 @@ class OdomReframer(Node):
             out.pose.covariance = pc
 
         if self.twist_from_pose:
-            # difference over the INPUT header stamps (sensor time): with use_now_stamp the output stamp is the
-            # receive time, which jitters with transport/bag-playback bunching and biases v = dp/dt upward
+            # Use the input header stamps (sensor time) for the difference. With use_now_stamp the output stamp is
+            # the receive time, which has jitter from transport and bag playback, and makes v = dp/dt too large.
             t_now = float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
             yaw_now = self._quat_to_yaw(q_out)
             self._pose_hist.append((t_now, float(pos_out[0]), float(pos_out[1]), yaw_now))

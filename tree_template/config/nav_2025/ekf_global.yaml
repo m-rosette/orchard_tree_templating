@@ -33,8 +33,7 @@ ekf_global:
     # Reject GPS updates that jump more than this Mahalanobis distance
     odom1_pose_rejection_threshold: 4.0
 
-    # Process noise — higher x/y values = less GPS authority, more wheel trust
-    # Start here; increase x[0,0] and x[1,1] further if scale error persists
+    # Process noise. Higher x/y values give the GPS less weight and the wheel odometry more weight.
     process_noise_covariance: [
       0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
       0.0,  0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,

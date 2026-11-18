@@ -1,10 +1,10 @@
-# navsat_transform for mode gps_heading: heading comes from /gps/course_imu (GPS course, already ENU, 0 = east),
-# odometry input is /odometry/global, fix input /fix_rtk (remaps in gps_fusion.launch.py). No dataset-specific yaw_offset.
+# navsat_transform for ekf_fusion.launch.py mode:=gps_heading. Heading comes from /gps/course_imu (GPS course, ENU,
+# 0 = east). Odometry input is /odometry/global. Fix input is /fix_rtk. The launch file sets these with remaps.
 navsat_transform:
   ros__parameters:
     frequency: 10.0
     delay: 0.0
-    gps_topic: /fix_rtk            # informational: actual topics are set by remaps in gps_fusion.launch.py
+    gps_topic: /fix_rtk            # for reference only: ekf_fusion.launch.py sets the topics with remaps
     imu_topic: /gps/course_imu
     odom_topic: /odometry/global
     output_topic: /odometry/gps

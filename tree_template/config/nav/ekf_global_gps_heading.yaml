@@ -1,8 +1,8 @@
-# ekf_global for mode gps_heading (gps_fusion.launch.py mode:=gps_heading). Validated offline on the 2023 Warthog bags.
-# vs ekf_global.yaml: fuses wheel VELOCITIES (/odometry/wheel from odom_reframer with twist_from_pose: true, explicit
-# covariance) + IMU yaw rate + GPS position (/odometry/gps, from /fix_rtk with realistic covariance) + GPS course
-# heading (/gps/course_imu, absolute ENU yaw) instead of /odometry/local poses; low process noise (x,y 0.005, yaw 0.01);
-# lagged-data smoothing because course headings are stamped mid-baseline (~1-2 s old).
+# ekf_global for ekf_fusion.launch.py mode:=gps_heading.
+# Inputs: wheel velocities (/odometry/wheel from odom_reframer with twist_from_pose: true), IMU yaw rate,
+# GPS position (/odometry/gps, from /fix_rtk) and GPS course heading (/gps/course_imu, ENU yaw).
+# Process noise is low (x, y 0.005; yaw 0.01). Lagged-data smoothing is on, because the course heading is
+# stamped at the middle of its baseline (1-2 s old).
 ekf_global:
   ros__parameters:
     frequency: 20.0
@@ -10,7 +10,7 @@ ekf_global:
     two_d_mode: true
     map_frame: map
     odom_frame: odom
-    base_link_frame: amiga__base
+    base_link_frame: warthog_base_footprint
     world_frame: map
     publish_tf: true
     publish_acceleration: false

@@ -520,9 +520,8 @@ def main():
     # ------------------------------------------------------------------
     # 4. Calibrate header-stamp -> bag receive-time mapping
     #
-    #    Needed because the SQL `timestamp` column is bag RECEIVE time, which
-    #    may be in a completely different epoch than image header.stamp for
-    #    replayed/reprocessed bags.
+    #    The SQL `timestamp` column is the bag receive time. For replayed or
+    #    reprocessed bags, it can be in a different epoch than image header.stamp.
     # ------------------------------------------------------------------
     calibration = None
     cal_topic = None
@@ -631,7 +630,7 @@ def main():
             cam_dir = os.path.join(tree_dir, cam.name)
 
             if cam.buffer_radius == 0:
-                # Single-frame mode (default, existing behavior)
+                # Single-frame mode (default)
                 color_img = ros_image_to_cv2(color_msg)
                 depth_img = ros_image_to_cv2(depth_msg)
                 del color_msg, depth_msg
@@ -648,7 +647,7 @@ def main():
                     "saved":       True,
                 }
             else:
-                # Multi-frame buffer mode: fetch radius frames on each side
+                # Buffer mode: get buffer_radius frames on each side
                 r = cam.buffer_radius
                 before_colors, after_colors = fetch_adjacent_frames(
                     con, topic_id_map[cam.color_topic], type_map[cam.color_topic],
@@ -659,7 +658,7 @@ def main():
                     t_ns_depth, r, r,
                 )
 
-                # Pad with None where the bag doesn't have enough adjacent frames
+                # Fill with None where the bag does not have sufficient adjacent frames
                 before_colors = [None] * (r - len(before_colors)) + before_colors
                 after_colors  = after_colors  + [None] * (r - len(after_colors))
                 before_depths = [None] * (r - len(before_depths)) + before_depths
@@ -673,8 +672,8 @@ def main():
                 frame_meta = {}
                 n_buf_saved = 0
                 for i, (c_msg, d_msg) in enumerate(zip(all_colors, all_depths)):
-                    offset     = i - r
-                    frame_name = f"frame_{offset}"
+                    frame_idx  = i - r
+                    frame_name = f"frame_{frame_idx}"
                     frame_dir  = os.path.join(cam_dir, frame_name)
                     if c_msg is not None and d_msg is not None:
                         color_img = ros_image_to_cv2(c_msg)

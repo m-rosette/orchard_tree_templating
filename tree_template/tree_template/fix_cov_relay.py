@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Republish a NavSatFix with a realistic position covariance (and optional stamp shift).
+Republish a NavSatFix with an RTK position covariance (and an optional stamp shift).
 
-The 2023 Reach RS publishes a ~1 m placeholder covariance while its real (RTK) noise is ~2 cm, so
-robot_localization would barely trust it. This relay sets a diagonal covariance from `sigma_m` (vertical 2x) and
-COVARIANCE_TYPE_DIAGONAL_KNOWN, drops fixes below `min_status`, and adds `stamp_shift_s` to the header stamp
-(for a known constant GPS latency / clock offset; 0 when clocks are synchronised).
+The 2023 Reach RS publishes a 1 m placeholder covariance, but its RTK noise is approximately 2 cm. With the
+placeholder, robot_localization gives the GPS almost no weight. This relay:
+  - sets a diagonal covariance from `sigma_m` (vertical: 2 x sigma_m), type COVARIANCE_TYPE_DIAGONAL_KNOWN,
+  - drops fixes with a status below `min_status`,
+  - adds `stamp_shift_s` to the header stamp (a constant GPS latency or clock offset; 0 with synchronized clocks).
 """
 import rclpy
 from rclpy.node import Node
