@@ -262,6 +262,6 @@ trellis_from_rgbd_extraction:
     anchor_tree_id: -1
     trellis_side: far
     registry_topic: fastslam_registry
-    shift_whole_map: false
+    shift_whole_map: true
     max_correction_m: 2.0
     measurement_timeout_sec: 5.0

@@ -19,16 +19,19 @@ anchor_tree_id          (int)   – tree to anchor on; -1 = none yet (set it at 
 trellis_side            (str)   – fallback side when meta.yaml has no 'side' field (default "far").
 z_offset                (float) – vertical offset added to all trunk z-positions (default 0.0).
 registry_topic          (str)   – topic name for the TrunkRegistry message (default "fastslam_registry").
-shift_whole_map         (bool)  – if True, correction shifts all trunks; if False, anchor only (default False).
+shift_whole_map         (bool)  – if True, correction shifts all trunks; if False, anchor only (default True).
 max_correction_m        (float) – reject corrections larger than this magnitude in metres (default 1.0).
 measurement_timeout_sec (float) – seconds to wait for a trunk measurement after triggering (default 5.0).
 slam_results_yaml       (str)   – path to the yaml written by save_best_particle_map.py for this run.
+                                  If empty, the node uses the slam_trunks_*.yaml file in extraction_dir.
                                   If it has a row_yaw_rad value, the node uses this one row yaw for
                                   the whole run to de-rotate all tree positions, so the row is along
                                   local +X. If not, the node uses the broadside yaw of the anchor tree.
                                   The trunk orientation is always identity: the robot pose defines the
                                   planning frame, so the trellis side branches are perpendicular to
                                   the row at all trees.
+
+trellis_geometry.py has the frame definitions and the transform.
 
 Workflow
 --------
@@ -53,14 +56,10 @@ Each meta.yaml must have at least:
 """
 
 import copy
-import glob
-import os
 import threading
-from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
-import yaml
 
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -71,148 +70,14 @@ from rcl_interfaces.msg import SetParametersResult
 from std_srvs.srv import Trigger
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
 
-
-# =============================================================================
-#  Pure helper functions
-# =============================================================================
-
-def _load_meta_yamls(extraction_dir: str) -> Dict[int, dict]:
-    """
-    Walk extraction_dir for tree_*/meta.yaml files and return a dict
-    keyed by integer tree_id.
-    """
-    pattern = os.path.join(extraction_dir, "tree_*", "meta.yaml")
-    paths = sorted(glob.glob(pattern))
-
-    if not paths:
-        raise FileNotFoundError(
-            f"No tree_*/meta.yaml files found under: {extraction_dir}"
-        )
-
-    tree_data: Dict[int, dict] = {}
-    for p in paths:
-        with open(p, "r") as f:
-            meta = yaml.safe_load(f)
-
-        if "tree_id" in meta:
-            tid = int(meta["tree_id"])
-        else:
-            dir_name = Path(p).parent.name  # e.g. "tree_008"
-            tid = int(dir_name.split("_")[-1])
-            meta["tree_id"] = tid
-
-        tree_data[tid] = meta
-
-    return tree_data
-
-
-def _extract_world_xy(meta: dict) -> np.ndarray:
-    """Pull [x, y] world position from a meta dict (key: tree_world_xy_m)."""
-    wp = meta.get("tree_world_xy_m")
-    if wp is None:
-        raise KeyError(f"meta.yaml for tree {meta.get('tree_id')} missing 'tree_world_xy_m'")
-    return np.array([float(wp[0]), float(wp[1])], dtype=np.float64)
-
-
-def _extract_world_z(meta: dict) -> float:
-    # No Z stored in fast_slam_rgbd_extraction meta.yaml; always ground level.
-    return 0.0
-
-
-def _load_global_row_yaw(slam_results_yaml: str) -> Optional[float]:
-    """
-    Return row_yaw_rad from the yaml that save_best_particle_map.py writes.
-    Return None if the path is empty or missing, or the field is missing or null.
-    Then the caller uses the broadside yaw of the anchor tree.
-    """
-    if not slam_results_yaml:
-        return None
-    p = Path(slam_results_yaml).expanduser()
-    if not p.exists():
-        return None
-    try:
-        with open(p, "r") as f:
-            data = yaml.safe_load(f) or {}
-    except Exception:
-        return None
-    val = data.get("row_yaw_rad")
-    if val is None:
-        return None
-    try:
-        v = float(val)
-        return v if np.isfinite(v) else None
-    except Exception:
-        return None
-
-
-def _anchor_transform(
-    tree_data: Dict[int, dict],
-    anchor_id: int,
-    global_row_yaw: Optional[float] = None,
-) -> Tuple[np.ndarray, float, float]:
-    """
-    Compute the 2-D rigid transform that re-centers the row so that:
-
-      - The robot sits at (0, 0).
-      - The anchor tree is at its original observed lateral offset
-        (lat_dist_to_tree_m) on the Y axis.
-      - All other trees are positioned relative to the anchor in the
-        same rotated frame.
-
-    row_yaw is the angle used to de-rotate ALL tree positions into the
-    local frame, making the row lie along local +X. When global_row_yaw
-    is provided (the locked, run-wide estimate saved by
-    save_best_particle_map.py) it is used instead of the anchor's own
-    single broadside sample, since it's averaged over the whole run
-    rather than one odom reading.
-
-    Trunk orientation downstream is identity — the planning frame is
-    defined by the robot's current pose, so "row direction" is local +X
-    by construction and the trellis side branches are perpendicular to
-    it everywhere along the row.
-
-    Returns
-    -------
-    robot_origin_xy : (2,) world-frame robot position when anchor was broadside
-    row_yaw         : yaw (rad) used to de-rotate tree positions into the local frame
-    anchor_fwd      : along-row distance of the anchor tree from its broadside robot pose
-    """
-    if anchor_id not in tree_data:
-        raise ValueError(
-            f"Anchor tree id {anchor_id} not found. "
-            f"Available ids: {sorted(tree_data.keys())}"
-        )
-
-    anchor_meta = tree_data[anchor_id]
-    xyt = anchor_meta.get("broadside_robot_pose_xyt", [0.0, 0.0, 0.0])
-    robot_origin_xy = np.array([float(xyt[0]), float(xyt[1])], dtype=np.float64)
-    anchor_broadside_yaw = float(xyt[2]) if len(xyt) >= 3 else 0.0
-
-    row_yaw = float(global_row_yaw) if global_row_yaw is not None else anchor_broadside_yaw
-    anchor_fwd = float(anchor_meta.get("fwd_dist_to_tree_m", 0.0))
-
-    return robot_origin_xy, row_yaw, anchor_fwd
-
-
-def _transform_to_local(
-    world_xy: np.ndarray,
-    robot_origin_xy: np.ndarray,
-    row_yaw: float,
-    tree_fwd: float,
-    anchor_fwd: float,
-) -> np.ndarray:
-    """Compute local (x, y) for a trunk in the anchor robot frame."""
-    c, s = np.cos(-row_yaw), np.sin(-row_yaw)
-    rot = np.array([[c, -s], [s, c]], dtype=np.float64)
-
-    trunk_rot = rot @ world_xy
-    robot_rot = rot @ robot_origin_xy
-
-    along_row_world = trunk_rot[0] - robot_rot[0]
-    x = anchor_fwd + along_row_world
-    y = trunk_rot[1] - robot_rot[1]
-
-    return np.array([x, y], dtype=np.float64)
+from tree_template.trellis_geometry import (
+    anchor_transform,
+    extract_world_z,
+    find_slam_results_yaml,
+    load_global_row_yaw,
+    load_meta_yamls,
+    local_positions,
+)
 
 
 # =============================================================================
@@ -237,7 +102,7 @@ class TrellisFromExtractionNode(Node):
         self.declare_parameter("trellis_side", "far")
         self.declare_parameter("z_offset", 0.0)
         self.declare_parameter("registry_topic", "fastslam_registry")
-        self.declare_parameter("shift_whole_map", False)
+        self.declare_parameter("shift_whole_map", True)
         self.declare_parameter("max_correction_m", 1.0)
         self.declare_parameter("measurement_timeout_sec", 5.0)
         self.declare_parameter("slam_results_yaml", "")  # output of save_best_particle_map.py
@@ -251,27 +116,36 @@ class TrellisFromExtractionNode(Node):
         self.measurement_timeout_sec = float(self.get_parameter("measurement_timeout_sec").value)
         self.slam_results_yaml = str(self.get_parameter("slam_results_yaml").value)
 
-        self._global_row_yaw: Optional[float] = _load_global_row_yaw(self.slam_results_yaml)
-        if self.slam_results_yaml:
-            if self._global_row_yaw is not None:
-                self.get_logger().info(
-                    f"Loaded global row_yaw_rad={self._global_row_yaw:.6f} "
-                    f"({np.degrees(self._global_row_yaw):.2f} deg) from {self.slam_results_yaml}"
-                )
-            else:
-                self.get_logger().warn(
-                    f"slam_results_yaml set ({self.slam_results_yaml}) but row_yaw_rad "
-                    "missing/null/unreadable — falling back to per-anchor broadside yaw."
-                )
-
         if not self.extraction_dir:
             self.get_logger().fatal("Parameter 'extraction_dir' must be set.")
             raise RuntimeError("extraction_dir not set")
+
+        # The SLAM map and the extracted images must come from the same run (tree ids are not stable
+        # between runs), so the default is the slam_trunks_*.yaml file in extraction_dir.
+        if not self.slam_results_yaml:
+            self.slam_results_yaml = find_slam_results_yaml(self.extraction_dir)
+        self._global_row_yaw: Optional[float] = load_global_row_yaw(self.slam_results_yaml)
+        if self._global_row_yaw is not None:
+            self.get_logger().info(
+                f"Loaded global row_yaw_rad={self._global_row_yaw:.6f} "
+                f"({np.degrees(self._global_row_yaw):.2f} deg) from {self.slam_results_yaml}"
+            )
+        else:
+            self.get_logger().warn(
+                "\n" + "!" * 78 + "\n"
+                f"  No usable row_yaw_rad (slam_results_yaml='{self.slam_results_yaml}',\n"
+                f"  extraction_dir='{self.extraction_dir}').\n"
+                "  The node uses the broadside yaw of each anchor tree (one odom sample) for the row\n"
+                "  direction. The template yaw can be wrong by several degrees.\n"
+                + "!" * 78
+            )
 
         # ── State ─────────────────────────────────────────────────────────────
         self._tree_data: Dict[int, dict] = {}
         self._last_anchor_id: Optional[int] = None
         self._last_registry_msg: Optional[TrunkRegistry] = None
+        # Tree id of each trunk in _last_registry_msg (same order)
+        self._last_registry_ids: List[int] = []
 
         # Trunk measurement state: _sub_cbg writes it, the service handler reads it
         self._latest_trunk_pose = None
@@ -312,7 +186,7 @@ class TrellisFromExtractionNode(Node):
 
     def _do_startup(self):
         try:
-            self._tree_data = _load_meta_yamls(self.extraction_dir)
+            self._tree_data = load_meta_yamls(self.extraction_dir)
         except FileNotFoundError as e:
             self.get_logger().fatal(str(e))
             raise RuntimeError(str(e))
@@ -341,6 +215,11 @@ class TrellisFromExtractionNode(Node):
             if param.name == "anchor_tree_id":
                 anchor_id = int(param.value)
                 if anchor_id >= 0:
+                    if self._tree_data and anchor_id not in self._tree_data:
+                        reason = (f"anchor_tree_id {anchor_id} is not in {self.extraction_dir}. "
+                                  f"Available ids: {sorted(self._tree_data.keys())}")
+                        self.get_logger().error(reason)
+                        return SetParametersResult(successful=False, reason=reason)
                     if not self._tree_data:
                         self.get_logger().warn(
                             "anchor_tree_id set before yaml data was loaded — ignoring."
@@ -364,7 +243,10 @@ class TrellisFromExtractionNode(Node):
 
     def _try_publish(self, anchor_id: int):
         try:
-            robot_origin_xy, row_yaw, anchor_fwd = _anchor_transform(
+            robot_origin_xy, row_yaw = anchor_transform(
+                self._tree_data, anchor_id, self._global_row_yaw
+            )
+            ids, local_xy, skipped = local_positions(
                 self._tree_data, anchor_id, self._global_row_yaw
             )
         except ValueError as e:
@@ -377,17 +259,26 @@ class TrellisFromExtractionNode(Node):
             f"row_yaw={np.degrees(row_yaw):.1f} deg "
             f"({'global slam estimate' if self._global_row_yaw is not None else 'anchor sample'})"
         )
-
-        msg = self._build_trunk_registry(
-            self._tree_data, anchor_id, robot_origin_xy, row_yaw, anchor_fwd
-        )
-        if msg is None:
+        for tid in skipped:
+            self.get_logger().warn(f"tree_{tid:03d}: skipped, meta.yaml has no tree_world_xy_m")
+        if anchor_id not in ids:
+            self.get_logger().error(f"Anchor tree_{anchor_id:03d} has no world position. Registry not published.")
             return
+
+        # Row direction check: a line fit through the local trunk positions must be close to local +X.
+        if len(ids) >= 3:
+            slope_deg = float(np.degrees(np.arctan(np.polyfit(local_xy[:, 0], local_xy[:, 1], 1)[0])))
+            log = self.get_logger().warn if abs(slope_deg) > 1.0 else self.get_logger().info
+            log(f"Row line fit through {len(ids)} trunks is {slope_deg:+.2f} deg from local +X "
+                f"(row_yaw source: {'slam_results_yaml' if self._global_row_yaw is not None else 'anchor broadside'}).")
+
+        msg = self._build_trunk_registry(self._tree_data, anchor_id, ids, local_xy)
 
         # With TRANSIENT_LOCAL durability, a subscriber that joins late gets the last
         # message, so the node does not wait for subscribers before it publishes.
         self.registry_pub.publish(msg)
         self._last_registry_msg = msg
+        self._last_registry_ids = list(ids)
         self._last_anchor_id = anchor_id
 
         self.get_logger().info(
@@ -398,36 +289,22 @@ class TrellisFromExtractionNode(Node):
         self,
         tree_data: Dict[int, dict],
         anchor_id: int,
-        robot_origin_xy: np.ndarray,
-        row_yaw: float,
-        anchor_fwd: float,
-    ) -> Optional[TrunkRegistry]:
-        """Build (but do not publish) a TrunkRegistry from tree_data."""
+        ids: List[int],
+        local_xy: np.ndarray,
+    ) -> TrunkRegistry:
+        """Make (but do not publish) a TrunkRegistry. ids and local_xy come from local_positions()."""
         msg = TrunkRegistry()
-        skipped = 0
+        stamp = self.get_clock().now().to_msg()
 
-        for tid in sorted(tree_data.keys()):
+        for tid, xy in zip(ids, local_xy):
             meta = tree_data[tid]
-
-            try:
-                world_xy = _extract_world_xy(meta)
-                world_z = _extract_world_z(meta)
-            except KeyError as e:
-                self.get_logger().warn(f"tree_{tid:03d}: skipping — {e}")
-                skipped += 1
-                continue
-
-            tree_fwd = float(meta.get("fwd_dist_to_tree_m", 0.0))
-            local_xy = _transform_to_local(
-                world_xy, robot_origin_xy, row_yaw, tree_fwd, anchor_fwd
-            )
             side = str(meta.get("side", self.trellis_side)) or self.trellis_side
 
             trunk = TrunkInfo()
-            trunk.stamp = self.get_clock().now().to_msg()
-            trunk.pose.position.x = float(local_xy[0])
-            trunk.pose.position.y = float(local_xy[1])
-            trunk.pose.position.z = float(world_z) + float(self.z_offset)
+            trunk.stamp = stamp
+            trunk.pose.position.x = float(xy[0])
+            trunk.pose.position.y = float(xy[1])
+            trunk.pose.position.z = float(extract_world_z(meta)) + float(self.z_offset)
             # Identity orientation: the tree positions are de-rotated, so the row is
             # along local +X. generate_trellis_collision_obj sets the side-branch yaw
             # from `side`.
@@ -438,11 +315,8 @@ class TrellisFromExtractionNode(Node):
 
             self.get_logger().info(
                 f"tree_{tid:03d} {'[ANCHOR]' if tid == anchor_id else '        '} "
-                f"local=({local_xy[0]:+.3f}, {local_xy[1]:+.3f})  side={side}"
+                f"local=({xy[0]:+.3f}, {xy[1]:+.3f})  side={side}"
             )
-
-        if skipped:
-            self.get_logger().warn(f"Skipped {skipped} trees due to missing data.")
 
         return msg
 
@@ -472,7 +346,7 @@ class TrellisFromExtractionNode(Node):
         Service handler for /correct_template_anchor.
 
         1. Checks that a registry was published after the last anchor set.
-        2. Finds the anchor trunk (x closest to 0 in the robot frame).
+        2. Finds the anchor trunk by its tree id.
         3. Triggers a new depth estimate and waits for the result.
         4. Computes delta = live_xy - template_xy.
         5. Checks the delta magnitude.
@@ -498,10 +372,14 @@ class TrellisFromExtractionNode(Node):
             self.get_logger().warn(response.message)
             return response
 
-        anchor_idx = min(
-            range(len(trunks)),
-            key=lambda i: abs(trunks[i].pose.position.x)
-        )
+        if self._last_anchor_id not in self._last_registry_ids:
+            response.success = False
+            response.message = (
+                f"Anchor tree_{self._last_anchor_id:03d} is not in the cached TrunkRegistry."
+            )
+            self.get_logger().warn(response.message)
+            return response
+        anchor_idx = self._last_registry_ids.index(self._last_anchor_id)
         template_xy = np.array([
             trunks[anchor_idx].pose.position.x,
             trunks[anchor_idx].pose.position.y,
