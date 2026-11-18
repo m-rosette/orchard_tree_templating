@@ -2,6 +2,7 @@
 # on Ubuntu 22.04.
 numpy
 scipy
+scikit-image   # 2-D rigid transforms (EuclideanTransform)
 PyYAML
 utm            # fast_slam_rgbd_extraction, evaluation scripts
 # opencv: use apt python3-opencv (rosdep); a pip opencv-python can clash with the ROS cv2

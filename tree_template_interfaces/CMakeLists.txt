@@ -13,7 +13,6 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/UpdateTrellisPosition.srv"
-  "srv/CorrectAnchor.srv"
   "srv/SaveSlamResults.srv"
   "msg/TrunkInfo.msg"
   "msg/TrunkRegistry.msg"

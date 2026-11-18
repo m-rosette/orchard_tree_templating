@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import yaml
+from scipy.spatial.transform import Rotation
 
 
 def camera_matrix(info: Dict) -> np.ndarray:
@@ -30,14 +31,8 @@ def check_no_distortion(info: Dict, tol: float = 1e-6) -> bool:
 
 
 def rotation_from_rotvec(rv) -> np.ndarray:
-    """Rodrigues formula: rotation vector (rad) -> 3x3 rotation matrix."""
-    rv = np.asarray(rv, dtype=np.float64)
-    th = float(np.linalg.norm(rv))
-    if th < 1e-12:
-        return np.eye(3)
-    k = rv / th
-    kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
-    return np.eye(3) + np.sin(th) * kx + (1 - np.cos(th)) * kx @ kx
+    """Rotation vector (rad) -> 3x3 rotation matrix."""
+    return Rotation.from_rotvec(np.asarray(rv, dtype=np.float64)).as_matrix()
 
 
 def register_depth_to_color(
@@ -99,23 +94,6 @@ def register_depth_to_color(
 
     out[~np.isfinite(out)] = 0
     return out.reshape(H_c, W_c).astype(depth.dtype)
-
-
-def registration_error(
-    depth: np.ndarray, aligned_ref: np.ndarray, K_depth, K_color, R, t, max_abs: float = 100.0
-) -> Tuple[float, float, int]:
-    """
-    Compare register_depth_to_color(depth) with a reference aligned image (for example the camera driver output).
-    Return (median |diff|, fraction of pixels with |diff| <= max_abs, number of pixels with data in both).
-    """
-    reg = register_depth_to_color(depth, K_depth, K_color, R, t, aligned_ref.shape[:2]).astype(np.float64)
-    ref = aligned_ref.astype(np.float64)
-    both = (reg > 0) & (ref > 0)
-    n = int(both.sum())
-    if n == 0:
-        return float("inf"), 0.0, 0
-    diff = np.abs(reg[both] - ref[both])
-    return float(np.median(diff)), float(np.mean(diff <= max_abs)), n
 
 
 def load_extrinsics_yaml(path: str) -> Tuple[np.ndarray, np.ndarray, dict]:

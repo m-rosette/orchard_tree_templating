@@ -43,6 +43,7 @@
   <!-- Python libraries. utm has no rosdep key on Ubuntu 22.04: pip install -r requirements.txt -->
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-skimage</exec_depend>       <!-- 2-D rigid transforms (EuclideanTransform) -->
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-opencv</exec_depend>        <!-- fast_slam_rgbd_extraction -->
   <exec_depend>python3-matplotlib</exec_depend>    <!-- plot_*.py -->

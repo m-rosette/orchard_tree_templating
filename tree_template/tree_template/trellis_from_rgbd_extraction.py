@@ -53,7 +53,7 @@ Workflow
 1. Launch the node.
 2. Set the anchor tree at runtime to publish the initial template:
        ros2 param set /trellis_from_rgbd_extraction anchor_tree_id 8
-3. Call /correct_template_anchor (tree_template_interfaces/CorrectAnchor). For each frame in frame_offsets the
+3. Call /correct_template_anchor (std_srvs/Trigger). For each frame in frame_offsets the
    node selects the presaved base-camera frame, triggers the trunk detector and collects the TrunkInfo
    detections (robot base frame of that image). With the frame pose from meta.yaml (world_pose_xyt) each
    detection goes into the local frame. The detections of one object in different frames are grouped
@@ -76,12 +76,14 @@ Each meta.yaml must have at least:
 """
 
 import copy
+import json
 import math
 import threading
 import time
 from typing import Dict, List, Optional
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
@@ -92,13 +94,10 @@ from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue, SetPara
 from rcl_interfaces.srv import SetParameters
 from std_srvs.srv import Trigger
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
-from tree_template_interfaces.srv import CorrectAnchor
 
 from tree_template.trellis_geometry import (
     anchor_transform,
-    apply_map_correction,
     associate_groups,
-    base_to_local,
     cluster_detections,
     extract_world_z,
     fit_map_correction,
@@ -232,7 +231,7 @@ class TrellisFromExtractionNode(Node):
             if self.frame_select_service else None
         )
         self.correction_service = self.create_service(
-            CorrectAnchor,
+            Trigger,
             "/correct_template_anchor",
             self._correct_template_anchor_callback,
             callback_group=self._service_cbg,
@@ -440,16 +439,29 @@ class TrellisFromExtractionNode(Node):
     #  Correction service
     # =========================================================================
 
-    def _fail(self, response, message: str):
+    def _fail(self, response, message: str, result: Optional[dict] = None):
+        """Failure: message is a JSON object with "error" and the result fields known so far."""
         response.success = False
-        response.message = message
+        response.message = json.dumps(dict(result or {}, error=message))
         self.get_logger().warn(message)
         return response
 
     def _correct_template_anchor_callback(self, request, response):
         """
-        Service handler for /correct_template_anchor (CorrectAnchor): collect -> associate -> fit -> apply.
+        Service handler for /correct_template_anchor (std_srvs/Trigger): collect -> associate -> fit -> apply.
+
+        response.message is a JSON object:
+          summary (success) or error (failure)
+          dx, dy, dyaw         correction applied to all trunks, local frame: p_new = R(dyaw) @ p + [dx, dy]
+          anchor_dx, anchor_dy shift of the anchor trunk [m]
+          n_detections         detections from all frames
+          n_matched            detections in groups matched to a map trunk
+          matched_tree_ids     distinct matched trunks
+          rms_residual_m       RMS of (corrected prediction - detection) over the matched detections
+          yaw_clamped
+          frames_used          base-camera frames with at least one matched detection
         """
+        result = {}
         if self._last_registry_msg is None or self._last_anchor_id is None or self._robot_origin_xy is None:
             return self._fail(response, "No registry yet. Set anchor_tree_id before calling /correct_template_anchor.")
         anchor_id = self._last_anchor_id
@@ -471,9 +483,7 @@ class TrellisFromExtractionNode(Node):
                 self.get_logger().warn(f"Frames {missing} are not saved for tree_{anchor_id:03d}; skipped.")
         if not offsets:
             return self._fail(response, f"No saved {self.base_cam_name} frames for tree_{anchor_id:03d}.")
-        if 0 not in frame_pose:
-            frame_pose[0] = (np.zeros(2), 0.0, "broadside")
-        if any(frame_pose[o][2] != "world_pose" for o in offsets):
+        if any(frame_pose[o][1] != "world_pose" for o in offsets):
             self.get_logger().warn(
                 "Some frames have no world_pose_xyt in meta.yaml (extraction without --broadside_source odom). "
                 "Their detections are taken at the broadside pose.")
@@ -486,23 +496,22 @@ class TrellisFromExtractionNode(Node):
                     continue
                 time.sleep(self.frame_switch_delay_sec)
             dets = self._trigger_and_collect()
-            fxy, fyaw, _ = frame_pose[off]
+            to_local = frame_pose[off][0]
             for d in dets:
-                p = base_to_local(np.array([d.pose.position.x, d.pose.position.y]), fxy, fyaw)[0]
-                meas.append(p)
+                meas.append(to_local([[d.pose.position.x, d.pose.position.y]])[0])
                 meas_frame.append(off)
             self.get_logger().info(
                 f"[frame {off:+d}] {len(dets)} detection(s)"
                 + (": " + ", ".join(f"({m[0]:+.2f}, {m[1]:+.2f})" for m in meas[-len(dets):]) if dets else ""))
         if self.frame_select_client is not None and 0 in frame_pose:
             self._select_frame(0)          # leave the broadside frame on the base-camera topic
-        response.n_detections = len(meas)
+        result["n_detections"] = len(meas)
         if not meas:
-            return self._fail(response, "No trunk detections in any frame.")
+            return self._fail(response, "No trunk detections in any frame.", result)
         meas = np.array(meas)
 
         # --- 3. Group over frames, then associate groups to map trunks --------
-        groups = cluster_detections(meas, meas_frame, self.cluster_eps_m)
+        groups = cluster_detections(meas, self.cluster_eps_m)
         group_matches = associate_groups(meas, groups, pred_xy, ids, self.association_gate_m)
         tree_of_group = {tuple(g): tid for g, tid, _ in group_matches}
         for g in groups:
@@ -512,26 +521,26 @@ class TrellisFromExtractionNode(Node):
                 f"  object at ({c[0]:+.3f}, {c[1]:+.3f}) seen in frames {[meas_frame[k] for k in g]} -> "
                 + (f"tree_{tid:03d}" if tid is not None else "no match"))
         matches = [(k, tid, 0.0) for g, tid, _ in group_matches for k in g]
-        response.n_matched = len(matches)
+        result["n_matched"] = len(matches)
         matched_ids = sorted({tid for (_, tid, _) in matches})
-        response.matched_tree_ids = matched_ids
-        response.frames_used = sorted({meas_frame[k] for (k, _, _) in matches})
+        result["matched_tree_ids"] = matched_ids
+        result["frames_used"] = sorted({int(meas_frame[k]) for (k, _, _) in matches})
         if anchor_id not in matched_ids:
             return self._fail(
                 response,
                 f"The anchor tree_{anchor_id:03d} is not matched by any detection "
-                f"(gate {self.association_gate_m} m; matched: {matched_ids}).")
+                f"(gate {self.association_gate_m} m; matched: {matched_ids}).", result)
 
         # --- 4. Fit -----------------------------------------------------------
         P = np.array([pred_xy[ids.index(tid)] for (_, tid, _) in matches])
         M = np.array([meas[k] for (k, _, _) in matches])
         T = [tid for (_, tid, _) in matches]
-        dyaw, t, clamped = fit_map_correction(P, M, T, self.max_yaw_correction)
-        res = np.linalg.norm(apply_map_correction(P, dyaw, t) - M, axis=1)
+        corr, clamped = fit_map_correction(P, M, T, self.max_yaw_correction)
+        dyaw, t = float(corr.rotation), corr.translation
+        res = np.linalg.norm(corr(P) - M, axis=1)
         rms = float(np.sqrt(np.mean(res ** 2)))
         a_old = pred_xy[ids.index(anchor_id)]
-        a_new = apply_map_correction(a_old, dyaw, t)[0]
-        shift = a_new - a_old
+        shift = corr([a_old])[0] - a_old
         for tid in matched_ids:
             r = res[[k for k, x in enumerate(T) if x == tid]]
             self.get_logger().info(f"  residual tree_{tid:03d}: mean {r.mean():.3f} m over {len(r)} detection(s)")
@@ -539,38 +548,34 @@ class TrellisFromExtractionNode(Node):
             f"Correction: yaw {math.degrees(dyaw):+.2f} deg{' (clamped)' if clamped else ''}, "
             f"t ({t[0]:+.3f}, {t[1]:+.3f}) m, anchor shift ({shift[0]:+.3f}, {shift[1]:+.3f}) m, "
             f"RMS {rms:.3f} m, {len(matched_ids)} trunk(s), {len(matches)} detection(s)")
-        response.dx, response.dy, response.dyaw = float(t[0]), float(t[1]), float(dyaw)
-        response.anchor_dx, response.anchor_dy = float(shift[0]), float(shift[1])
-        response.rms_residual_m = rms
-        response.yaw_clamped = bool(clamped)
+        result.update(dx=float(t[0]), dy=float(t[1]), dyaw=float(dyaw),
+                      anchor_dx=float(shift[0]), anchor_dy=float(shift[1]),
+                      rms_residual_m=rms, yaw_clamped=bool(clamped))
 
         if float(np.linalg.norm(shift)) > self.max_correction_m:
             return self._fail(
                 response,
                 f"Anchor shift {np.linalg.norm(shift):.3f} m is more than max_correction_m "
-                f"({self.max_correction_m} m). Not applied.")
+                f"({self.max_correction_m} m). Not applied.", result)
 
         # --- 5. Apply to all trunks and publish ------------------------------
         corrected = copy.deepcopy(self._last_registry_msg)
-        new_xy = apply_map_correction(pred_xy, dyaw, t)
-        qz, qw = math.sin(dyaw / 2.0), math.cos(dyaw / 2.0)
-        for trunk, xy in zip(corrected.trunks, new_xy):
+        yaw_rot = Rotation.from_euler("z", dyaw)
+        for trunk, xy in zip(corrected.trunks, corr(pred_xy)):
             trunk.pose.position.x = float(xy[0])
             trunk.pose.position.y = float(xy[1])
             # Compose the yaw with the existing orientation (identity after a publish)
-            q = trunk.pose.orientation
-            trunk.pose.orientation.x, trunk.pose.orientation.y = (
-                qw * q.x - qz * q.y, qw * q.y + qz * q.x)
-            trunk.pose.orientation.z, trunk.pose.orientation.w = (
-                qw * q.z + qz * q.w, qw * q.w - qz * q.z)
+            o = trunk.pose.orientation
+            o.x, o.y, o.z, o.w = (yaw_rot * Rotation.from_quat([o.x, o.y, o.z, o.w])).as_quat().tolist()
         self.registry_pub.publish(corrected)
         self._last_registry_msg = corrected
         self.get_logger().info(f"Published the corrected TrunkRegistry ({len(corrected.trunks)} trunks).")
 
         response.success = True
-        response.message = (
+        result["summary"] = (
             f"anchor shift ({shift[0]:+.3f}, {shift[1]:+.3f}) m, yaw {math.degrees(dyaw):+.2f} deg, "
             f"{len(matched_ids)} trunk(s), RMS {rms:.3f} m")
+        response.message = json.dumps(result)
         return response
 
 

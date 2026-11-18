@@ -19,9 +19,12 @@ odometry it used, and with the odometry time = bag receive time the offset is 0.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
+from skimage.transform import EuclideanTransform
+
+from tree_template.trellis_geometry import pose_tf
 
 
 def _wrap(a):
@@ -37,30 +40,21 @@ def interp_yaw(odom: np.ndarray, t) -> np.ndarray:
     return _wrap(np.interp(t, odom[:, 3], np.unwrap(odom[:, 2])))
 
 
-def fit_rigid_2d(A: np.ndarray, B: np.ndarray) -> Tuple[float, np.ndarray]:
-    """Least-squares (theta, t) with B ~ R(theta) @ A + t (Kabsch in 2-D)."""
-    ca, cb = A.mean(axis=0), B.mean(axis=0)
-    a, b = A - ca, B - cb
-    s = np.sum(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
-    c = np.sum(a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1])
-    theta = float(np.arctan2(s, c))
-    R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-    return theta, cb - R @ ca
-
-
-def apply_rigid_2d(theta: float, t: np.ndarray, P: np.ndarray) -> np.ndarray:
-    R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-    return P @ R.T + t
-
-
 @dataclass
 class LocalFit:
-    theta: float               # rotation odometry -> world (rad)
-    t: np.ndarray              # translation odometry -> world (m)
+    tf: EuclideanTransform     # odometry frame -> world frame
     rms_inlier_m: float        # RMS residual of the inliers
     n_used: int
     n_inliers: int
-    span_m: float              # travel distance inside the window (a short span makes theta weak)
+    span_m: float              # travel distance inside the window (a short span makes the rotation weak)
+
+    @property
+    def theta(self) -> float:
+        return float(self.tf.rotation)
+
+    @property
+    def t(self) -> np.ndarray:
+        return self.tf.translation
 
 
 def robust_local_fit(
@@ -89,24 +83,25 @@ def robust_local_fit(
     A = interp_xy(odom, t_odom)
     B = path[m_idx, :2]
 
-    def fit(k):
+    def fit(k) -> EuclideanTransform:
         if theta is None:
-            return fit_rigid_2d(A[k], B[k])
-        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-        return theta, np.mean(B[k] - A[k] @ R.T, axis=0)
+            T = EuclideanTransform()
+            T.estimate(A[k], B[k])
+            return T
+        R = EuclideanTransform(rotation=theta)
+        return EuclideanTransform(rotation=theta, translation=np.mean(B[k] - R(A[k]), axis=0))
 
     keep = np.ones(len(A), dtype=bool)
     for _ in range(iters):
-        th, t = fit(keep)
-        r = np.linalg.norm(apply_rigid_2d(th, t, A) - B, axis=1)
+        r = np.linalg.norm(fit(keep)(A) - B, axis=1)
         new_keep = r <= max(3.0 * float(np.median(r[keep])), 0.05)
         if new_keep.sum() < min_points or np.array_equal(new_keep, keep):
             break
         keep = new_keep
-    th, t = fit(keep)
-    r = np.linalg.norm(apply_rigid_2d(th, t, A) - B, axis=1)
+    T = fit(keep)
+    r = np.linalg.norm(T(A) - B, axis=1)
     span = float(np.sum(np.linalg.norm(np.diff(A, axis=0), axis=1)))
-    return LocalFit(th, t, float(np.sqrt(np.mean(r[keep] ** 2))), int(len(A)), int(keep.sum()), span)
+    return LocalFit(T, float(np.sqrt(np.mean(r[keep] ** 2))), int(len(A)), int(keep.sum()), span)
 
 
 def world_poses(fit: LocalFit, odom: np.ndarray, t_odom: np.ndarray, odom_to_base_yaw: float) -> np.ndarray:
@@ -114,7 +109,7 @@ def world_poses(fit: LocalFit, odom: np.ndarray, t_odom: np.ndarray, odom_to_bas
     (K, 3) world [x, y, yaw] of the robot base at odometry times t_odom.
     yaw = odometry yaw + fit.theta + odom_to_base_yaw (the base frame yaw from the odometry child frame).
     """
-    xy = apply_rigid_2d(fit.theta, fit.t, interp_xy(odom, t_odom))
+    xy = fit.tf(interp_xy(odom, t_odom))
     yaw = _wrap(interp_yaw(odom, t_odom) + fit.theta + odom_to_base_yaw)
     return np.column_stack([xy, yaw])
 
@@ -151,25 +146,22 @@ def broadside_from_odom(
     if t_odom.size < 2:
         return None
     P = world_poses(fit, odom, t_odom, odom_to_base_yaw)
-    d = tree_xy[None, :] - P[:, :2]
-    c, s = np.cos(P[:, 2]), np.sin(P[:, 2])
-    fwd = c * d[:, 0] + s * d[:, 1]
+    # Tree in the robot base frame at each odometry sample: x = fwd, y = lat
+    fwd = np.array([pose_tf(*p).inverse([tree_xy])[0, 0] for p in P])
     # fwd crosses 0 between two odometry samples: interpolate the time of the crossing
     k = int(np.argmin(np.abs(fwd)))
     t_best = t_odom[k]
     for j in (k - 1, k):
         if 0 <= j < len(fwd) - 1 and fwd[j] * fwd[j + 1] <= 0 and fwd[j] != fwd[j + 1]:
-            a = fwd[j] / (fwd[j] - fwd[j + 1])
-            t_best = t_odom[j] + a * (t_odom[j + 1] - t_odom[j])
+            t_best = float(np.interp(0.0, sorted(fwd[j:j + 2]), t_odom[j:j + 2][np.argsort(fwd[j:j + 2])]))
             break
     pose = world_poses(fit, odom, np.array([t_best]), odom_to_base_yaw)[0]
-    dx, dy = tree_xy - pose[:2]
-    cy, sy = np.cos(pose[2]), np.sin(pose[2])
+    fwd_b, lat_b = pose_tf(*pose).inverse([tree_xy])[0]
     return {
         "pose_xyt": [float(v) for v in pose],
         "t_slam": float(t_best - time_offset),
-        "fwd": float(cy * dx + sy * dy),
-        "lat": float(-sy * dx + cy * dy),
+        "fwd": float(fwd_b),
+        "lat": float(lat_b),
         "fit": fit,
         "theta_fit": rot,
     }

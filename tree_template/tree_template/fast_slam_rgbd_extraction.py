@@ -102,11 +102,13 @@ import sqlite3
 import numpy as np
 import yaml
 import cv2
+from scipy.spatial.transform import Rotation
 
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 from tree_template.odom_alignment import broadside_from_odom, world_poses
+from tree_template.trellis_geometry import pose_tf
 from tree_template.depth_registration import (
     camera_info_to_dict,
     camera_matrix,
@@ -230,7 +232,7 @@ def find_broadside_pose_index(robot_poses, tree_xy):
 
 
 def _yaw_from_quat(q):
-    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    return float(Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("ZYX")[0])
 
 
 def load_odom_series(con, topic):
@@ -258,12 +260,11 @@ def base_delta(pose0, pose1, odom_to_base_yaw):
     Motion from pose0 to pose1 (odometry [x, y, yaw]) in the robot base frame at pose0: [dx, dy, dyaw].
     odom_to_base_yaw: yaw (rad) from the odometry child frame to the robot base frame.
     """
-    dx, dy = pose1[0] - pose0[0], pose1[1] - pose0[1]
-    c, s = math.cos(-pose0[2]), math.sin(-pose0[2])
-    bx, by = c * dx - s * dy, s * dx + c * dy                       # in the odometry child frame at pose0
-    c, s = math.cos(-odom_to_base_yaw), math.sin(-odom_to_base_yaw)
-    dyaw = math.atan2(math.sin(pose1[2] - pose0[2]), math.cos(pose1[2] - pose0[2]))
-    return [c * bx - s * by, s * bx + c * by, dyaw]
+    # Points in base1 -> child1 -> odometry frame -> child0 -> base0 (skimage: A + B = A, then B).
+    # c_b: base frame -> odometry child frame.
+    c_b = pose_tf(0.0, 0.0, odom_to_base_yaw)
+    rel = c_b + pose_tf(*pose1) + pose_tf(*pose0).inverse + c_b.inverse
+    return [float(rel.translation[0]), float(rel.translation[1]), float(rel.rotation)]
 
 
 # ---------------------------------------------------------------------------

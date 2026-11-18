@@ -19,7 +19,7 @@ setup(
         (os.path.join('share', package_name, 'config', 'robot'), glob('config/robot/*.yaml')),
         (os.path.join('share', package_name, 'config', 'camera_extrinsics'), glob('config/camera_extrinsics/*.yaml')),
     ],
-    install_requires=['setuptools', 'numpy', 'scipy', 'PyYAML', 'utm'],
+    install_requires=['setuptools', 'numpy', 'scipy', 'scikit-image', 'PyYAML', 'utm'],
     zip_safe=True,
     maintainer='Marcus Rosette',
     maintainer_email='rosettem@oregonstate.edu',

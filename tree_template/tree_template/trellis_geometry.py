@@ -2,7 +2,8 @@
 trellis_geometry.py
 
 Pure functions that put the trunks of a saved SLAM map into the local frame of one anchor tree.
-This module does not import ROS, so tests and offline tools can use it.
+This module does not import ROS, so tests and offline tools can use it. 2-D poses and rigid transforms are
+skimage.transform.EuclideanTransform objects (pose_tf).
 
 Local frame:
     origin  the robot pose when the anchor tree was broadside (broadside_robot_pose_xyt)
@@ -21,6 +22,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
+from scipy.cluster.hierarchy import fclusterdata
+from scipy.optimize import linear_sum_assignment
+from skimage.transform import EuclideanTransform
 
 
 def load_meta_yamls(extraction_dir: str) -> Dict[int, dict]:
@@ -108,11 +112,14 @@ def anchor_transform(
     return robot_origin_xy, row_yaw
 
 
-def transform_to_local(world_xy: np.ndarray, robot_origin_xy: np.ndarray, row_yaw: float) -> np.ndarray:
-    """Return the local (x, y) of a world point: R(-row_yaw) @ (world_xy - robot_origin_xy)."""
-    c, s = np.cos(-row_yaw), np.sin(-row_yaw)
-    rot = np.array([[c, -s], [s, c]], dtype=np.float64)
-    return rot @ (np.asarray(world_xy, dtype=np.float64) - robot_origin_xy)
+def pose_tf(x: float, y: float, yaw: float) -> EuclideanTransform:
+    """2-D pose as a transform: points in the frame of the pose -> points in the parent frame."""
+    return EuclideanTransform(rotation=float(yaw), translation=(float(x), float(y)))
+
+
+def local_tf(robot_origin_xy: np.ndarray, row_yaw: float) -> EuclideanTransform:
+    """World -> local frame (origin at robot_origin_xy, +X along the row)."""
+    return pose_tf(robot_origin_xy[0], robot_origin_xy[1], row_yaw).inverse
 
 
 def local_positions(
@@ -128,19 +135,10 @@ def local_positions(
     skipped  tree ids without tree_world_xy_m
     """
     robot_origin_xy, row_yaw = anchor_transform(tree_data, anchor_id, global_row_yaw)
-    ids: List[int] = []
-    rows: List[np.ndarray] = []
-    skipped: List[int] = []
-    for tid in sorted(tree_data.keys()):
-        try:
-            world_xy = extract_world_xy(tree_data[tid])
-        except KeyError:
-            skipped.append(tid)
-            continue
-        ids.append(tid)
-        rows.append(transform_to_local(world_xy, robot_origin_xy, row_yaw))
-    xy = np.vstack(rows) if rows else np.zeros((0, 2), dtype=np.float64)
-    return ids, xy, skipped
+    ids = [t for t in sorted(tree_data) if "tree_world_xy_m" in tree_data[t]]
+    skipped = [t for t in sorted(tree_data) if t not in ids]
+    world = np.array([extract_world_xy(tree_data[t]) for t in ids]).reshape(-1, 2)
+    return ids, local_tf(robot_origin_xy, row_yaw)(world), skipped
 
 
 def expected_anchor_local(meta: dict, row_yaw: float) -> np.ndarray:
@@ -149,30 +147,23 @@ def expected_anchor_local(meta: dict, row_yaw: float) -> np.ndarray:
     R(broadside_yaw - row_yaw) @ (fwd_dist_to_tree_m, lat_dist_to_tree_m).
     """
     broadside_yaw = float(meta["broadside_robot_pose_xyt"][2])
-    fl = np.array([float(meta["fwd_dist_to_tree_m"]), float(meta["lat_dist_to_tree_m"])], dtype=np.float64)
-    a = broadside_yaw - row_yaw
-    c, s = np.cos(a), np.sin(a)
-    return np.array([[c, -s], [s, c]], dtype=np.float64) @ fl
+    fl = [[float(meta["fwd_dist_to_tree_m"]), float(meta["lat_dist_to_tree_m"])]]
+    return EuclideanTransform(rotation=broadside_yaw - row_yaw)(fl)[0]
 
 
 # =============================================================================
 #  Map correction from base-camera trunk detections
 # =============================================================================
 
-def rot2(a: float) -> np.ndarray:
-    c, s = np.cos(a), np.sin(a)
-    return np.array([[c, -s], [s, c]], dtype=np.float64)
-
-
 def frame_poses_local(
     meta: dict,
     cam: str,
     robot_origin_xy: np.ndarray,
     row_yaw: float,
-) -> Dict[int, Tuple[np.ndarray, float, str]]:
+) -> Dict[int, Tuple[EuclideanTransform, str]]:
     """
-    Pose of the robot base frame in the local frame for each saved frame of camera cam (buffer frames, or the
-    single frame as index 0): {frame index: (xy (2,), yaw, source)}.
+    For each saved frame of camera cam (buffer frames, or the single frame as index 0): (transform robot base
+    frame of that image -> local frame, source).
 
     source "world_pose": from world_pose_xyt (fast_slam_rgbd_extraction --broadside_source odom).
     source "broadside":  the frame has no world pose (older extraction); the broadside pose is used.
@@ -182,81 +173,29 @@ def frame_poses_local(
     frames = cam_meta.get("frames")
     if frames is None:
         frames = {"frame_0": cam_meta}
+    to_local = local_tf(robot_origin_xy, row_yaw)
     out = {}
     for name, fm in frames.items():
         if not fm or not fm.get("saved", False):
             continue
-        idx = int(name.split("_")[-1])
         wp, src = fm.get("world_pose_xyt"), "world_pose"
         if wp is None:
             wp, src = bs, "broadside"
-        xy = rot2(-row_yaw) @ (np.asarray(wp[:2], dtype=np.float64) - robot_origin_xy)
-        out[idx] = (xy, float(wp[2]) - row_yaw, src)
+        out[int(name.split("_")[-1])] = (pose_tf(*wp[:3]) + to_local, src)
     return out
 
 
-def base_to_local(points_base: np.ndarray, frame_xy: np.ndarray, frame_yaw: float) -> np.ndarray:
-    """(N, 2) points in the robot base frame of one image -> local frame (frame pose from frame_poses_local)."""
-    return np.atleast_2d(points_base) @ rot2(frame_yaw).T + frame_xy
-
-
-def associate(
-    meas_local: np.ndarray,
-    pred_local: np.ndarray,
-    pred_ids: List[int],
-    gate_m: float,
-    meas_frames: Optional[List[int]] = None,
-) -> List[Tuple[int, int, float]]:
+def cluster_detections(meas_local: np.ndarray, eps_m: float = 0.10) -> List[List[int]]:
     """
-    Match measurements to predicted trunks, inside gate_m and on the same side of the robot (sign of y).
-    In one image (same meas_frames value) each trunk takes at most one measurement and each measurement at most
-    one trunk: the pairs are taken by increasing distance. Over different images a trunk can match many times.
-    Return [(measurement index, tree id, distance)], sorted by measurement index.
-    """
-    meas_local = np.atleast_2d(meas_local)
-    if meas_frames is None:
-        meas_frames = list(range(len(meas_local)))     # each measurement its own image: nearest trunk
-    cand = []
-    for i, m in enumerate(meas_local):
-        d = np.linalg.norm(pred_local - m, axis=1)
-        ok = (np.sign(pred_local[:, 1]) == np.sign(m[1])) & (d <= gate_m)
-        cand.extend((float(d[j]), i, j) for j in np.nonzero(ok)[0])
-    used_meas, used_trunk, out = set(), set(), []
-    for d, i, j in sorted(cand):
-        if i in used_meas or (meas_frames[i], j) in used_trunk:
-            continue
-        used_meas.add(i)
-        used_trunk.add((meas_frames[i], j))
-        out.append((i, int(pred_ids[j]), d))
-    return sorted(out)
-
-
-def cluster_detections(
-    meas_local: np.ndarray,
-    meas_frames: List[int],
-    eps_m: float = 0.10,
-) -> List[List[int]]:
-    """
-    Group the detections of one object over several images. After the motion compensation, the detections of one
-    trunk in different images agree to a few cm. A detection joins the nearest group whose centroid is within
-    eps_m and that has no detection from the same image yet; otherwise it starts a new group.
+    Group the detections of one object over several images (complete linkage: every two detections of a group
+    are within eps_m). After the motion compensation, the detections of one trunk agree to a few cm.
     Return the groups as lists of detection indices.
     """
     meas_local = np.atleast_2d(meas_local)
-    groups: List[List[int]] = []
-    for i in np.argsort(meas_frames, kind="stable"):
-        best, best_d = None, eps_m
-        for g in groups:
-            if any(meas_frames[k] == meas_frames[i] for k in g):
-                continue
-            d = float(np.linalg.norm(meas_local[g].mean(axis=0) - meas_local[i]))
-            if d <= best_d:
-                best, best_d = g, d
-        if best is None:
-            groups.append([int(i)])
-        else:
-            best.append(int(i))
-    return [sorted(g) for g in groups]
+    if len(meas_local) == 1:
+        return [[0]]
+    labels = fclusterdata(meas_local, t=eps_m, criterion="distance", method="complete")
+    return [np.nonzero(labels == lab)[0].tolist() for lab in np.unique(labels)]
 
 
 def associate_groups(
@@ -267,25 +206,16 @@ def associate_groups(
     gate_m: float,
 ) -> List[Tuple[List[int], int, float]]:
     """
-    One-to-one match of detection groups (cluster_detections) to predicted trunks, by increasing distance between
-    the group centroid and the trunk, inside gate_m and on the same side of the robot (sign of y).
+    One-to-one match of detection groups to predicted trunks with the smallest total centroid distance
+    (linear_sum_assignment), only for pairs inside gate_m and on the same side of the robot (sign of y).
     Return [(group, tree id, distance)].
     """
     meas_local = np.atleast_2d(meas_local)
-    cand = []
-    for gi, g in enumerate(groups):
-        c = meas_local[g].mean(axis=0)
-        d = np.linalg.norm(pred_local - c, axis=1)
-        ok = (np.sign(pred_local[:, 1]) == np.sign(c[1])) & (d <= gate_m)
-        cand.extend((float(d[j]), gi, j) for j in np.nonzero(ok)[0])
-    used_g, used_t, out = set(), set(), []
-    for d, gi, j in sorted(cand):
-        if gi in used_g or j in used_t:
-            continue
-        used_g.add(gi)
-        used_t.add(j)
-        out.append((groups[gi], int(pred_ids[j]), d))
-    return out
+    centroids = np.array([meas_local[g].mean(axis=0) for g in groups])
+    d = np.linalg.norm(centroids[:, None, :] - pred_local[None, :, :], axis=2)
+    ok = (d <= gate_m) & (np.sign(centroids[:, None, 1]) == np.sign(pred_local[None, :, 1]))
+    rows, cols = linear_sum_assignment(np.where(ok, d, gate_m * 1e3))
+    return [(groups[r], int(pred_ids[c]), float(d[r, c])) for r, c in zip(rows, cols) if ok[r, c]]
 
 
 def fit_map_correction(
@@ -293,41 +223,27 @@ def fit_map_correction(
     meas: np.ndarray,
     tree_ids: List[int],
     max_yaw_rad: float,
-) -> Tuple[float, np.ndarray, bool]:
+) -> Tuple[EuclideanTransform, bool]:
     """
-    Rigid 2-D correction (yaw, t) with meas ~ R(yaw) @ pred + t, for matched pairs (pred[i], meas[i]) of the
-    trunks tree_ids[i].
+    Rigid 2-D correction T with meas ~ T(pred), for matched pairs (pred[i], meas[i]) of the trunks tree_ids[i].
+    Each trunk has the same weight: the fit uses the mean detection of each trunk.
 
-    One distinct trunk: translation only (yaw = 0), t = mean(meas - pred).
-    Two or more distinct trunks: least-squares rotation + translation. The pairs are weighted so each trunk has
-    the same total weight (a trunk seen in 5 frames does not count 5 times). If |yaw| > max_yaw_rad, the yaw is
-    clamped and the translation is fitted again with the clamped yaw.
+    One distinct trunk: translation only. Two or more: least-squares rotation + translation
+    (EuclideanTransform.estimate). If |yaw| > max_yaw_rad, the yaw is clamped and the translation is fitted
+    again with the clamped yaw.
 
-    Return (yaw, t, clamped).
+    Return (T, clamped).
     """
-    pred = np.atleast_2d(pred)
-    meas = np.atleast_2d(meas)
     ids = np.asarray(tree_ids)
     uniq = np.unique(ids)
-    w = np.array([1.0 / np.sum(ids == i) for i in ids])
-    w = w / w.sum()
-
-    if len(uniq) < 2:
-        return 0.0, np.sum(w[:, None] * (meas - pred), axis=0), False
-
-    cp = np.sum(w[:, None] * pred, axis=0)
-    cm = np.sum(w[:, None] * meas, axis=0)
-    a, b = pred - cp, meas - cm
-    s = np.sum(w * (a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]))
-    c = np.sum(w * (a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1]))
-    yaw = float(np.arctan2(s, c))
+    P = np.array([np.atleast_2d(pred)[ids == u][0] for u in uniq])
+    M = np.array([np.atleast_2d(meas)[ids == u].mean(axis=0) for u in uniq])
+    yaw = 0.0
+    if len(uniq) >= 2:
+        T = EuclideanTransform()
+        T.estimate(P, M)
+        yaw = float(T.rotation)
     clamped = abs(yaw) > max_yaw_rad
-    if clamped:
-        yaw = float(np.clip(yaw, -max_yaw_rad, max_yaw_rad))
-    t = cm - rot2(yaw) @ cp
-    return yaw, t, clamped
-
-
-def apply_map_correction(xy: np.ndarray, yaw: float, t: np.ndarray) -> np.ndarray:
-    """Apply the correction to (N, 2) local positions."""
-    return np.atleast_2d(xy) @ rot2(yaw).T + t
+    yaw = float(np.clip(yaw, -max_yaw_rad, max_yaw_rad))
+    R = EuclideanTransform(rotation=yaw)
+    return EuclideanTransform(rotation=yaw, translation=np.mean(M - R(P), axis=0)), clamped
