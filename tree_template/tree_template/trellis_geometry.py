@@ -153,3 +153,181 @@ def expected_anchor_local(meta: dict, row_yaw: float) -> np.ndarray:
     a = broadside_yaw - row_yaw
     c, s = np.cos(a), np.sin(a)
     return np.array([[c, -s], [s, c]], dtype=np.float64) @ fl
+
+
+# =============================================================================
+#  Map correction from base-camera trunk detections
+# =============================================================================
+
+def rot2(a: float) -> np.ndarray:
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s], [s, c]], dtype=np.float64)
+
+
+def frame_poses_local(
+    meta: dict,
+    cam: str,
+    robot_origin_xy: np.ndarray,
+    row_yaw: float,
+) -> Dict[int, Tuple[np.ndarray, float, str]]:
+    """
+    Pose of the robot base frame in the local frame for each saved frame of camera cam (buffer frames, or the
+    single frame as index 0): {frame index: (xy (2,), yaw, source)}.
+
+    source "world_pose": from world_pose_xyt (fast_slam_rgbd_extraction --broadside_source odom).
+    source "broadside":  the frame has no world pose (older extraction); the broadside pose is used.
+    """
+    bs = meta.get("broadside_robot_pose_xyt", [robot_origin_xy[0], robot_origin_xy[1], row_yaw])
+    cam_meta = (meta.get("cameras") or {}).get(cam) or {}
+    frames = cam_meta.get("frames")
+    if frames is None:
+        frames = {"frame_0": cam_meta}
+    out = {}
+    for name, fm in frames.items():
+        if not fm or not fm.get("saved", False):
+            continue
+        idx = int(name.split("_")[-1])
+        wp, src = fm.get("world_pose_xyt"), "world_pose"
+        if wp is None:
+            wp, src = bs, "broadside"
+        xy = rot2(-row_yaw) @ (np.asarray(wp[:2], dtype=np.float64) - robot_origin_xy)
+        out[idx] = (xy, float(wp[2]) - row_yaw, src)
+    return out
+
+
+def base_to_local(points_base: np.ndarray, frame_xy: np.ndarray, frame_yaw: float) -> np.ndarray:
+    """(N, 2) points in the robot base frame of one image -> local frame (frame pose from frame_poses_local)."""
+    return np.atleast_2d(points_base) @ rot2(frame_yaw).T + frame_xy
+
+
+def associate(
+    meas_local: np.ndarray,
+    pred_local: np.ndarray,
+    pred_ids: List[int],
+    gate_m: float,
+    meas_frames: Optional[List[int]] = None,
+) -> List[Tuple[int, int, float]]:
+    """
+    Match measurements to predicted trunks, inside gate_m and on the same side of the robot (sign of y).
+    In one image (same meas_frames value) each trunk takes at most one measurement and each measurement at most
+    one trunk: the pairs are taken by increasing distance. Over different images a trunk can match many times.
+    Return [(measurement index, tree id, distance)], sorted by measurement index.
+    """
+    meas_local = np.atleast_2d(meas_local)
+    if meas_frames is None:
+        meas_frames = list(range(len(meas_local)))     # each measurement its own image: nearest trunk
+    cand = []
+    for i, m in enumerate(meas_local):
+        d = np.linalg.norm(pred_local - m, axis=1)
+        ok = (np.sign(pred_local[:, 1]) == np.sign(m[1])) & (d <= gate_m)
+        cand.extend((float(d[j]), i, j) for j in np.nonzero(ok)[0])
+    used_meas, used_trunk, out = set(), set(), []
+    for d, i, j in sorted(cand):
+        if i in used_meas or (meas_frames[i], j) in used_trunk:
+            continue
+        used_meas.add(i)
+        used_trunk.add((meas_frames[i], j))
+        out.append((i, int(pred_ids[j]), d))
+    return sorted(out)
+
+
+def cluster_detections(
+    meas_local: np.ndarray,
+    meas_frames: List[int],
+    eps_m: float = 0.10,
+) -> List[List[int]]:
+    """
+    Group the detections of one object over several images. After the motion compensation, the detections of one
+    trunk in different images agree to a few cm. A detection joins the nearest group whose centroid is within
+    eps_m and that has no detection from the same image yet; otherwise it starts a new group.
+    Return the groups as lists of detection indices.
+    """
+    meas_local = np.atleast_2d(meas_local)
+    groups: List[List[int]] = []
+    for i in np.argsort(meas_frames, kind="stable"):
+        best, best_d = None, eps_m
+        for g in groups:
+            if any(meas_frames[k] == meas_frames[i] for k in g):
+                continue
+            d = float(np.linalg.norm(meas_local[g].mean(axis=0) - meas_local[i]))
+            if d <= best_d:
+                best, best_d = g, d
+        if best is None:
+            groups.append([int(i)])
+        else:
+            best.append(int(i))
+    return [sorted(g) for g in groups]
+
+
+def associate_groups(
+    meas_local: np.ndarray,
+    groups: List[List[int]],
+    pred_local: np.ndarray,
+    pred_ids: List[int],
+    gate_m: float,
+) -> List[Tuple[List[int], int, float]]:
+    """
+    One-to-one match of detection groups (cluster_detections) to predicted trunks, by increasing distance between
+    the group centroid and the trunk, inside gate_m and on the same side of the robot (sign of y).
+    Return [(group, tree id, distance)].
+    """
+    meas_local = np.atleast_2d(meas_local)
+    cand = []
+    for gi, g in enumerate(groups):
+        c = meas_local[g].mean(axis=0)
+        d = np.linalg.norm(pred_local - c, axis=1)
+        ok = (np.sign(pred_local[:, 1]) == np.sign(c[1])) & (d <= gate_m)
+        cand.extend((float(d[j]), gi, j) for j in np.nonzero(ok)[0])
+    used_g, used_t, out = set(), set(), []
+    for d, gi, j in sorted(cand):
+        if gi in used_g or j in used_t:
+            continue
+        used_g.add(gi)
+        used_t.add(j)
+        out.append((groups[gi], int(pred_ids[j]), d))
+    return out
+
+
+def fit_map_correction(
+    pred: np.ndarray,
+    meas: np.ndarray,
+    tree_ids: List[int],
+    max_yaw_rad: float,
+) -> Tuple[float, np.ndarray, bool]:
+    """
+    Rigid 2-D correction (yaw, t) with meas ~ R(yaw) @ pred + t, for matched pairs (pred[i], meas[i]) of the
+    trunks tree_ids[i].
+
+    One distinct trunk: translation only (yaw = 0), t = mean(meas - pred).
+    Two or more distinct trunks: least-squares rotation + translation. The pairs are weighted so each trunk has
+    the same total weight (a trunk seen in 5 frames does not count 5 times). If |yaw| > max_yaw_rad, the yaw is
+    clamped and the translation is fitted again with the clamped yaw.
+
+    Return (yaw, t, clamped).
+    """
+    pred = np.atleast_2d(pred)
+    meas = np.atleast_2d(meas)
+    ids = np.asarray(tree_ids)
+    uniq = np.unique(ids)
+    w = np.array([1.0 / np.sum(ids == i) for i in ids])
+    w = w / w.sum()
+
+    if len(uniq) < 2:
+        return 0.0, np.sum(w[:, None] * (meas - pred), axis=0), False
+
+    cp = np.sum(w[:, None] * pred, axis=0)
+    cm = np.sum(w[:, None] * meas, axis=0)
+    a, b = pred - cp, meas - cm
+    s = np.sum(w * (a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]))
+    c = np.sum(w * (a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1]))
+    yaw = float(np.arctan2(s, c))
+    clamped = abs(yaw) > max_yaw_rad
+    if clamped:
+        yaw = float(np.clip(yaw, -max_yaw_rad, max_yaw_rad))
+    t = cm - rot2(yaw) @ cp
+    return yaw, t, clamped
+
+
+def apply_map_correction(xy: np.ndarray, yaw: float, t: np.ndarray) -> np.ndarray:
+    """Apply the correction to (N, 2) local positions."""
+    return np.atleast_2d(xy) @ rot2(yaw).T + t

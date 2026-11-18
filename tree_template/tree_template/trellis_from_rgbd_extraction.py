@@ -19,9 +19,7 @@ anchor_tree_id          (int)   – tree to anchor on; -1 = none yet (set it at 
 trellis_side            (str)   – fallback side when meta.yaml has no 'side' field (default "far").
 z_offset                (float) – vertical offset added to all trunk z-positions (default 0.0).
 registry_topic          (str)   – topic name for the TrunkRegistry message (default "fastslam_registry").
-shift_whole_map         (bool)  – if True, correction shifts all trunks; if False, anchor only (default True).
-max_correction_m        (float) – reject corrections larger than this magnitude in metres (default 1.0).
-measurement_timeout_sec (float) – seconds to wait for a trunk measurement after triggering (default 5.0).
+max_correction_m        (float) – reject a correction that moves the anchor trunk more than this (default 1.0 m).
 slam_results_yaml       (str)   – path to the yaml written by save_best_particle_map.py for this run.
                                   If empty, the node uses the slam_trunks_*.yaml file in extraction_dir.
                                   If it has a row_yaw_rad value, the node uses this one row yaw for
@@ -31,15 +29,37 @@ slam_results_yaml       (str)   – path to the yaml written by save_best_partic
                                   planning frame, so the trellis side branches are perpendicular to
                                   the row at all trees.
 
-trellis_geometry.py has the frame definitions and the transform.
+Correction parameters (/correct_template_anchor)
+------------------------------------------------
+frame_offsets           (int[]) – base-camera buffer frames to use (default [-2, -1, 0, 1, 2]).
+frame_select_service    (str)   – set_parameters service of the node that publishes the presaved base-camera
+                                  frame (default /apple_prediction/set_parameters). Empty: no frame switch,
+                                  one trigger, and the detections are taken in the frame_0 robot frame.
+frame_select_param      (str)   – its frame index parameter (default presaved_images.base_cam_frame_index).
+frame_switch_delay_sec  (float) – wait after a frame switch, before the trigger (default 0.3).
+trigger_service         (str)   – trunk detector trigger (default /trigger_estimation).
+trigger_timeout_sec     (float) – (default 30.0).
+detection_collect_sec   (float) – time to collect TrunkInfo after the trigger returns (default 0.5).
+measurement_topic       (str)   – TrunkInfo from trunk_detection_relay (default /trunk_measurements_raw).
+base_cam_name           (str)   – camera folder name in meta.yaml (default base_cam).
+cluster_eps_m           (float) – detections of one object in different frames are grouped within this (default 0.10).
+association_gate_m      (float) – max distance group centroid <-> predicted trunk (default 0.35).
+max_yaw_correction_deg  (float) – yaw clamp of the correction (default 5.0).
+
+trellis_geometry.py has the frame definitions, the transform and the correction fit.
 
 Workflow
 --------
 1. Launch the node.
 2. Set the anchor tree at runtime to publish the initial template:
        ros2 param set /trellis_from_rgbd_extraction anchor_tree_id 8
-3. Call /correct_template_anchor (std_srvs/Trigger) to refine the anchor
-   trunk position using a live depth measurement.
+3. Call /correct_template_anchor (tree_template_interfaces/CorrectAnchor). For each frame in frame_offsets the
+   node selects the presaved base-camera frame, triggers the trunk detector and collects the TrunkInfo
+   detections (robot base frame of that image). With the frame pose from meta.yaml (world_pose_xyt) each
+   detection goes into the local frame. The detections of one object in different frames are grouped
+   (cluster_eps_m); each group is matched one-to-one to the nearest map trunk on the same side
+   (association_gate_m); the anchor trunk must be matched. Then one rigid correction moves the whole map:
+   translation only if one trunk is matched, translation + yaw (clamped) if two or more are matched.
 
 Directory structure expected (output of fast_slam_rgbd_extraction):
     extraction_dir/
@@ -56,23 +76,33 @@ Each meta.yaml must have at least:
 """
 
 import copy
+import math
 import threading
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
 
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue, SetParametersResult
+from rcl_interfaces.srv import SetParameters
 from std_srvs.srv import Trigger
 from tree_template_interfaces.msg import TrunkInfo, TrunkRegistry
+from tree_template_interfaces.srv import CorrectAnchor
 
 from tree_template.trellis_geometry import (
     anchor_transform,
+    apply_map_correction,
+    associate_groups,
+    base_to_local,
+    cluster_detections,
     extract_world_z,
+    fit_map_correction,
+    frame_poses_local,
     find_slam_results_yaml,
     load_global_row_yaw,
     load_meta_yamls,
@@ -89,11 +119,11 @@ class TrellisFromExtractionNode(Node):
         super().__init__("trellis_from_rgbd_extraction")
 
         # ── Callback groups ───────────────────────────────────────────────────
-        # The service handler and the trigger client use the same group, so the async
-        # service call in the handler does not deadlock.
+        # The correction service handler waits on the responses of its own service clients and on the
+        # TrunkInfo subscriber. The clients and the subscriber use other groups, so the executor can run their
+        # callbacks while the handler waits.
         self._service_cbg = MutuallyExclusiveCallbackGroup()
-        # The subscriber callbacks use a different group, so they can run while the
-        # service handler thread waits on the threading.Event.
+        self._client_cbg = ReentrantCallbackGroup()
         self._sub_cbg = MutuallyExclusiveCallbackGroup()
 
         # ── Parameters ───────────────────────────────────────────────────────
@@ -102,19 +132,39 @@ class TrellisFromExtractionNode(Node):
         self.declare_parameter("trellis_side", "far")
         self.declare_parameter("z_offset", 0.0)
         self.declare_parameter("registry_topic", "fastslam_registry")
-        self.declare_parameter("shift_whole_map", True)
         self.declare_parameter("max_correction_m", 1.0)
-        self.declare_parameter("measurement_timeout_sec", 5.0)
         self.declare_parameter("slam_results_yaml", "")  # output of save_best_particle_map.py
+        # Correction
+        self.declare_parameter("frame_offsets", [-2, -1, 0, 1, 2])
+        self.declare_parameter("frame_select_service", "/apple_prediction/set_parameters")
+        self.declare_parameter("frame_select_param", "presaved_images.base_cam_frame_index")
+        self.declare_parameter("frame_switch_delay_sec", 0.3)
+        self.declare_parameter("trigger_service", "/trigger_estimation")
+        self.declare_parameter("trigger_timeout_sec", 30.0)
+        self.declare_parameter("detection_collect_sec", 0.5)
+        self.declare_parameter("measurement_topic", "/trunk_measurements_raw")
+        self.declare_parameter("base_cam_name", "base_cam")
+        self.declare_parameter("association_gate_m", 0.35)
+        self.declare_parameter("cluster_eps_m", 0.10)
+        self.declare_parameter("max_yaw_correction_deg", 5.0)
 
         self.extraction_dir = self.get_parameter("extraction_dir").value
         self.trellis_side = self.get_parameter("trellis_side").value
         self.z_offset = self.get_parameter("z_offset").value
         self.registry_topic = str(self.get_parameter("registry_topic").value)
-        self.shift_whole_map = bool(self.get_parameter("shift_whole_map").value)
         self.max_correction_m = float(self.get_parameter("max_correction_m").value)
-        self.measurement_timeout_sec = float(self.get_parameter("measurement_timeout_sec").value)
         self.slam_results_yaml = str(self.get_parameter("slam_results_yaml").value)
+        gp = self.get_parameter
+        self.frame_offsets = [int(v) for v in gp("frame_offsets").value]
+        self.frame_select_service = str(gp("frame_select_service").value)
+        self.frame_select_param = str(gp("frame_select_param").value)
+        self.frame_switch_delay_sec = float(gp("frame_switch_delay_sec").value)
+        self.trigger_timeout_sec = float(gp("trigger_timeout_sec").value)
+        self.detection_collect_sec = float(gp("detection_collect_sec").value)
+        self.base_cam_name = str(gp("base_cam_name").value)
+        self.association_gate_m = float(gp("association_gate_m").value)
+        self.cluster_eps_m = float(gp("cluster_eps_m").value)
+        self.max_yaw_correction = math.radians(float(gp("max_yaw_correction_deg").value))
 
         if not self.extraction_dir:
             self.get_logger().fatal("Parameter 'extraction_dir' must be set.")
@@ -146,10 +196,14 @@ class TrellisFromExtractionNode(Node):
         self._last_registry_msg: Optional[TrunkRegistry] = None
         # Tree id of each trunk in _last_registry_msg (same order)
         self._last_registry_ids: List[int] = []
+        # Local frame of the last anchor (origin and row yaw in the world frame)
+        self._robot_origin_xy: Optional[np.ndarray] = None
+        self._row_yaw: float = 0.0
 
-        # Trunk measurement state: _sub_cbg writes it, the service handler reads it
-        self._latest_trunk_pose = None
-        self._trunk_received_event: Optional[threading.Event] = None
+        # Detections collected during a trigger: _sub_cbg writes, the service handler reads
+        self._collect_lock = threading.Lock()
+        self._collecting = False
+        self._collected: List[TrunkInfo] = []
 
         # ── Publishers ───────────────────────────────────────────────────────
         self._registry_qos = QoSProfile(
@@ -164,15 +218,21 @@ class TrellisFromExtractionNode(Node):
         # ── Subscribers ──────────────────────────────────────────────────────
         self.trunk_meas_sub = self.create_subscription(
             TrunkInfo,
-            "/trunk_measurements_raw",
+            str(gp("measurement_topic").value),
             self._trunk_measurement_callback,
             10,
             callback_group=self._sub_cbg,
         )
 
         # ── Services ─────────────────────────────────────────────────────────
+        self.trigger_client = self.create_client(
+            Trigger, str(gp("trigger_service").value), callback_group=self._client_cbg)
+        self.frame_select_client = (
+            self.create_client(SetParameters, self.frame_select_service, callback_group=self._client_cbg)
+            if self.frame_select_service else None
+        )
         self.correction_service = self.create_service(
-            Trigger,
+            CorrectAnchor,
             "/correct_template_anchor",
             self._correct_template_anchor_callback,
             callback_group=self._service_cbg,
@@ -280,6 +340,8 @@ class TrellisFromExtractionNode(Node):
         self._last_registry_msg = msg
         self._last_registry_ids = list(ids)
         self._last_anchor_id = anchor_id
+        self._robot_origin_xy = robot_origin_xy
+        self._row_yaw = row_yaw
 
         self.get_logger().info(
             f"Published TrunkRegistry with {len(msg.trunks)} trunks."
@@ -325,171 +387,191 @@ class TrellisFromExtractionNode(Node):
     # =========================================================================
 
     def _trunk_measurement_callback(self, msg: TrunkInfo):
-        """Runs on _sub_cbg, so it can run while the service handler runs."""
-        self._latest_trunk_pose = msg.pose
-        self.get_logger().debug(
-            f"Trunk measurement — x={msg.pose.position.x:.3f} m, "
-            f"y={msg.pose.position.y:.3f} m, width={msg.width:.3f} m"
-        )
-        # Release _get_live_trunk_position if it waits
-        if self._trunk_received_event is not None:
-            self._trunk_received_event.set()
+        """Runs on _sub_cbg. Keeps the detections that arrive while a trigger is in progress."""
+        with self._collect_lock:
+            if self._collecting:
+                self._collected.append(msg)
+
+    # =========================================================================
+    #  Service helpers (called from the correction handler thread)
+    # =========================================================================
+
+    def _call(self, client, request, timeout_sec: float):
+        """Synchronous call from the service handler thread. Return the response, or None on timeout."""
+        if not client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error(f"Service {client.srv_name} is not available.")
+            return None
+        done = threading.Event()
+        future = client.call_async(request)
+        future.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout_sec):
+            self.get_logger().error(f"Service {client.srv_name}: no response after {timeout_sec:.0f} s.")
+            return None
+        return future.result()
+
+    def _select_frame(self, offset: int) -> bool:
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name=self.frame_select_param,
+            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=int(offset)),
+        )]
+        resp = self._call(self.frame_select_client, req, 5.0)
+        ok = resp is not None and all(r.successful for r in resp.results)
+        if not ok:
+            self.get_logger().warn(f"Could not select base-camera frame {offset:+d}.")
+        return ok
+
+    def _trigger_and_collect(self) -> List[TrunkInfo]:
+        """Trigger the detector on the current image and return the TrunkInfo detections of that image."""
+        with self._collect_lock:
+            self._collected = []
+            self._collecting = True
+        resp = self._call(self.trigger_client, Trigger.Request(), self.trigger_timeout_sec)
+        if resp is not None and not resp.success:
+            self.get_logger().warn(f"Trunk detector trigger failed: {resp.message}")
+        # The detector publishes before it returns; the relay publishes one TrunkInfo per trunk after that.
+        time.sleep(self.detection_collect_sec)
+        with self._collect_lock:
+            self._collecting = False
+            out = list(self._collected)
+        return out
 
     # =========================================================================
     #  Correction service
     # =========================================================================
 
-    def _correct_template_anchor_callback(
-        self, request: Trigger.Request, response: Trigger.Response
-    ) -> Trigger.Response:
+    def _fail(self, response, message: str):
+        response.success = False
+        response.message = message
+        self.get_logger().warn(message)
+        return response
+
+    def _correct_template_anchor_callback(self, request, response):
         """
-        Service handler for /correct_template_anchor.
-
-        1. Checks that a registry was published after the last anchor set.
-        2. Finds the anchor trunk by its tree id.
-        3. Triggers a new depth estimate and waits for the result.
-        4. Computes delta = live_xy - template_xy.
-        5. Checks the delta magnitude.
-        6. Shifts the anchor trunk only, or the full map, and publishes again.
+        Service handler for /correct_template_anchor (CorrectAnchor): collect -> associate -> fit -> apply.
         """
-        self.get_logger().info("Correction service called — starting pipeline.")
+        if self._last_registry_msg is None or self._last_anchor_id is None or self._robot_origin_xy is None:
+            return self._fail(response, "No registry yet. Set anchor_tree_id before calling /correct_template_anchor.")
+        anchor_id = self._last_anchor_id
+        if anchor_id not in self._last_registry_ids:
+            return self._fail(response, f"Anchor tree_{anchor_id:03d} is not in the cached TrunkRegistry.")
 
-        # --- 1. Check a registry exists --------------------------------------
-        if self._last_registry_msg is None or self._last_anchor_id is None:
-            response.success = False
-            response.message = (
-                "No registry has been published yet. "
-                "Set anchor_tree_id before calling /correct_template_anchor."
-            )
-            self.get_logger().warn(response.message)
-            return response
+        ids = list(self._last_registry_ids)
+        pred_xy = np.array([[t.pose.position.x, t.pose.position.y] for t in self._last_registry_msg.trunks])
 
-        # --- 2. Identify the anchor trunk ------------------------------------
-        trunks = self._last_registry_msg.trunks
-        if not trunks:
-            response.success = False
-            response.message = "Cached TrunkRegistry contains no trunks."
-            self.get_logger().warn(response.message)
-            return response
-
-        if self._last_anchor_id not in self._last_registry_ids:
-            response.success = False
-            response.message = (
-                f"Anchor tree_{self._last_anchor_id:03d} is not in the cached TrunkRegistry."
-            )
-            self.get_logger().warn(response.message)
-            return response
-        anchor_idx = self._last_registry_ids.index(self._last_anchor_id)
-        template_xy = np.array([
-            trunks[anchor_idx].pose.position.x,
-            trunks[anchor_idx].pose.position.y,
-        ])
-        self.get_logger().info(
-            f"Anchor trunk (idx={anchor_idx}, tree_id={self._last_anchor_id}) "
-            f"template position — x={template_xy[0]:.4f} m, y={template_xy[1]:.4f} m"
-        )
-
-        # --- 3. Get live trunk position --------------------------------------
-        if self._latest_trunk_pose is None:
-            response.success = False
-            response.message = (
-                "No trunk measurement available. Call /trigger_estimation first "
-                "and ensure trunk_detection_relay is publishing to /trunk_measurements_raw."
-            )
-            self.get_logger().warn(response.message)
-            return response
-
-        live_xy = np.array([
-            self._latest_trunk_pose.position.x,
-            self._latest_trunk_pose.position.y,
-        ])
-        self.get_logger().info(
-            f"Using last trunk measurement — x={live_xy[0]:.4f} m, y={live_xy[1]:.4f} m"
-        )
-
-        # --- 4. Compute delta ------------------------------------------------
-        delta = live_xy - template_xy
-        delta_norm = float(np.linalg.norm(delta))
-        self.get_logger().info(
-            f"Live trunk position  — x={live_xy[0]:.4f} m, y={live_xy[1]:.4f} m\n"
-            f"Correction delta     — dx={delta[0]:.4f} m, dy={delta[1]:.4f} m "
-            f"(|Δ|={delta_norm:.4f} m)"
-        )
-
-        # --- 5. Validate delta -----------------------------------------------
-        if delta_norm > self.max_correction_m:
-            response.success = False
-            response.message = (
-                f"Correction delta {delta_norm:.3f} m exceeds max_correction_m "
-                f"({self.max_correction_m} m). Verify the sensor is seeing the "
-                "correct trunk."
-            )
-            self.get_logger().error(response.message)
-            return response
-
-        # --- 6. Shift and re-publish -----------------------------------------
-        shifted = copy.deepcopy(self._last_registry_msg)
-
-        if self.shift_whole_map:
-            for trunk in shifted.trunks:
-                trunk.pose.position.x += delta[0]
-                trunk.pose.position.y += delta[1]
-            self.get_logger().info(
-                f"Shifted entire map ({len(shifted.trunks)} trunks) "
-                f"by ({delta[0]:.4f}, {delta[1]:.4f}) m."
-            )
+        # --- 1. Frame poses (local frame) -------------------------------------
+        frame_pose = frame_poses_local(
+            self._tree_data[anchor_id], self.base_cam_name, self._robot_origin_xy, self._row_yaw)
+        if self.frame_select_client is None:
+            offsets = [0]
         else:
-            shifted.trunks[anchor_idx].pose.position.x += delta[0]
-            shifted.trunks[anchor_idx].pose.position.y += delta[1]
+            offsets = [o for o in self.frame_offsets if o in frame_pose]
+            missing = sorted(set(self.frame_offsets) - set(offsets))
+            if missing:
+                self.get_logger().warn(f"Frames {missing} are not saved for tree_{anchor_id:03d}; skipped.")
+        if not offsets:
+            return self._fail(response, f"No saved {self.base_cam_name} frames for tree_{anchor_id:03d}.")
+        if 0 not in frame_pose:
+            frame_pose[0] = (np.zeros(2), 0.0, "broadside")
+        if any(frame_pose[o][2] != "world_pose" for o in offsets):
+            self.get_logger().warn(
+                "Some frames have no world_pose_xyt in meta.yaml (extraction without --broadside_source odom). "
+                "Their detections are taken at the broadside pose.")
+
+        # --- 2. Collect -------------------------------------------------------
+        meas, meas_frame = [], []
+        for off in offsets:
+            if self.frame_select_client is not None:
+                if not self._select_frame(off):
+                    continue
+                time.sleep(self.frame_switch_delay_sec)
+            dets = self._trigger_and_collect()
+            fxy, fyaw, _ = frame_pose[off]
+            for d in dets:
+                p = base_to_local(np.array([d.pose.position.x, d.pose.position.y]), fxy, fyaw)[0]
+                meas.append(p)
+                meas_frame.append(off)
             self.get_logger().info(
-                f"Shifted anchor trunk (idx={anchor_idx}) only "
-                f"by ({delta[0]:.4f}, {delta[1]:.4f}) m."
-            )
+                f"[frame {off:+d}] {len(dets)} detection(s)"
+                + (": " + ", ".join(f"({m[0]:+.2f}, {m[1]:+.2f})" for m in meas[-len(dets):]) if dets else ""))
+        if self.frame_select_client is not None and 0 in frame_pose:
+            self._select_frame(0)          # leave the broadside frame on the base-camera topic
+        response.n_detections = len(meas)
+        if not meas:
+            return self._fail(response, "No trunk detections in any frame.")
+        meas = np.array(meas)
 
-        self.registry_pub.publish(shifted)
-        # Keep the cache up to date with the corrected version
-        self._last_registry_msg = shifted
+        # --- 3. Group over frames, then associate groups to map trunks --------
+        groups = cluster_detections(meas, meas_frame, self.cluster_eps_m)
+        group_matches = associate_groups(meas, groups, pred_xy, ids, self.association_gate_m)
+        tree_of_group = {tuple(g): tid for g, tid, _ in group_matches}
+        for g in groups:
+            c = meas[g].mean(axis=0)
+            tid = tree_of_group.get(tuple(g))
+            self.get_logger().info(
+                f"  object at ({c[0]:+.3f}, {c[1]:+.3f}) seen in frames {[meas_frame[k] for k in g]} -> "
+                + (f"tree_{tid:03d}" if tid is not None else "no match"))
+        matches = [(k, tid, 0.0) for g, tid, _ in group_matches for k in g]
+        response.n_matched = len(matches)
+        matched_ids = sorted({tid for (_, tid, _) in matches})
+        response.matched_tree_ids = matched_ids
+        response.frames_used = sorted({meas_frame[k] for (k, _, _) in matches})
+        if anchor_id not in matched_ids:
+            return self._fail(
+                response,
+                f"The anchor tree_{anchor_id:03d} is not matched by any detection "
+                f"(gate {self.association_gate_m} m; matched: {matched_ids}).")
 
-        self.get_logger().info("Re-published corrected TrunkRegistry.")
+        # --- 4. Fit -----------------------------------------------------------
+        P = np.array([pred_xy[ids.index(tid)] for (_, tid, _) in matches])
+        M = np.array([meas[k] for (k, _, _) in matches])
+        T = [tid for (_, tid, _) in matches]
+        dyaw, t, clamped = fit_map_correction(P, M, T, self.max_yaw_correction)
+        res = np.linalg.norm(apply_map_correction(P, dyaw, t) - M, axis=1)
+        rms = float(np.sqrt(np.mean(res ** 2)))
+        a_old = pred_xy[ids.index(anchor_id)]
+        a_new = apply_map_correction(a_old, dyaw, t)[0]
+        shift = a_new - a_old
+        for tid in matched_ids:
+            r = res[[k for k, x in enumerate(T) if x == tid]]
+            self.get_logger().info(f"  residual tree_{tid:03d}: mean {r.mean():.3f} m over {len(r)} detection(s)")
+        self.get_logger().info(
+            f"Correction: yaw {math.degrees(dyaw):+.2f} deg{' (clamped)' if clamped else ''}, "
+            f"t ({t[0]:+.3f}, {t[1]:+.3f}) m, anchor shift ({shift[0]:+.3f}, {shift[1]:+.3f}) m, "
+            f"RMS {rms:.3f} m, {len(matched_ids)} trunk(s), {len(matches)} detection(s)")
+        response.dx, response.dy, response.dyaw = float(t[0]), float(t[1]), float(dyaw)
+        response.anchor_dx, response.anchor_dy = float(shift[0]), float(shift[1])
+        response.rms_residual_m = rms
+        response.yaw_clamped = bool(clamped)
+
+        if float(np.linalg.norm(shift)) > self.max_correction_m:
+            return self._fail(
+                response,
+                f"Anchor shift {np.linalg.norm(shift):.3f} m is more than max_correction_m "
+                f"({self.max_correction_m} m). Not applied.")
+
+        # --- 5. Apply to all trunks and publish ------------------------------
+        corrected = copy.deepcopy(self._last_registry_msg)
+        new_xy = apply_map_correction(pred_xy, dyaw, t)
+        qz, qw = math.sin(dyaw / 2.0), math.cos(dyaw / 2.0)
+        for trunk, xy in zip(corrected.trunks, new_xy):
+            trunk.pose.position.x = float(xy[0])
+            trunk.pose.position.y = float(xy[1])
+            # Compose the yaw with the existing orientation (identity after a publish)
+            q = trunk.pose.orientation
+            trunk.pose.orientation.x, trunk.pose.orientation.y = (
+                qw * q.x - qz * q.y, qw * q.y + qz * q.x)
+            trunk.pose.orientation.z, trunk.pose.orientation.w = (
+                qw * q.z + qz * q.w, qw * q.w - qz * q.z)
+        self.registry_pub.publish(corrected)
+        self._last_registry_msg = corrected
+        self.get_logger().info(f"Published the corrected TrunkRegistry ({len(corrected.trunks)} trunks).")
 
         response.success = True
         response.message = (
-            f"Correction applied — dx={delta[0]:.4f} m, dy={delta[1]:.4f} m "
-            f"({'whole map' if self.shift_whole_map else 'anchor trunk only'})"
-        )
+            f"anchor shift ({shift[0]:+.3f}, {shift[1]:+.3f}) m, yaw {math.degrees(dyaw):+.2f} deg, "
+            f"{len(matched_ids)} trunk(s), RMS {rms:.3f} m")
         return response
-
-    # =========================================================================
-    #  Live trunk position helper
-    # =========================================================================
-
-    def _get_live_trunk_position(self) -> Optional[np.ndarray]:
-        """
-        Wait for a new TrunkInfo on /trunk_measurements_raw.
-        Clears the old state first, so the measurement that comes back is new.
-        """
-        self._latest_trunk_pose = None
-        self._trunk_received_event = threading.Event()
-
-        self.get_logger().info(
-            f"Waiting up to {self.measurement_timeout_sec}s for trunk measurement..."
-        )
-
-        received = self._trunk_received_event.wait(timeout=self.measurement_timeout_sec)
-        self._trunk_received_event = None
-
-        if not received:
-            self.get_logger().warn(
-                f"Timed out after {self.measurement_timeout_sec}s waiting for "
-                "/trunk_measurements_raw. Check trunk_detection_relay is running "
-                "and the camera has a clear view of the trunk."
-            )
-            return None
-
-        x = self._latest_trunk_pose.position.x
-        y = self._latest_trunk_pose.position.y
-        self.get_logger().info(f"Live trunk position — x={x:.4f} m, y={y:.4f} m")
-        return np.array([x, y])
 
 
 # =============================================================================

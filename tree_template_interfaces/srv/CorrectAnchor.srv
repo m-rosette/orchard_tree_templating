@@ -1,0 +1,18 @@
+# Correct the trellis template map from base-camera trunk detections (trellis_from_rgbd_extraction).
+# Empty request: the node uses the anchor tree set with anchor_tree_id.
+---
+bool success
+string message
+# Correction applied to all trunks, local frame: p_new = R(dyaw) @ p + [dx, dy]
+float64 dx
+float64 dy
+float64 dyaw
+# Shift of the anchor trunk: anchor_new - anchor_old [m]
+float64 anchor_dx
+float64 anchor_dy
+uint32 n_detections          # detections from all frames
+uint32 n_matched             # detections matched to a map trunk
+int32[] matched_tree_ids     # distinct matched trunks
+float64 rms_residual_m       # RMS of (corrected prediction - detection) over the matched detections
+bool yaw_clamped
+int32[] frames_used          # base-camera frame indices with at least one matched detection

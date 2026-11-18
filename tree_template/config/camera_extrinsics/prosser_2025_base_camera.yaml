@@ -1,0 +1,33 @@
+camera_ns: /camera/base_camera
+depth_frame: base_camera_depth_optical_frame
+color_frame: base_camera_color_optical_frame
+convention: p_color = R @ p_depth + t
+rotation: [0.9999898362891142, -0.0033460519609940453, 0.0030217966087863705, 0.003347897679681687,
+  0.9999942121860534, -0.0006059500975108463, -0.003019751578677769, 0.0006160606046642931,
+  0.9999952507735896]
+translation_m: [0.014833121424631827, 0.0001106872063522525, -8.334448992647539e-05]
+rotvec_rad: [0.0006110074591412607, 0.0030207845158240648, 0.00334698636786787]
+fit: {median_abs_mm: 0.0, p95_abs_mm: 0.0, frac_within_10mm: 0.9934265553266605, valid_mask_agreement: 0.9979911295572916,
+  n_pairs: 8, cost: 0.6721851952722171, bag: /home/marcus/apple_harvest_ws/data/prosser_2025_bags/day3/rosbag2_2025_10_30-09_10_50,
+  depth_topic: /camera/base_camera/depth/image_rect_raw, aligned_topic: /camera/base_camera/aligned_depth_to_color/image_raw,
+  date: '2026-11-18'}
+depth_camera_info:
+  frame_id: base_camera_depth_optical_frame
+  width: 848
+  height: 480
+  distortion_model: plumb_bob
+  k: [427.6949768066406, 0.0, 422.2054138183594, 0.0, 427.6949768066406, 244.42422485351562,
+    0.0, 0.0, 1.0]
+  d: [0.0, 0.0, 0.0, 0.0, 0.0]
+  p: [427.6949768066406, 0.0, 422.2054138183594, 0.0, 0.0, 427.6949768066406, 244.42422485351562,
+    0.0, 0.0, 0.0, 1.0, 0.0]
+color_camera_info:
+  frame_id: base_camera_color_optical_frame
+  width: 640
+  height: 480
+  distortion_model: plumb_bob
+  k: [614.3169555664062, 0.0, 322.9431457519531, 0.0, 614.5902099609375, 239.09657287597656,
+    0.0, 0.0, 1.0]
+  d: [0.0, 0.0, 0.0, 0.0, 0.0]
+  p: [614.3169555664062, 0.0, 322.9431457519531, 0.0, 0.0, 614.5902099609375, 239.09657287597656,
+    0.0, 0.0, 0.0, 1.0, 0.0]
