@@ -1,0 +1,43 @@
+# Robot config (prosser_2023_warthog.yaml tells how to use this file).
+# Platform: 2026 Prosser bags, Farm-ng Amiga. Same as prosser_2025_amiga.yaml, but for odometry from twist only.
+# Use with robot_platform:=amiga nav_config:=nav_2026 robot_config:=<this file>.
+# In the 2026 bags the /filter/state pose is not usable and the robot moves along -x of amiga__base.
+# nav_2026 ekf_local fuses only the twist. rotate_yaw_deg 180 turns the twist (and the yaw) by 180 deg, so the
+# EKF moves the robot along -x of amiga__base, which agrees with the trunk detections.
+# The 2026 bags have no aligned depth topic. Start depth_image_proc::RegisterNode with the output remapped to
+# /camera/base_camera/aligned_depth_to_color/image_raw (it needs publish_robot_description:=true for the camera TF).
+
+trunk_detection_relay:
+  ros__parameters:
+    input_topic: tree_image_data
+    camera_frame: base_camera_color_optical_frame
+    output_frame: amiga__base
+    base_x_is_right: false
+
+odom_reframer:
+  ros__parameters:
+    input_odom_topic: /filter/state
+    base_frame: amiga__base
+    gps_topic: /gps/pvt
+    rotate_yaw_deg: 180.0
+
+row_fast_slam:
+  ros__parameters:
+    base_frame: amiga__base   # child_frame_id of odom_slam_best
+    # Debug CSVs (+ _landmarks.csv, _tracks.csv), rewritten each run. Default: tree_template/debug_data/ in the
+    # package source folder. Remove the # to set a different path (this value wins over the params file):
+    # debug.csv_path: /path/to/debug_data/fastslam_debug.csv
+
+tree_scene_node:
+  ros__parameters:
+    trellis_frame: amiga__base
+
+save_best_particle_map:
+  ros__parameters:
+    out: /home/marcus/trunk_width_ws/pf_localization_package_data/slam_measurements/slam_trunks.yaml
+    final_gps_navsat_topic: /gps/pvt
+    world_correction.antenna_x: 0.57    # [m] GPS antenna x in amiga__base (gps_antenna in amiga.urdf.xacro)
+
+trellis_from_rgbd_extraction:
+  ros__parameters:
+    extraction_dir: /home/marcus/apple_harvest_ws/data/rgbd_at_trees_prosser_2026_v2

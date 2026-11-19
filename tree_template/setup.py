@@ -15,6 +15,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*launch.[pxy][yma]*')),
         (os.path.join('share', package_name, 'config', 'nav'), glob('config/nav/*.yaml')),
         (os.path.join('share', package_name, 'config', 'nav_2025'), glob('config/nav_2025/*.yaml')),
+        (os.path.join('share', package_name, 'config', 'nav_2026'), glob('config/nav_2026/*.yaml')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'config', 'robot'), glob('config/robot/*.yaml')),
         (os.path.join('share', package_name, 'config', 'camera_extrinsics'), glob('config/camera_extrinsics/*.yaml')),
