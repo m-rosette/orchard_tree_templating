@@ -385,6 +385,10 @@ class RowFastSLAMNode(Node):
         self.declare_parameter("origin_recal.interval",  10)     # run every N measurements
 
         self.declare_parameter("meas_max_lag_sec", 0.5)
+        # Depth of the measurement subscription queue (KEEP_LAST). The relay publishes one TrunkInfo per trunk, so a
+        # frame with two trunks gives two messages at the same time. With depth 1, the second message replaces the
+        # first when the filter is busy.
+        self.declare_parameter("meas_queue_depth", 1)
 
         # Odom history for delayed measurement alignment (seconds).
         self.declare_parameter("odom_history_sec", 20.0)
@@ -395,6 +399,7 @@ class RowFastSLAMNode(Node):
 
         self.meas_max_lag_sec = float(self.get_parameter("meas_max_lag_sec").value)
         self.odom_history_sec = float(self.get_parameter("odom_history_sec").value)
+        self.meas_queue_depth = max(1, int(self.get_parameter("meas_queue_depth").value))
 
         self._registry_min_interval = float(self.get_parameter("publish.registry_min_interval").value)
         self._odom_min_interval     = float(self.get_parameter("publish.odom_min_interval").value)
@@ -696,7 +701,7 @@ class RowFastSLAMNode(Node):
 
         meas_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=self.meas_queue_depth,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
@@ -711,7 +716,7 @@ class RowFastSLAMNode(Node):
             "RowFastSLAMNode started.\n"
             f"  num_particles={self.num_particles}\n"
             f"  odom_topic={self.odom_topic}\n"
-            f"  measurement_topic={self.measurement_topic}\n"
+            f"  measurement_topic={self.measurement_topic} (queue depth {self.meas_queue_depth})\n"
             f"  registry_topic={self.registry_topic}\n"
             f"  odom_best_topic={self.odom_best_topic}\n"
             f"  use_template_map={self.use_template_map}, use_global_row_yaw={self.use_global_row_yaw}\n"
