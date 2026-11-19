@@ -175,9 +175,10 @@ def tree_in_robot_frames(poses: np.ndarray, tree_xy: np.ndarray) -> np.ndarray:
     return Rotation.from_euler("z", -poses[:, 2]).apply(d)[:, :2]
 
 
-def load_odom(bag: BagReader, topic: str):
-    """(N, 4) [x, y, yaw, receive time s] of nav_msgs/Odometry messages on topic, or None."""
-    rows = [(m.pose.pose, t) for _, m, t in bag.messages([topic])]
+def load_odom(bag: BagReader, topic: str, use_header: bool = False):
+    """(N, 4) [x, y, yaw, time s] of nav_msgs/Odometry messages on topic, or None.
+    The time is the receive time, or the header stamp with use_header."""
+    rows = [(m.pose.pose, stamp_s(m) * 1e9 if use_header else t) for _, m, t in bag.messages([topic])]
     if not rows:
         return None
     q = np.array([[p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w] for p, _ in rows])
@@ -296,6 +297,12 @@ def parse_args():
     p.add_argument("--cam2_buffer_radius", type=int, default=0, help="frames on each side of the broadside frame")
 
     p.add_argument("--odom_topic", default="/filter/state", help="nav_msgs/Odometry")
+    p.add_argument("--odom_bag", default=None,
+                   help="bag with --odom_topic (default: --bag). For example a recording of /odometry/local made "
+                        "while the bag played (use it with --odom_stamp header)")
+    p.add_argument("--odom_stamp", choices=["receive", "header"], default="receive",
+                   help="odometry time: receive time in the odometry bag, or the header stamp (a recording made "
+                        "during bag playback has the playback clock in the header stamps only)")
     p.add_argument("--odom_to_base_yaw_deg", type=float, default=0.0,
                    help="yaw of the base frame in the odometry child frame (180: 2025 Amiga /filter/state)")
     p.add_argument("--broadside_source", choices=["odom", "slam_path"], default="odom",
@@ -363,7 +370,8 @@ def main():
     if args.image_time_offset_s is not None:
         offset = args.image_time_offset_s
     elif args.auto_detect_clock_offset:
-        img0, odom0 = bag.first(image_topics[0])[0], bag.first(args.odom_topic)[0]
+        img0 = bag.first(image_topics[0])[0]
+        odom0 = (BagReader(args.odom_bag) if args.odom_bag else bag).first(args.odom_topic)[0]
         if img0 is None or odom0 is None:
             raise RuntimeError("--auto_detect_clock_offset needs messages on the image and odometry topics")
         offset = stamp_s(img0) - stamp_s(odom0)
@@ -389,7 +397,8 @@ def main():
     def header_to_receive_s(h_s):
         return h_s if header_epoch_ok else (t0_cal_ns + (h_s - h0_cal) * slope_cal) * 1e-9
 
-    odom = load_odom(bag, args.odom_topic)
+    odom_bag = BagReader(args.odom_bag) if args.odom_bag else bag
+    odom = load_odom(odom_bag, args.odom_topic, use_header=(args.odom_stamp == "header"))
     if odom is None:
         print(f"[WARN] no odometry on {args.odom_topic}")
 
@@ -414,6 +423,8 @@ def main():
             info.update(pose=b["pose_xyt"], timestamp_s=b["t_slam"], fwd_dist_m=b["fwd"], lat_dist_m=b["lat"],
                         broadside_source="odom", broadside_fit={
                             "odom_topic": args.odom_topic,
+                            "odom_bag": args.odom_bag or args.bag,
+                            "odom_stamp": args.odom_stamp,
                             "odom_time_offset_s": args.odom_time_offset_s,
                             "window_s": args.broadside_window_s,
                             "rotation_window_s": args.broadside_rotation_window_s,
@@ -510,6 +521,8 @@ def main():
             "image_time_offset_applied_s": offset,
             "slam_yaml": os.path.abspath(args.yaml),
             "odom_topic": args.odom_topic,
+            "odom_bag": args.odom_bag or args.bag,
+            "odom_stamp": args.odom_stamp,
             "odom_to_base_yaw_deg": args.odom_to_base_yaw_deg,
             "max_color_depth_dt_s": args.max_color_depth_dt_s,
             "cameras": cam_meta,

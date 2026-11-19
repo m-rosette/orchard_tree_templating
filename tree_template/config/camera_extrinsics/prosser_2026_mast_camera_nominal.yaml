@@ -1,0 +1,10 @@
+# Nominal RealSense D435 depth->color extrinsics for the 2026 Prosser mast camera.
+# The 2026 bags have no extrinsics topic and no aligned mast depth, so calibrate_depth_to_color cannot fit this unit.
+# The 2026 mast camera is not the 2025 unit (different depth intrinsics), so prosser_2025_mast_camera.yaml does not
+# apply. Nominal values: 15 mm along x, no rotation.
+camera_ns: /camera/mast_camera
+depth_frame: mast_camera_depth_optical_frame
+color_frame: mast_camera_color_optical_frame
+convention: p_color = R @ p_depth + t
+rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+translation_m: [0.015, 0.0, 0.0]
