@@ -21,7 +21,12 @@ t_from_broadside_s, odom_pose_xyt (--odom_topic), world_pose_xyt (odometry in th
 Buffer frames also have base_delta_from_frame0_xyt (motion from frame_0 in the base frame, --odom_to_base_yaw_deg).
 The depth frame of a pair is the one with the header stamp nearest to the color frame.
 
-Broadside (--broadside_source odom): odometry put into the world frame by odom_alignment.broadside_from_odom.
+Broadside (--broadside_source odom): odometry put into the world frame by odom_alignment.broadside_from_odom
+(odometry fitted to the SLAM robot_path).
+Broadside (--broadside_source trees): odometry fitted to the SLAM map trees by odom_alignment.broadside_from_trees.
+The trunk detections (--meas_topic, TrunkInfo in the robot base frame, in --odom_bag) go into the odometry frame and
+are matched to the map trees. Use it when the robot_path jumps (for example at the start of a row), with an
+--odom_bag recorded while the bag played (odometry and /trunk_measurements_raw of the same SLAM run).
 meta.yaml also keeps the robot_path result (slam_path_broadside) and the fit (broadside_fit).
 
 depth_aligned.png: depth_registration.register_depth_to_color with --camN_depth_to_color (calibrate_depth_to_color,
@@ -61,7 +66,13 @@ from tree_template.depth_registration import (
     load_extrinsics_yaml,
     register_depth_to_color,
 )
-from tree_template.odom_alignment import broadside_from_odom, interp_pose, world_poses
+from tree_template.odom_alignment import (
+    broadside_from_odom,
+    broadside_from_trees,
+    detection_trees,
+    interp_pose,
+    world_poses,
+)
 from tree_template.trellis_geometry import pose_tf
 
 BRIDGE = CvBridge()
@@ -305,8 +316,19 @@ def parse_args():
                         "during bag playback has the playback clock in the header stamps only)")
     p.add_argument("--odom_to_base_yaw_deg", type=float, default=0.0,
                    help="yaw of the base frame in the odometry child frame (180: 2025 Amiga /filter/state)")
-    p.add_argument("--broadside_source", choices=["odom", "slam_path"], default="odom",
-                   help="odom: odometry fitted to the robot_path; slam_path: robot_path pose with the smallest |fwd|")
+    p.add_argument("--broadside_source", choices=["odom", "trees", "slam_path"], default="odom",
+                   help="odom: odometry fitted to the robot_path; trees: odometry fitted to the map trees with the "
+                        "trunk detections in --odom_bag (--meas_topic); slam_path: robot_path pose with the smallest |fwd|")
+    p.add_argument("--meas_topic", default="/trunk_measurements_raw",
+                   help="--broadside_source trees: TrunkInfo detections (robot base frame) in --odom_bag")
+    p.add_argument("--tree_cluster_eps_m", type=float, default=0.15,
+                   help="--broadside_source trees: detections closer than this are one odometry-frame tree")
+    p.add_argument("--tree_min_hits", type=int, default=3, help="--broadside_source trees: detections for a tree")
+    p.add_argument("--tree_gate_m", type=float, default=0.25,
+                   help="--broadside_source trees: max distance odometry-frame tree -> map tree (less than half "
+                        "the tree spacing)")
+    p.add_argument("--tree_search_m", type=float, default=0.5,
+                   help="--broadside_source trees: translation search around the robot_path start value")
     p.add_argument("--odom_time_offset_s", type=float, default=0.0, help="odometry time - SLAM time")
     p.add_argument("--broadside_window_s", type=float, default=10.0, help="half window, translation fit")
     p.add_argument("--broadside_rotation_window_s", type=float, default=60.0, help="half window, rotation fit")
@@ -402,26 +424,55 @@ def main():
     if odom is None:
         print(f"[WARN] no odometry on {args.odom_topic}")
 
-    # --- Broadside from the odometry -----------------------------------------
-    if args.broadside_source == "odom":
+    # --- Odometry-frame trees from the trunk detections (--broadside_source trees) -----
+    det_trees = None
+    if args.broadside_source == "trees":
         if odom is None:
-            raise RuntimeError(f"--broadside_source odom needs odometry on {args.odom_topic}")
+            raise RuntimeError(f"--broadside_source trees needs odometry on {args.odom_topic}")
+        meas = [(m.pose.position.x, m.pose.position.y, m.stamp.sec + m.stamp.nanosec * 1e-9)   # TrunkInfo: image time
+                for _, m, _ in odom_bag.messages([args.meas_topic])]
+        if not meas:
+            raise RuntimeError(f"--broadside_source trees needs TrunkInfo messages on {args.meas_topic} in "
+                               f"{args.odom_bag or args.bag}")
+        det_trees = detection_trees(odom, np.array(meas), args.odom_time_offset_s, odom_to_base_yaw,
+                                    eps_m=args.tree_cluster_eps_m, min_hits=args.tree_min_hits)
+        print(f"{len(meas)} trunk detections on {args.meas_topic} -> {len(det_trees)} odometry-frame trees")
+    map_xy = np.array([info["tree_xy"] for info in broadside_info.values()], dtype=np.float64).reshape(-1, 2)
+
+    # --- Broadside from the odometry -----------------------------------------
+    if args.broadside_source in ("odom", "trees"):
+        if odom is None:
+            raise RuntimeError(f"--broadside_source {args.broadside_source} needs odometry on {args.odom_topic}")
         for tree_id, info in broadside_info.items():
             info["slam_path_broadside"] = {"pose_xyt": info["pose"], "timestamp_s": info["timestamp_s"],
                                            "fwd_dist_m": info["fwd_dist_m"], "lat_dist_m": info["lat_dist_m"]}
-            b = broadside_from_odom(path, odom, np.array(info["tree_xy"]), info["timestamp_s"],
-                                    args.odom_time_offset_s, odom_to_base_yaw,
-                                    window_s=args.broadside_window_s, rotation_window_s=args.broadside_rotation_window_s)
+            source = args.broadside_source
+            b = None
+            if source == "trees":
+                b = broadside_from_trees(path, odom, det_trees, map_xy, np.array(info["tree_xy"]),
+                                         info["timestamp_s"], args.odom_time_offset_s, odom_to_base_yaw,
+                                         window_s=args.broadside_window_s,
+                                         rotation_window_s=args.broadside_rotation_window_s,
+                                         gate_m=args.tree_gate_m, search_m=args.tree_search_m)
+                if b is None:
+                    print(f"  [WARN] Tree {tree_id}: tree fit failed; odometry fitted to the robot_path used")
+                    source = "odom (tree fit failed)"
+            if b is None:
+                b = broadside_from_odom(path, odom, np.array(info["tree_xy"]), info["timestamp_s"],
+                                        args.odom_time_offset_s, odom_to_base_yaw, window_s=args.broadside_window_s,
+                                        rotation_window_s=args.broadside_rotation_window_s)
             if b is None:
                 print(f"  [WARN] Tree {tree_id}: odometry fit failed; robot_path broadside pose used")
                 info["broadside_source"] = "slam_path (odometry fit failed)"
                 continue
             moved = math.hypot(b["pose_xyt"][0] - info["pose"][0], b["pose_xyt"][1] - info["pose"][1])
+            tf_info = b.get("tree_fit_info")
             print(f"  Tree {tree_id:>3}: t={b['t_slam']:.3f} s ({b['t_slam'] - info['timestamp_s']:+.2f} s) "
-                  f"lat={b['lat']:+.3f} m, {moved:.2f} m from the robot_path pose, fit RMS {b['fit'].rms_inlier_m:.2f} m")
+                  f"lat={b['lat']:+.3f} m, {moved:.2f} m from the robot_path pose, fit RMS {b['fit'].rms_inlier_m:.2f} m"
+                  + (f", {tf_info['n_matched']}/{tf_info['n_trees']} trees matched" if tf_info else ""))
             info["world_fit"] = b["fit"]
             info.update(pose=b["pose_xyt"], timestamp_s=b["t_slam"], fwd_dist_m=b["fwd"], lat_dist_m=b["lat"],
-                        broadside_source="odom", broadside_fit={
+                        broadside_source=source, broadside_fit={
                             "odom_topic": args.odom_topic,
                             "odom_bag": args.odom_bag or args.bag,
                             "odom_stamp": args.odom_stamp,
@@ -435,6 +486,9 @@ def main():
                             "n_used": b["fit"].n_used,
                             "travel_in_window_m": b["fit"].span_m,
                         })
+            if tf_info:
+                info["broadside_fit"].update(meas_topic=args.meas_topic, tree_gate_m=args.tree_gate_m,
+                                             tree_search_m=args.tree_search_m, **tf_info)
 
     # --- Frames ---------------------------------------------------------------
     pad_s = max(args.filter_pad_s if args.filter_pad_s is not None else args.max_time_delta_s + 0.5,

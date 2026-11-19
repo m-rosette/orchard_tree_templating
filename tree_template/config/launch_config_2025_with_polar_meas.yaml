@@ -292,7 +292,8 @@ trellis_from_rgbd_extraction:
     registry_topic: fastslam_registry
     max_correction_m: 2.0                 # [m] max anchor shift of a correction
     # /correct_template_anchor
-    frame_offsets: [-2, -1, 0, 1, 2]      # base-camera frames
+    correction_frames: current            # current: only the displayed base-camera image (parked robot) | buffer
+    frame_offsets: [-2, -1, 0, 1, 2]      # base-camera frames for correction_frames buffer
     frame_select_service: /apple_prediction/set_parameters
     frame_select_param: presaved_images.base_cam_frame_index
     trigger_service: /trigger_estimation

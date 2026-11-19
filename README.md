@@ -162,10 +162,12 @@ ROS params files don't expand `~` or `$HOME`, so paths in the robot config must 
 |---|---|
 | `config/robot/prosser_2023_warthog.yaml` | Robot config for `robot_platform:=warthog` (default): 2023 Prosser bags, Clearpath Warthog |
 | `config/robot/prosser_2025_amiga.yaml` | Robot config for `robot_platform:=amiga`: 2025 Prosser, Amiga (`/filter/state`, `/gps/pvt`) |
+| `config/robot/prosser_2026_amiga.yaml` | Robot config for the 2026 Prosser Amiga bags (use with `robot_platform:=amiga nav_config:=nav_2026`): `/filter/state` pose not usable, odometry from its twist only |
 | `config/launch_config.yaml` | Params file (default). Same as the 2023 tuning |
 | `config/launch_config_2023_with_polar_meas.yaml` | Params file: 2023 Prosser bags |
-| `config/launch_config_2025_with_polar_meas.yaml` | Params file: 2025 Prosser (`slot_spacing 1.42`) |
-| `config/nav/`, `config/nav_2025/` | `robot_localization` EKF + navsat configs for each platform. `nav_2025` has no gps_heading files yet |
+| `config/launch_config_2025_with_polar_meas.yaml` | Params file: 2025/2026 Prosser Amiga, Envy V-trellis (tree spacing about 0.60 m; `slot_spacing 0.63` in odometry units) |
+| `config/nav/`, `config/nav_2025/`, `config/nav_2026/` | `robot_localization` EKF + navsat configs for each platform. `nav_2025` has no gps_heading files yet. `nav_2026` has only a velocity-only `ekf_local` |
+| `config/camera_extrinsics/` | Depth -> color extrinsics for bags without an aligned depth topic (`prosser_2025_*`: fitted; `prosser_2026_mast_camera_nominal`: nominal RealSense values) |
 | `config/bag_qos_override.yaml` | `/tf_static` QoS override for replaying ROS 1-converted bags |
 
 ---
@@ -281,17 +283,152 @@ The default output path is `save_best_particle_map.out` from the robot config; `
 
 If `require_*` is true for an input that never arrived, the save fails. For example, `require_gps_fix: true` with no GPS fails, so set those params to `false` on robots without GPS.
 
-### 4. Place templates from a saved map (optional)
+### 4. Templates from a saved map
 
-After running `fast_slam_rgbd_extraction.py` on a bag plus a saved map (example command in `config/rgbd_extraction_cli.yaml`):
+See [Templating from a saved map](#templating-from-a-saved-map): extract the RGB-D frames at each mapped tree,
+place the trellis templates around one anchor tree, and correct them locally from the trunk detections.
+
+---
+
+## Templating from a saved map
+
+The SLAM map is good to about 0.2 m along a full row. That is enough to drive the mobile base, but not enough to
+place collision templates for the arm. So the templating phase works at one tree at a time, with the robot parked
+in front of it:
+
+1. Place all the templates of the saved map relative to the robot at that tree (the anchor tree).
+2. Detect the trunks in the base-camera image at that parked pose.
+3. Shift the templates so that they agree with the detections (local correction).
+4. Detect the apples and plan the arm motions with the corrected templates.
+
+On recorded data, "parked in front of the tree" is the image where the robot was broadside to the tree. The steps
+below use the RGB-D frames extracted from the bag at each mapped tree.
+
+### Step 1: extract the RGB-D frames at each mapped tree
+
+`fast_slam_rgbd_extraction` reads a saved map and the bag. For each tree it finds the time when the tree was
+straight to the side of the robot (broadside) and saves the mast-camera frame and a buffer of base-camera frames
+around it, with their robot poses, to `tree_NNN/` folders (`meta.yaml`, `camera_info.yaml`, `color.png`,
+`depth.png`, `depth_aligned.png`).
+
+Broadside source (`--broadside_source`):
+
+| Value | Odometry is fitted to | Use it when |
+|---|---|---|
+| `odom` (default) | the SLAM `robot_path` | the `robot_path` is smooth |
+| `trees` | the map trees, with the trunk detections (`--meas_topic`, default `/trunk_measurements_raw`) | the `robot_path` jumps, for example at the start of a row while the filter converges. Needs an `--odom_bag` with the odometry and the trunk detections of the same SLAM run |
+| `slam_path` | (no fit) the `robot_path` pose itself | debugging |
+
+`robot_path` is the pose of the best particle at each time, so it jumps when a different particle becomes the
+best. With `trees`, `meta.yaml` records the fit (`n_matched`, `rms_inlier_m`, `search_score`,
+`search_other_score`; an other score near the score means an ambiguous match, for example a shift of one tree
+spacing).
+
+Example (2026 Prosser bag; the bag pose of `/filter/state` is not usable, so the odometry and the trunk detections
+come from a recording of `/odometry/local` and `/trunk_measurements_raw` made while the bag played through the
+pipeline):
 
 ```bash
-# extraction_dir comes from the robot config when started by the pipeline launch
-ros2 run tree_template trellis_from_rgbd_extraction --ros-args -p extraction_dir:=<dir>
-ros2 param set /trellis_from_rgbd_extraction anchor_tree_id 3
+CFG=$(ros2 pkg prefix tree_template)/share/tree_template/config/camera_extrinsics
+ros2 run tree_template fast_slam_rgbd_extraction \
+  --yaml <map_dir>/slam_trunks.yaml \
+  --bag <bag_dir> \
+  --output_dir <extraction_dir> \
+  --odom_bag <map_dir>/odom_rec --odom_topic /odometry/local --odom_stamp header --odom_to_base_yaw_deg 0 \
+  --broadside_source trees \
+  --image_time_offset_s -0.04 \
+  --cam1_depth_topic /camera/mast_camera/depth/image_rect_raw \
+  --cam1_depth_to_color $CFG/prosser_2026_mast_camera_nominal.yaml \
+  --cam2_depth_to_color $CFG/prosser_2025_base_camera.yaml \
+  --cam2_buffer_radius 2
+cp <map_dir>/slam_trunks.yaml <extraction_dir>/slam_trunks_<name>.yaml   # the trial nodes read the map from here
 ```
 
-This node publishes on the same `fastslam_registry` topic as `row_fast_slam`. Don't run both against the same collision node unless you remap one of them.
+- `--odom_stamp header`: a recording made during bag playback has the bag clock only in the header stamps.
+- `--camN_depth_to_color`: registers raw depth to the color image when the bag has no aligned depth topic.
+- `config/rgbd_extraction_cli.yaml` has the 2025 example.
+
+### Step 2: interactive session in RViz
+
+`templating_trial.launch.py` (package `harvest`, apple-harvest repo) starts MoveIt with RViz, `tree_scene_node`
+(templates as collision objects), `trellis_from_rgbd_extraction` (map, anchor and correction),
+`apple_prediction` (presaved images, point clouds, apples), the trunk detector with `trunk_detection_relay`, and
+`voxelize_scan`. It does not start SLAM.
+
+```bash
+# Terminal 1
+ros2 launch harvest templating_trial.launch.py trial_dir:=<extraction_dir>
+```
+
+RViz (`view_templating.rviz`): set the Fixed Frame to `amiga__base`. The displays are PlanningScene (templates),
+`colorize_pt_cloud` (mast camera, `/rgbd_pointcloud`), `base_cam_pointcloud` (`/base_cam/pointcloud`),
+`trunk_annotated` (trunk detector, `/annotated_segmented_image`), `apple_markers`.
+
+```bash
+# Terminal 2
+TREE=10
+
+# 1. Load the images of the tree: mast and base-camera point clouds
+ros2 param set /apple_prediction presaved_images.tree_id $TREE
+
+# 2. Place all the templates of the SLAM map, with this tree as the anchor (uncorrected SLAM placement).
+#    Set it again to go back to the uncorrected placement.
+ros2 param set /trellis_from_rgbd_extraction anchor_tree_id $TREE
+
+# 3. Select the base-camera image of the parked robot (-2 ... 2; 0 = broadside)
+ros2 param set /apple_prediction presaved_images.base_cam_frame_index 0
+
+# 4. (optional) Trunk detection on that image only: see trunk_annotated
+ros2 service call /trigger_estimation std_srvs/srv/Trigger {}
+
+# 5. Local correction on that image: the templates move onto the detected trunks
+ros2 service call /correct_template_anchor std_srvs/srv/Trigger {}
+
+# 6. Apple detection on the mast image: apple_markers, /apple_annotated, poses in the response
+ros2 service call /apple_prediction harvest_interfaces/srv/ApplePrediction {}
+```
+
+What you see:
+
+- The templates and the point clouds are in the robot base frame of the selected base-camera image.
+  `trellis_from_rgbd_extraction` follows `presaved_images.base_cam_frame_index` of `/apple_prediction` (through
+  `/parameter_events`) and publishes the templates again in the robot frame of that image (its odometry pose,
+  `world_pose_xyt` in `meta.yaml`). When you select a different image, the templates and the point clouds move
+  together, because the robot moved and the trees did not. The map error stays the same in the world, so one local
+  correction is enough at one parked pose.
+- `/correct_template_anchor` (with `correction_frames: current`) triggers the detector once on the selected image,
+  matches the detections to the templates in the robot frame of that image, fits one rigid correction
+  (translation, and yaw if two or more trunks match) and moves all the templates. The odometry is not used in the
+  fit. After the correction the anchor template is on its detection in that image. The corrected map then stays at
+  the same place in the world when you select a different image.
+- The response message is JSON: `summary`, `frame`, `dx`/`dy`/`dyaw` and `anchor_dx`/`anchor_dy` (robot frame of
+  the image), `matched_tree_ids`, `rms_residual_m`, `anchor_residual_m`, `detections`, or `error` (for example
+  when no detection matches the anchor within `association_gate_m`).
+- The trunk detector runs only when it is triggered: `ros2 param set` publishes the images, it does not run the
+  detector. `/annotated_segmented_image` is not latched, so RViz shows only the images published while it is open.
+
+Correction modes (`trellis_from_rgbd_extraction` parameter `correction_frames`):
+
+| Value | The correction uses |
+|---|---|
+| `current` (default) | Only the selected base-camera image: the parked-robot correction, no odometry in the fit |
+| `buffer` | All the frames in `frame_offsets` (default `[-2, -1, 0, 1, 2]`): the node selects each frame, triggers the detector and puts the detections in the local frame with the odometry poses of the frames. At the end frame 0 is selected |
+
+One detection can be several centimetres off (the trunk depth is read at the bottom of the mask). On a parked robot,
+several images of the same pose average this without odometry.
+
+### Step 3: automated trial
+
+`orchard_templating.py` (package `harvest`) runs steps 1-6 for each tree, then plans the arm to each apple with the
+templates and with a voxelized mast point cloud, and saves `results.yaml` and images in
+`data_save_dir/<dataset>/<time>/tree_<id>/`:
+
+```bash
+ros2 run harvest orchard_templating.py --ros-args -p tree_id:=$TREE -p trial_dir:=<extraction_dir>
+ros2 run harvest orchard_templating.py --ros-args -p "tree_ids:=[10, 20, 30]" -p trial_dir:=<extraction_dir>
+```
+
+Use the same `trial_dir` as the launch, and start it after the launch is ready.
 
 ---
 
@@ -433,11 +570,11 @@ Turns `TrunkRegistry` into MoveIt `CollisionObject`s. Each tree is a leader cyli
 
 ### `trellis_from_rgbd_extraction`
 
-Republishes a `TrunkRegistry` from a folder of per-tree `meta.yaml` files made by `fast_slam_rgbd_extraction.py`, anchored to `anchor_tree_id`. Its `/correct_template_anchor` service shifts the template onto a live base-camera trunk detection. Known issues are listed in `notes/templating_trial_plan.md` in the workspace.
+Publishes a `TrunkRegistry` from a folder of per-tree `meta.yaml` files made by `fast_slam_rgbd_extraction`, anchored to `anchor_tree_id`. It keeps the map in the local frame of the anchor tree and publishes it in the robot base frame of the selected base-camera image (it follows `/apple_prediction` `presaved_images.base_cam_frame_index`). Its `/correct_template_anchor` service corrects the whole map from the base-camera trunk detections (`correction_frames`: `current` or `buffer`). See [Templating from a saved map](#templating-from-a-saved-map).
 
 ### Other entry points
 
-- `fast_slam_rgbd_extraction`: extracts the RGB-D frames where the robot is broadside to each mapped tree, from a bag plus a saved map.
+- `fast_slam_rgbd_extraction`: extracts the RGB-D frames where the robot is broadside to each mapped tree, from a bag plus a saved map (see [Step 1](#step-1-extract-the-rgb-d-frames-at-each-mapped-tree)).
 
 ---
 

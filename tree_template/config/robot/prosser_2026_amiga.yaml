@@ -40,4 +40,4 @@ save_best_particle_map:
 
 trellis_from_rgbd_extraction:
   ros__parameters:
-    extraction_dir: /home/marcus/apple_harvest_ws/data/rgbd_at_trees_prosser_2026_v2
+    extraction_dir: /home/marcus/apple_harvest_ws/data/rgbd_at_trees_prosser_2026_v3
