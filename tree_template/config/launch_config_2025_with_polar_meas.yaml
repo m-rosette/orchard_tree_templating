@@ -221,9 +221,9 @@ odom_reframer:
 
     use_now_stamp: true
     copy_twist: true
-    # twist_from_pose: publish the body velocity of the pose, with sigma = frac * |v| + floor. The Warthog odometry
-    # has zero pose covariance, and its twist does not agree with its pose. The gps_heading global EKF fuses this
-    # velocity. trunk_to_template_pub.launch.py sets twist_from_pose (true only while that EKF runs).
+    # twist_from_pose: publish the body velocity of the pose, with sigma = frac * |v| + floor. The gps_heading
+    # global EKF fuses this velocity. trunk_to_template_pub.launch.py sets twist_from_pose (true only while that EKF
+    # runs).
     twist_from_pose: true
     twist_from_pose_window: 5
     twist_cov_frac_v: 0.03

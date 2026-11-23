@@ -8,7 +8,7 @@ depth frame. The tool pairs the two by stamp and finds the R, t for which regist
 with the aligned image: grid search on t_x, then Nelder-Mead on t and the rotation vector.
 
 Usage:
-    ros2 run tree_template calibrate_depth_to_color --bag /path/to/bag_dir --camera_ns /camera/base_camera \
+    ros2 run tree_template calibrate_depth_to_color --bag /path/to/bag_dir --camera_ns /camera/base_camera \\
         --out config/camera_extrinsics/prosser_2025_base_camera.yaml
 
 fast_slam_rgbd_extraction reads the output (--cam1_depth_to_color / --cam2_depth_to_color).

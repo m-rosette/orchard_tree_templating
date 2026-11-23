@@ -2,14 +2,13 @@
 """
 trellis_from_rgbd_extraction.py
 
-Publishes the trunks of a fast_slam_rgbd_extraction folder (tree_*/meta.yaml) as one TrunkRegistry for an anchor
-tree, and corrects the whole map from base-camera trunk detections.
+Publishes the trunks of a fast_slam_rgbd_extraction folder (tree_*/meta.yaml) as one TrunkRegistry, and corrects
+the map from base-camera trunk detections.
 
-The map and the correction are kept in the local frame of the anchor tree (trellis_geometry.py). The registry is
-published in the robot base frame of the displayed base-camera image of the anchor (the frame pose world_pose_xyt
-in meta.yaml): the trunk positions and the row direction (trunk orientation) are in that frame, as the presaved
-point clouds are. The displayed image is presaved_images.base_cam_frame_index of the frame_select_service node
-(/apple_prediction): the node follows its /parameter_events and publishes the registry again when it changes.
+The node keeps the map in the local frame of the anchor tree (trellis_geometry.py). It publishes the map in the
+robot base frame of the displayed base-camera image (world_pose_xyt of that frame in meta.yaml). The presaved point
+clouds use the same frame. The displayed image is presaved_images.base_cam_frame_index of the frame_select_service
+node. The node reads it from /parameter_events and publishes the map again when it changes.
 
 Parameters
 ----------
@@ -38,17 +37,17 @@ association_gate_m      (float) max distance object -> map trunk (default 0.35)
 max_yaw_correction_deg  (float) default 5.0
 
 /correct_template_anchor (std_srvs/Trigger): local correction of the map at the parked robot pose.
-correction_frames current: trigger the detector once on the displayed base-camera image. The detections and the
-    templates are both in the robot base frame of that image, so the correction does not use the odometry: group
-    the detections per object, match the groups to the templates (one-to-one, same side, the anchor must match), and
-    fit one rigid correction (translation; with two or more trunks also yaw) in that frame. All trunks move with
-    it. The frame pose (world_pose_xyt) only keeps the corrected map in the local frame, so the corrected templates
-    stay at the same place in the world when the displayed image changes.
-correction_frames buffer: for each frame in frame_offsets, select the frame, trigger the detector and put the
-    detections in the local frame with the frame pose (world_pose_xyt). Then the same match and fit in the local
-    frame. The detections of the frames are combined with the odometry between the frames. At the end frame 0 is
-    displayed.
-The corrected registry is published in the robot base frame of the displayed image. The response message is JSON.
+    1. Get the trunk detections:
+       correction_frames current: one detector trigger on the displayed image. The detections and the map are in
+       the robot base frame of that image, so the fit does not use the odometry.
+       correction_frames buffer: one trigger on each frame in frame_offsets. The frame poses (world_pose_xyt) put
+       the detections in the local frame, so the fit uses the odometry between the frames. Frame 0 is displayed
+       at the end.
+    2. Group the detections per object. Match the groups to the map trunks (one to one, same side). The anchor
+       must match.
+    3. Fit one rigid correction (translation; yaw also with two or more trunks) and move all trunks.
+    4. Publish the corrected map in the robot base frame of the displayed image.
+The response message is JSON.
 """
 
 import copy
@@ -83,7 +82,6 @@ from tree_template.trellis_geometry import (
     load_global_row_yaw,
     load_meta_yamls,
     local_positions,
-    pose_tf,
 )
 
 
@@ -133,7 +131,7 @@ class TrellisFromExtractionNode(Node):
 
         self._tree_data = load_meta_yamls(self.extraction_dir)
         self._anchor_id = None
-        self._registry = None              # map in the local frame of the anchor (corrected by the correction)
+        self._registry = None              # map in the local frame of the anchor (the correction changes it)
         self._registry_ids: List[int] = []  # tree id of each trunk in _registry
         self._origin_xy = None             # local frame of the anchor
         self._row_yaw = 0.0

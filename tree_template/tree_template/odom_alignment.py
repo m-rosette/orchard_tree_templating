@@ -4,13 +4,13 @@ odom_alignment.py
 Puts the robot odometry into the SLAM world frame near one time, so the broadside pose of a tree comes from a
 smooth trajectory. No ROS imports.
 
-The SLAM robot_path (/odom_slam_best) is the pose of the best particle at each time and jumps when the best particle
-changes. Near one time, a trimmed rigid 2-D fit maps the odometry onto the path and ignores the jumps.
+Path fit (robust_local_fit): a trimmed rigid 2-D fit of the odometry onto the SLAM robot_path (/odom_slam_best).
+The robot_path is the pose of the best particle, so it jumps when the best particle changes. The trim ignores the
+jumps.
 
-Tree fit (tree_local_fit): the trunk detections go into the odometry frame and make odometry-frame trees
-(detection_trees). These trees are matched to the SLAM map trees near one time, and the fit maps the odometry onto
-the map trees. It does not use the robot_path. At the start of a row the robot_path can jump by 0.5-0.9 m
-while the filter converges, and the path fit is then bad.
+Tree fit (tree_local_fit): the trunk detections go into the odometry frame as odometry-frame trees
+(detection_trees). The fit matches these trees to the SLAM map trees and does not use the robot_path. Use it when
+the robot_path jumps a lot, for example at the start of a row while the filter converges.
 
 Arrays (rows [x, y, yaw, t]):
     path  SLAM robot_path: world frame, SLAM clock
@@ -132,7 +132,7 @@ def detection_trees(
     meas rows [x, y, t]: the trunk in the robot base frame (trunk_detection_relay TrunkInfo), image time on the SLAM
     clock. Each detection goes into the odometry frame with the odometry pose at its time. Detections closer than
     eps_m are one tree (single linkage). t is the median detection time of the tree, n the number of detections.
-    Trees with fewer than min_hits detections are dropped.
+    The function drops trees with fewer than min_hits detections.
     """
     meas = np.asarray(meas, dtype=np.float64).reshape(-1, 3)
     t_odom = meas[:, 2] + time_offset
@@ -179,15 +179,14 @@ def tree_local_fit(
     Fit odometry -> world from the odometry-frame trees (detection_trees) with t within window_s of t_center (SLAM
     clock), matched one to one to the map trees map_xy (world frame). With theta: translation only.
 
-    1. Translation search: shifts of init by up to +/- search_m (step step_m). Each tree within gate_m of a map
-       tree adds 1 - (d / gate_m)^2 to the score of the shift, and the shift with the highest score wins. This removes
-       an init error smaller than search_m. A shift of one tree spacing can match as many trees as the correct
-       shift, but with larger distances, so the score uses the distances and not only the number of matches.
-    2. Refit: one-to-one matches within gate_m, rigid fit (rotation and translation with 3 or more matches and no
-       theta), iters times.
-    Return (LocalFit, info) or None if fewer than min_matches trees match. info: n_trees, n_matched, the score of
-    the best shift, and the best score of the shifts more than gate_m from it (a value near the best score means
-    the match is ambiguous, for example a shift of one tree spacing).
+    1. Translation search: shifts of init up to +/- search_m (step step_m). Each tree within gate_m of a map tree
+       adds 1 - (d / gate_m)^2 to the score of the shift. The shift with the highest score wins. The score uses the
+       distances, because a shift of one tree spacing can match as many trees as the correct shift.
+    2. Refit, iters times: one-to-one matches within gate_m, then a rigid fit (rotation and translation with 3 or
+       more matches and no theta).
+    Return (LocalFit, info), or None if fewer than min_matches trees match. info: n_trees, n_matched,
+    search_score (best shift) and search_other_score (best shift more than gate_m from it). An other score near
+    the score shows an ambiguous match.
     """
     sel = np.abs(trees[:, 2] - t_center) <= window_s
     A = trees[sel, :2]
@@ -310,9 +309,9 @@ def broadside_from_trees(
     search_m: float = 0.5,
 ):
     """
-    Broadside pose of one tree from the odometry fitted to the map trees (tree_local_fit), not to the robot_path.
-    The robot_path fit over +/- rotation_window_s gives only the start value. Then the rotation comes from the trees
-    within +/- rotation_window_s, and the translation from the trees within +/- window_s.
+    Broadside pose of one tree from the odometry fitted to the map trees (tree_local_fit).
+    The robot_path fit over +/- rotation_window_s gives only the start value. The trees within
+    +/- rotation_window_s give the rotation, and the trees within +/- window_s give the translation.
     Return dict(pose_xyt, t_slam, fwd, lat, fit, theta_fit, tree_fit_info), or None if a fit fails.
     """
     init = robust_local_fit(path, odom, time_offset, t_guess, rotation_window_s)

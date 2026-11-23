@@ -1,6 +1,6 @@
 # config/nav_2026/ekf_local.yaml
-# Local EKF for the 2026 Prosser bags (Amiga). The /filter/state pose in these bags is not usable (the Amiga
-# filter did not converge), but its twist is good. This EKF fuses only the wheel velocities (vx, vy, vyaw).
+# Local EKF for the 2026 Prosser bags (Amiga). The /filter/state pose in these bags is not usable, but its twist
+# is good. This EKF fuses only the wheel velocities (vx, vy, vyaw).
 # The /oak0/imu stamps use the Amiga device clock, not the bag clock, so this EKF does not use the IMU.
 # Use with robot_config prosser_2026_amiga.yaml (odom_reframer rotate_yaw_deg 180 makes the twist point along
 # the direction of travel).

@@ -17,16 +17,15 @@ Output:
 
 meta.yaml, for each frame: color/depth header stamps, color_depth_dt_s and sync_ok (--max_color_depth_dt_s),
 t_from_broadside_s, odom_pose_xyt (--odom_topic), world_pose_xyt (odometry in the SLAM world frame,
---broadside_source odom), slam_path_pose_xyt (SLAM robot_path; it jumps when the best particle changes).
+--broadside_source odom or trees), slam_path_pose_xyt (SLAM robot_path; it jumps when the best particle changes).
 Buffer frames also have base_delta_from_frame0_xyt (motion from frame_0 in the base frame, --odom_to_base_yaw_deg).
 The depth frame of a pair is the one with the header stamp nearest to the color frame.
 
-Broadside (--broadside_source odom): odometry put into the world frame by odom_alignment.broadside_from_odom
-(odometry fitted to the SLAM robot_path).
-Broadside (--broadside_source trees): odometry fitted to the SLAM map trees by odom_alignment.broadside_from_trees.
-The trunk detections (--meas_topic, TrunkInfo in the robot base frame, in --odom_bag) go into the odometry frame and
-are matched to the map trees. Use it when the robot_path jumps (for example at the start of a row), with an
---odom_bag recorded while the bag played (odometry and /trunk_measurements_raw of the same SLAM run).
+Broadside (--broadside_source):
+    odom   odometry fitted to the SLAM robot_path (odom_alignment.broadside_from_odom).
+    trees  odometry fitted to the SLAM map trees (odom_alignment.broadside_from_trees). The trunk detections
+           (--meas_topic, TrunkInfo in the robot base frame) come from --odom_bag. Use it when the robot_path jumps,
+           with an --odom_bag recorded during the SLAM run (odometry and /trunk_measurements_raw).
 meta.yaml also keeps the robot_path result (slam_path_broadside) and the fit (broadside_fit).
 
 depth_aligned.png: depth_registration.register_depth_to_color with --camN_depth_to_color (calibrate_depth_to_color,
@@ -35,7 +34,7 @@ config/camera_extrinsics/) or the bag extrinsics topic. An aligned depth topic (
 
 Clocks: the image header stamp expected at SLAM time T is T + --image_time_offset_s. Image header stamps map to the
 bag receive time with a linear fit from the first and last message of an image topic. The odometry time is its
-receive time.
+receive time, or its header stamp with --odom_stamp header (a recording made during bag playback).
 
 Usage:
     ros2 run tree_template fast_slam_rgbd_extraction \\
@@ -389,11 +388,12 @@ def main():
               (f" ({cam.align_source})" if cam.align_source else ""))
 
     # --- Clocks ---------------------------------------------------------------
+    odom_bag = BagReader(args.odom_bag) if args.odom_bag else bag
     if args.image_time_offset_s is not None:
         offset = args.image_time_offset_s
     elif args.auto_detect_clock_offset:
         img0 = bag.first(image_topics[0])[0]
-        odom0 = (BagReader(args.odom_bag) if args.odom_bag else bag).first(args.odom_topic)[0]
+        odom0 = odom_bag.first(args.odom_topic)[0]
         if img0 is None or odom0 is None:
             raise RuntimeError("--auto_detect_clock_offset needs messages on the image and odometry topics")
         offset = stamp_s(img0) - stamp_s(odom0)
@@ -412,14 +412,13 @@ def main():
     if calibration is None:
         print("[WARN] no header -> receive time fit; the frame search reads the whole bag")
     h0_cal, t0_cal_ns, slope_cal = calibration or (0.0, 0, 1e9)
-    # Odometry lookup: header stamps in the host epoch are used directly (the receive time adds the image topic
-    # delay); header stamps in a different epoch (replayed bag) go through the fit.
+    # Image header time -> odometry time for the frame poses. Header stamps in the epoch of the bag receive time
+    # stay as they are. Header stamps in a different epoch go through the linear fit.
     header_epoch_ok = calibration is not None and abs(t0_cal_ns * 1e-9 - h0_cal) < 5.0
 
     def header_to_receive_s(h_s):
         return h_s if header_epoch_ok else (t0_cal_ns + (h_s - h0_cal) * slope_cal) * 1e-9
 
-    odom_bag = BagReader(args.odom_bag) if args.odom_bag else bag
     odom = load_odom(odom_bag, args.odom_topic, use_header=(args.odom_stamp == "header"))
     if odom is None:
         print(f"[WARN] no odometry on {args.odom_topic}")
